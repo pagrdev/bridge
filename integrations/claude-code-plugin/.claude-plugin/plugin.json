@@ -1,0 +1,14 @@
+{
+  "name": "pagr",
+  "description": "Set up and troubleshoot Pagr from inside Claude Code: install the bridge, pair your Mac, register projects, and diagnose why a session is not reachable.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Stagberry Labs LLC",
+    "url": "https://pagr.dev"
+  },
+  "homepage": "https://pagr.dev/docs/claude-code",
+  "repository": "https://github.com/pagrdev/bridge",
+  "license": "Apache-2.0",
+  "keywords": ["pagr", "remote", "mobile", "approvals", "coding-agents", "setup"],
+  "category": "productivity"
+}
