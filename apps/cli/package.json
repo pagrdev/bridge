@@ -1,17 +1,32 @@
 {
-  "name": "@pagr/bridge-cli",
+  "name": "@pagr/cli",
   "version": "0.1.0",
+  "description": "pagr — connect your Mac's Claude Code and Codex sessions to Pagr",
   "license": "Apache-2.0",
   "type": "module",
+  "bin": {
+    "pagr": "./dist/bin.js"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x dist/bin.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
+    "@pagr/bridge-adapter-claude": "workspace:*",
+    "@pagr/bridge-adapter-codex": "workspace:*",
+    "@pagr/bridge-core": "workspace:*",
     "@pagr/protocol": "workspace:*",
+    "commander": "^13.1.0",
+    "picocolors": "^1.1.1",
     "zod": "^3.25.0"
   }
 }
