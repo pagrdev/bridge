@@ -4,12 +4,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/stagberry-labs/pagr-bridge.git",
+    "url": "git+https://github.com/pagrdev/bridge.git",
     "directory": "packages/adapter-codex"
   },
-  "homepage": "https://github.com/stagberry-labs/pagr-bridge/tree/main/packages/adapter-codex#readme",
+  "homepage": "https://github.com/pagrdev/bridge/tree/main/packages/adapter-codex#readme",
   "bugs": {
-    "url": "https://github.com/stagberry-labs/pagr-bridge/issues"
+    "url": "https://github.com/pagrdev/bridge/issues"
   },
   "type": "module",
   "main": "./dist/index.js",

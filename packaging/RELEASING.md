@@ -4,7 +4,7 @@ Everything in this repo ships as npm packages under the `@pagr` scope, plus a Ho
 that wraps the CLI tarball. There is no CI: every step below runs on a maintainer's Mac.
 
 > **Before the first release**, replace the placeholder repository URL
-> (`https://github.com/stagberry-labs/pagr-bridge`) in every `package.json` and in
+> (`https://github.com/pagrdev/bridge`) in every `package.json` and in
 > `packaging/homebrew/pagr.rb` with the real one. npm renders it on the package page and
 > Homebrew audit checks it.
 

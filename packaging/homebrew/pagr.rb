@@ -12,7 +12,7 @@
 # prebuilt binaries for both arm64 and x86_64.
 class Pagr < Formula
   desc "Connect your Mac's Claude Code and Codex sessions to Pagr"
-  homepage "https://github.com/stagberry-labs/pagr-bridge"
+  homepage "https://github.com/pagrdev/bridge"
   # RELEASE: replace VERSION with the published @pagr/cli version (no leading `v`).
   url "https://registry.npmjs.org/@pagr/cli/-/cli-VERSION.tgz"
   version "VERSION"

@@ -5,12 +5,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/stagberry-labs/pagr-bridge.git",
+    "url": "git+https://github.com/pagrdev/bridge.git",
     "directory": "integrations/claude-channel"
   },
-  "homepage": "https://github.com/stagberry-labs/pagr-bridge/tree/main/integrations/claude-channel#readme",
+  "homepage": "https://github.com/pagrdev/bridge/tree/main/integrations/claude-channel#readme",
   "bugs": {
-    "url": "https://github.com/stagberry-labs/pagr-bridge/issues"
+    "url": "https://github.com/pagrdev/bridge/issues"
   },
   "type": "module",
   "main": "./dist/index.mjs",
