@@ -1,6 +1,11 @@
 # Troubleshooting the Pagr bridge
 
-Start with `pagr doctor`. It checks Node, `~/.pagr` permissions, the secret store, pairing, the daemon socket, gateway reachability, the `codex`/`claude` CLIs and the launch agent, and prints a fix for each failure. `pagr status` shows the live picture; `pagr daemon logs -f` streams `~/.pagr/logs/daemon.log`.
+Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 0700/0600 permissions), `config.json` and `projects.json` integrity, the secret store (with a real read/write round-trip), the device key, pairing, API reachability, clock skew, the daemon socket, the gateway handshake, gateway reachability, the `codex`/`claude` CLIs and the launch agent — printing a fix for each failure.
+
+- `pagr doctor --json` produces a support-ready report. Every error message in the CLI points here.
+- `pagr doctor --fix` tightens any file permissions that are too permissive.
+- `pagr doctor --offline` skips the network checks.
+- `pagr status` shows the live picture; `pagr daemon logs -f` streams `~/.pagr/logs/daemon.log`.
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
@@ -11,6 +16,11 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` permissions, the secret stor
 | Codex sessions fail immediately | Codex CLI not logged in | `codex login` |
 | Claude approvals never reach your phone | session not started by Pagr, or the daemon lost the gateway | see below |
 | daemon logs `auth failed` or `device revoked` | this device was revoked from the dashboard | `pagr logout && pagr connect` |
+| `connect` prints an HTML excerpt / "returned an HTML page, not JSON" | a captive portal or proxy is intercepting HTTPS, or `--api-url` points at the website | join the network properly, or fix `--api-url` / `PAGR_API_URL` |
+| `this Mac's clock is … the Pagr server` | the clock is off by more than a minute; signed commands expire on a schedule | System Settings → General → Date & Time → *Set automatically* |
+| `keychain read failed … is locked` | the login Keychain is locked | Keychain Access → File → Unlock login, then re-run |
+| `config.json is not valid JSON` | a partial write (crash or full disk) | `pagr connect --force`, or delete the file and `pagr connect` |
+| `this Mac is paired, but the background daemon did not start` | launchd started the job but it died | `pagr daemon logs -n 50`, then `pagr daemon install` — **do not** re-run `connect`, the pairing is saved |
 
 ## Daemon not connecting
 
@@ -23,22 +33,42 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` permissions, the secret stor
 3. `pagr doctor` — the **gateway** check does a raw TCP connect to the gateway host. If it fails while a browser can reach the dashboard, a proxy is intercepting WebSockets.
 4. The launch agent runs with the `PATH` captured at `pagr connect`/`pagr daemon install` time. If you installed Node or the agent CLIs afterwards, run `pagr daemon install` again to refresh the plist.
 
-## Pairing code expired
+## `pagr connect`
 
-Codes are short-lived. `pagr connect` prints the code and opens `…/device/pair?code=…`; if you did not approve in time you get `pairing failed: pairing code expired`. Just run `pagr connect` again — the device key is reused, nothing was registered.
+`connect` runs in six visible steps: check this Mac → prepare the device key → contact Pagr → approve in the browser → save the pairing → verify the gateway handshake. It only reports success once the daemon has actually connected to the gateway, and it is safe to run twice: on an already-paired Mac it changes nothing and exits 0.
 
-Other pairing failures:
+**Nothing is written until the approval completes.** Ctrl-C at any point before that leaves no config, no plist and no half-state (exit 130).
 
-- `could not reach https://api.pagr.dev` — network, or you meant a local stack: `pagr connect --api-url http://localhost:4000` (or `PAGR_API_URL`).
-- `pairing rejected` — someone declined the request in the dashboard.
-- `already paired as dev_…` — this Mac already has an identity. Use `pagr connect --force` to re-pair or `pagr logout` first.
+| What you see | What happened | What to do |
+| --- | --- | --- |
+| `cannot resolve api.pagr.dev` | DNS | check the network; `--api-url` / `PAGR_API_URL` for a local stack |
+| `… refused the connection` | nothing listening at that URL | fix `--api-url` / `PAGR_API_URL` |
+| `… did not respond (connection timed out)` | outbound TLS blocked | the bridge only needs outbound 443; check VPN/proxy |
+| `… returned an HTML page, not JSON` | captive portal / proxy / wrong URL | see the table above |
+| `… returned a malformed JSON body` | a broken or intercepting server | `npm i -g @pagr/cli@latest`, then `pagr doctor --json` |
+| `… has no pairing endpoint (HTTP 404)` | wrong API URL, or an API older than this CLI | check `--api-url` |
+| `this version of the pagr CLI is no longer supported` | the server requires a newer bridge | `npm i -g @pagr/cli@latest` |
+| `the API speaks device protocol vN` | protocol mismatch | update the CLI, or point at the right environment |
+| `the pairing code expired before it was approved` | you did not approve in time | run `pagr connect` again — nothing was registered |
+| `the pairing request was declined in the dashboard` | someone clicked deny | run `pagr connect` again, approve with the right account |
+| `that pairing code was already used by another device` | the code was redeemed elsewhere | run `pagr connect` again for a fresh code |
+| `nobody approved this Mac within N minutes` | the wait timed out (`--timeout <minutes>`) | run `pagr connect` again |
+| `lost contact with the API while waiting for approval` | the network dropped for several consecutive polls | reconnect and run `pagr connect` again |
+| `could not open a browser here` | headless, SSH or no default browser | open the printed URL yourself — `connect` keeps waiting |
+| `already paired as dev_…` | this Mac already has an identity | nothing to do; `pagr connect --force` to re-pair, or `pagr logout` first |
+
+Transient trouble does **not** abort the flow: a connection reset or a 5xx mid-poll is retried (up to five consecutive failures), and `pair/start` retries 5xx twice before giving up. `PAGR_HTTP_TIMEOUT_MS` caps each individual HTTP request if your network hangs rather than fails.
+
+`pagr connect --force` re-pairs cleanly: it **deletes the old device key from the Keychain and mints a new one**, and tells the server which device this pairing replaces. Revoked key material is never reused. Revoke the old device in the dashboard as well.
 
 ## Keychain prompt
 
 The device's Ed25519 private key is stored in the macOS login Keychain under the service `dev.pagr.bridge`. macOS may prompt once when the daemon (or `pagr connect`) first reads it. Choose **Always Allow** so the background daemon can start after a reboot without a prompt.
 
 - If the prompt keeps returning after every update, open Keychain Access → search `dev.pagr.bridge` → Access Control → allow all applications, or simply `pagr logout && pagr connect` to mint a fresh key under the new binary.
-- `pagr doctor` shows which store is in use: `keyring` (native), `security-cli` (fallback to `/usr/bin/security`) or `file`. `file` only appears when `PAGR_INSECURE_FILE_STORE=1` is set — never use that outside CI.
+- `pagr doctor` shows which store is in use: `keyring` (native), `security-cli` (fallback to `/usr/bin/security`) or `file`. `file` only appears when `PAGR_INSECURE_FILE_STORE=1` is set — never use that outside CI. The check does a real write/read/delete round-trip, so a locked or denied Keychain shows up as a failure rather than as "no key".
+- A Keychain that is **locked** or where you clicked **Deny** is reported as such and the command stops. It is never treated as "no key yet": minting a second device key would silently break a working pairing.
+- If the native module cannot load (wrong architecture after a Node upgrade), the bridge falls back to `/usr/bin/security`; `pagr doctor` names the reason.
 - Never copy `secrets.json` or the Keychain item to another machine; re-pair instead.
 
 ## Codex not logged in
@@ -86,13 +116,35 @@ pagr projects        # still there; the cloud learns the ids on the next connect
 
 Use `pagr logout --purge` to also forget the project registry, or `pagr uninstall --yes` to remove `~/.pagr` entirely.
 
+## `~/.pagr` problems
+
+- **Unwritable / full disk / read-only volume** — reported before anything else happens, with the path and a fix (exit 10). Nothing is written.
+- **Corrupt `config.json` or `projects.json`** — a partial write reads as "not paired", which sends you down the wrong path. `pagr doctor` and `pagr status` now name the damaged file, and `pagr connect` reports it and starts fresh. All state writes are atomic (temp file + rename), so a crash never truncates a file.
+- **Wrong permissions** — anything under `~/.pagr` that is group- or world-readable is flagged. `pagr doctor --fix` (and `pagr connect`) tighten it back to 0700/0600.
+- **A very long `PAGR_HOME`** — a unix socket path is capped at ~104 bytes, so the daemon socket moves to a short per-user runtime directory and its location is recorded in `run/daemon.sock.path`. `pagr doctor` shows which path is in use.
+
+## launchd problems
+
+- **`/bin/launchctl` missing** (not macOS, or a container) — `connect` says so, keeps the pairing, and tells you to run `pagr daemon run` in the foreground.
+- **`launchctl bootstrap` refused** — the error carries launchctl's own words plus the path of `launchd.err.log`. The pairing is already saved; fix the cause and re-run `pagr daemon install`, not `pagr connect`.
+- **Already loaded** — the job is kickstarted with the freshly written plist instead of failing.
+- **A stale plist** from an older install (a binary that no longer exists, or a different `PAGR_HOME`) is flagged by `pagr doctor`; `pagr daemon install` rewrites it.
+
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | ok |
-| 1 | error |
+| 1 | error (uncategorised) |
 | 2 | usage / aborted |
 | 3 | daemon not running |
 | 4 | not paired |
-| 5 | precondition failed (doctor failures, project registry refusals) |
+| 5 | precondition failed (doctor failures, project registry refusals, launchd refused) |
+| 6 | the Pagr API could not be used (offline, DNS, refused, 5xx, HTML, wrong URL) |
+| 7 | pairing did not complete (expired, declined, already used, nobody approved) |
+| 8 | version mismatch — this CLI is too old (or too new) for that API |
+| 9 | the device key could not be read or written (Keychain locked / denied / missing) |
+| 10 | `PAGR_HOME` is unusable (unwritable, full, read-only, corrupt state file) |
+| 130 | interrupted (Ctrl-C) |
+
+Every command accepts `--json` (before or after the command name). In JSON mode **stdout carries exactly one JSON document** — `{...}` on success, `{"ok":false,"error":{"code","message","exitCode","hint"}}` on failure — and all human narration goes to stderr.

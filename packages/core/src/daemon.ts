@@ -532,7 +532,14 @@ export async function startDaemon(o: CreateDaemonOptions): Promise<Daemon> {
 
 export {
   installLaunchAgent,
+  LAUNCH_AGENT_LABEL,
+  LAUNCHCTL,
+  LaunchAgentError,
+  type LaunchAgentErrorCode,
+  type LaunchAgentOptions,
   launchAgentPlistPath,
+  launchAgentStaleReason,
+  readPlistFacts,
   renderPlist,
   uninstallLaunchAgent,
 } from './launchAgent.js';

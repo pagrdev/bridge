@@ -74,21 +74,54 @@ export async function loadOrCreateIdentity(
   store: SecretStore,
   opts: { deviceId?: string } = {},
 ): Promise<DeviceIdentity> {
+  // A store read that FAILS (locked Keychain, denied prompt) throws — it must never look like
+  // "no key yet", or we would mint a second identity and overwrite a working pairing.
   let pem = await store.get(PRIVATE_KEY_SECRET);
+  const created = !pem;
   if (!pem) {
     pem = generateKeyPairPem().privateKeyPem;
     await store.set(PRIVATE_KEY_SECRET, pem);
   }
   const privateKeyPem = pem;
-  const publicKeyPem = createPublicKey(createPrivateKey(privateKeyPem))
-    .export({ type: 'spki', format: 'pem' })
-    .toString();
+  let publicKeyPem: string;
+  try {
+    publicKeyPem = createPublicKey(createPrivateKey(privateKeyPem))
+      .export({ type: 'spki', format: 'pem' })
+      .toString();
+  } catch (err) {
+    throw new InvalidDeviceKeyError(
+      `the stored pagr device key is not a usable Ed25519 private key: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
   const identity: DeviceIdentity = {
     publicKeyRaw: rawPublicKeyFromPem(publicKeyPem),
     sign: (data) => signWithPem(privateKeyPem, data),
   };
   if (opts.deviceId) identity.deviceId = opts.deviceId;
+  identityWasCreated.set(identity, created);
   return identity;
+}
+
+/** Whether `loadOrCreateIdentity` minted a brand-new key (vs. reusing the stored one). */
+const identityWasCreated = new WeakMap<DeviceIdentity, boolean>();
+export const wasNewlyCreated = (identity: DeviceIdentity): boolean =>
+  identityWasCreated.get(identity) ?? false;
+
+/** The stored key exists but is corrupt — a truncated Keychain item or a hand-edited file. */
+export class InvalidDeviceKeyError extends Error {
+  readonly hint =
+    'run `pagr logout` then `pagr connect` to mint a fresh key (the old one is unusable)';
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidDeviceKeyError';
+  }
+}
+
+/** Is a device private key present? Used by `doctor` to spot a config without its key. */
+export async function hasIdentity(store: SecretStore): Promise<boolean> {
+  return (await store.get(PRIVATE_KEY_SECRET)) !== null;
 }
 
 export async function deleteIdentity(store: SecretStore): Promise<void> {

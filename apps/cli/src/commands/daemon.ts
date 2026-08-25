@@ -99,10 +99,16 @@ export function runDaemonInstall(ctx: CliContext): string {
     logsDir: paths.logsDir,
     env: { PAGR_HOME: ctx.home, ...(ctx.env.PATH ? { PATH: ctx.env.PATH } : {}) },
     exec: (f, a) => void ctx.exec(f, a),
+    hasLaunchctl: () => ctx.hasLaunchctl(),
     ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
   });
+  if (ctx.json) {
+    printJson(ctx, { installed: true, plist, label: LAUNCH_AGENT_LABEL, logsDir: paths.logsDir });
+    return plist;
+  }
   ctx.out(ok(`launch agent installed ${dim(plist)}`));
   ctx.out(dim(`  label ${LAUNCH_AGENT_LABEL}; logs in ${paths.logsDir}`));
+  ctx.out(dim('  confirm it came up with `pagr status` (gateway should read connected)'));
   return plist;
 }
 
@@ -111,6 +117,10 @@ export function runDaemonUninstall(ctx: CliContext): boolean {
     exec: (f, a) => void ctx.exec(f, a),
     ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
   });
+  if (ctx.json) {
+    printJson(ctx, { removed, label: LAUNCH_AGENT_LABEL });
+    return removed;
+  }
   ctx.out(removed ? ok('launch agent removed') : warn('launch agent was not installed'));
   return removed;
 }
@@ -160,14 +170,26 @@ export async function runDaemonLogs(
 ): Promise<void> {
   const file = ctx.paths.logFile;
   if (!existsSync(file))
-    throw new CliError(`no log file at ${file}`, EXIT.precondition, 'the daemon has not run yet');
+    throw new CliError(`no log file at ${file}`, EXIT.precondition, {
+      code: 'no_log_file',
+      hint: 'the daemon has not run yet — `pagr daemon install`, then `pagr daemon logs`',
+    });
   const n = Number.parseInt(opts.lines, 10) || 50;
   if (opts.follow) {
+    if (ctx.json)
+      throw new CliError('--follow cannot be combined with --json', EXIT.usage, {
+        code: 'usage',
+        hint: 'drop --json to stream, or drop --follow for a JSON snapshot',
+      });
     await ctx.execStream('/usr/bin/tail', ['-n', String(n), '-f', file]);
     return;
   }
-  const lines = readFileSync(file, 'utf8').trimEnd().split('\n');
-  for (const l of lines.slice(-n)) ctx.out(l);
+  const lines = readFileSync(file, 'utf8').trimEnd().split('\n').slice(-n);
+  if (ctx.json) {
+    printJson(ctx, { file, lines });
+    return;
+  }
+  for (const l of lines) ctx.out(l);
 }
 
 export function registerDaemon(program: Command, getCtx: () => CliContext): void {

@@ -1,7 +1,8 @@
 import { readConfig } from '@pagr/bridge-core';
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
-import { dim, ok, printJson } from '../output.js';
+import { CliError, EXIT } from '../errors.js';
+import { dim, ok, printJson, warn } from '../output.js';
 import { resolveWebUrl } from '../urls.js';
 
 export type BillingAction = 'status' | 'upgrade' | 'portal';
@@ -31,7 +32,8 @@ export async function runBilling(
         : 'billing';
   ctx.out(ok(`opening ${verb} in your browser…`));
   ctx.out(dim(`  ${url}`));
-  if (opts.open) await ctx.openBrowser(url);
+  if (opts.open && !(await ctx.openBrowser(url)))
+    ctx.out(warn('could not open a browser here — copy the URL above'));
 }
 
 export function registerBilling(program: Command, getCtx: () => CliContext): void {
@@ -43,7 +45,10 @@ export function registerBilling(program: Command, getCtx: () => CliContext): voi
     .action((action: string | undefined, opts: { webUrl?: string; open: boolean }) => {
       const a = (action ?? 'status') as BillingAction;
       if (!['status', 'upgrade', 'portal'].includes(a))
-        throw new Error(`unknown billing action "${action}" (status | upgrade | portal)`);
+        throw new CliError(`unknown billing action "${action}"`, EXIT.usage, {
+          code: 'usage',
+          hint: 'use one of: status | upgrade | portal',
+        });
       return runBilling(getCtx(), a, opts);
     });
 }

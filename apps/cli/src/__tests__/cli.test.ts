@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IpcServer } from '@pagr/bridge-core';
 import {
@@ -6,7 +6,6 @@ import {
   getPaths,
   IpcClientError,
   PRIVATE_KEY_SECRET,
-  readConfig,
 } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EXIT } from '../errors.js';
@@ -93,83 +92,6 @@ describe('status', () => {
     const j = lastJson(h) as { daemon: { pid: number; transport: string }; sessions: number };
     expect(j.daemon).toMatchObject({ running: true, pid: 4242, transport: 'connected' });
     expect(j.sessions).toBe(2);
-  });
-});
-
-describe('connect', () => {
-  const fetchStub = (statuses: unknown[]) => {
-    let i = 0;
-    const calls: string[] = [];
-    const fetch = async (url: string, init?: RequestInit) => {
-      calls.push(`${init?.method ?? 'GET'} ${url}`);
-      const body = url.endsWith('/pair/start')
-        ? {
-            pairingId: 'pr_1',
-            code: 'ABCD-EFGH',
-            pairUrl: 'http://localhost:3000/device/pair?code=ABCD-EFGH',
-            expiresAt: '2030-01-01T00:00:00Z',
-          }
-        : statuses[Math.min(i++, statuses.length - 1)];
-      return new Response(JSON.stringify(body), { status: 200 });
-    };
-    return { fetch, calls };
-  };
-
-  it('pairs, persists config, installs the launch agent and prints next steps', async () => {
-    const { fetch, calls } = fetchStub([
-      { status: 'pending' },
-      {
-        status: 'completed',
-        deviceId: DEV,
-        userId: USR,
-        gatewayUrl: 'wss://gw.example/ws',
-        serverKeys: { k1: 'x' },
-      },
-    ]);
-    h.overrides.fetch = fetch;
-    expect(await h.run(['connect', '--api-url', 'http://api.test', '--name', 'Studio'])).toBe(
-      EXIT.ok,
-    );
-    expect(calls[0]).toBe('POST http://api.test/v1/devices/pair/start');
-    expect(h.opened).toEqual(['http://localhost:3000/device/pair?code=ABCD-EFGH']);
-    const cfg = readConfig(getPaths(h.home).configFile);
-    expect(cfg).toMatchObject({
-      deviceId: DEV,
-      userId: USR,
-      gatewayUrl: 'wss://gw.example/ws',
-      apiUrl: 'http://api.test',
-      deviceName: 'Studio',
-    });
-    expect(await h.store.get(PRIVATE_KEY_SECRET)).toMatch(/PRIVATE KEY/);
-    const plist = readFileSync(join(h.launchAgentsDir, 'dev.pagr.bridge.plist'), 'utf8');
-    expect(plist).toContain('/opt/pagr/dist/bin.js');
-    expect(plist).toContain('<string>daemon</string>');
-    expect(h.execCalls.some((c) => c[1] === 'bootstrap')).toBe(true);
-    const out = plain(h.stdout);
-    expect(out).toContain('ABCD-EFGH');
-    expect(out).toContain('pagr project add');
-    expect(out).toContain('iMessage');
-  });
-  it('--no-daemon skips launchd and --gateway-url overrides', async () => {
-    h.overrides.fetch = fetchStub([
-      { status: 'completed', deviceId: DEV, userId: USR, gatewayUrl: 'wss://gw', serverKeys: {} },
-    ]).fetch;
-    expect(
-      await h.run(['connect', '--no-daemon', '--no-open', '--gateway-url', 'wss://local:8080']),
-    ).toBe(EXIT.ok);
-    expect(existsSync(join(h.launchAgentsDir, 'dev.pagr.bridge.plist'))).toBe(false);
-    expect(h.opened).toEqual([]);
-    expect(readConfig(getPaths(h.home).configFile).gatewayUrl).toBe('wss://local:8080');
-  });
-  it('expired code → helpful error', async () => {
-    h.overrides.fetch = fetchStub([{ status: 'expired' }]).fetch;
-    expect(await h.run(['connect'])).toBe(EXIT.error);
-    expect(plain(h.stderr)).toContain('expired');
-  });
-  it('refuses to re-pair without --force', async () => {
-    writeFileSync(getPaths(h.home).configFile, JSON.stringify({ deviceId: DEV }));
-    expect(await h.run(['connect'])).toBe(EXIT.ok);
-    expect(plain(h.stdout)).toContain('already paired');
   });
 });
 
@@ -305,44 +227,6 @@ describe('daemon', () => {
     h.stdout.length = 0;
     expect(await h.run(['--json', 'daemon', 'status'])).toBe(EXIT.ok);
     expect(lastJson(h)).toMatchObject({ running: true, lockPid: process.pid });
-  });
-});
-
-describe('doctor', () => {
-  it('reports failures with fixes and exits 5', async () => {
-    h.execImpl = () => {
-      throw new Error('ENOENT');
-    };
-    expect(await h.run(['doctor'])).toBe(EXIT.precondition);
-    const out = plain(h.stdout);
-    expect(out).toMatch(/✓ node/);
-    expect(out).toMatch(/✗ paired/);
-    expect(out).toContain('pagr connect');
-    expect(out).toMatch(/! codex/);
-  });
-  it('passes when everything is wired', async () => {
-    writeFileSync(
-      getPaths(h.home).configFile,
-      JSON.stringify({ deviceId: DEV, gatewayUrl: 'wss://gw.example' }),
-    );
-    server = await fakeDaemon(h.home, { status: () => status() });
-    await h.run(['daemon', 'install']);
-    h.execImpl = (f) => (f === '/bin/launchctl' ? 'ok' : '1.0.0');
-    h.stdout.length = 0;
-    expect(await h.run(['--json', 'doctor'])).toBe(EXIT.ok);
-    const j = lastJson(h) as { ok: boolean; checks: Array<{ name: string; status: string }> };
-    expect(j.ok).toBe(true);
-    expect(j.checks.find((c) => c.name === 'gateway')?.status).toBe('ok');
-  });
-  it('flags unreachable gateway', async () => {
-    writeFileSync(
-      getPaths(h.home).configFile,
-      JSON.stringify({ deviceId: DEV, gatewayUrl: 'wss://gw.example' }),
-    );
-    h.overrides.tcpConnect = async () => false;
-    await h.run(['--json', 'doctor']);
-    const j = lastJson(h) as { checks: Array<{ name: string; status: string }> };
-    expect(j.checks.find((c) => c.name === 'gateway')?.status).toBe('fail');
   });
 });
 

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { ProjectRegistry, readConfig } from '@pagr/bridge-core';
+import { inspectConfig, ProjectRegistry } from '@pagr/bridge-core';
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { daemonStatus } from '../ipc.js';
@@ -27,7 +27,7 @@ export function probeAgentsLocally(ctx: CliContext): AgentLine[] {
 }
 
 export async function runStatus(ctx: CliContext): Promise<void> {
-  const config = readConfig(ctx.paths.configFile);
+  const { config, problem } = inspectConfig(ctx.paths.configFile);
   const status = await daemonStatus(ctx);
   const agents = probeAgentsLocally(ctx);
   const projects =
@@ -35,13 +35,16 @@ export async function runStatus(ctx: CliContext): Promise<void> {
     (existsSync(ctx.paths.projectsFile)
       ? new ProjectRegistry({ file: ctx.paths.projectsFile, pagrHome: ctx.home }).list().length
       : 0);
+  // A running daemon is the better source of truth: it holds the identity in memory even if
+  // config.json was damaged after it started.
   const data = {
     home: ctx.home,
-    paired: Boolean(config.deviceId),
-    deviceId: config.deviceId ?? null,
+    paired: status?.paired ?? Boolean(config.deviceId),
+    deviceId: config.deviceId ?? status?.deviceId ?? null,
     deviceName: config.deviceName ?? null,
-    userId: config.userId ?? null,
-    gatewayUrl: config.gatewayUrl ?? null,
+    userId: config.userId ?? status?.userId ?? null,
+    gatewayUrl: config.gatewayUrl ?? status?.gatewayUrl ?? null,
+    configProblem: problem ? problem.message : null,
     daemon: status
       ? {
           running: true,
@@ -68,15 +71,16 @@ export async function runStatus(ctx: CliContext): Promise<void> {
         ? warn('unpaired')
         : warn(status.transport);
   ctx.out(bold('Pagr bridge'));
+  if (problem) ctx.out(warn(`${problem.message} — ${problem.hint}`));
   ctx.out(
     kv([
       [
         'device',
-        config.deviceId
-          ? `${shortId(config.deviceId)} ${dim(config.deviceName ?? '')}`
+        data.deviceId
+          ? `${shortId(data.deviceId)} ${dim(config.deviceName ?? '')}`
           : bad('not paired — run `pagr connect`'),
       ],
-      ['user', config.userId ? shortId(config.userId) : '—'],
+      ['user', data.userId ? shortId(data.userId) : '—'],
       ['gateway', gw],
       [
         'daemon',
