@@ -25,14 +25,18 @@ export const LAUNCH_AGENT_LABEL = 'dev.pagr.bridge';
 export async function buildAdapters(
   home: string,
   mock: boolean,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<Map<Provider, CodingAgentAdapter>> {
   const map = new Map<Provider, CodingAgentAdapter>();
   const [codexMod, claudeMod] = await Promise.all([
     import('@pagr/bridge-adapter-codex'),
     import('@pagr/bridge-adapter-claude'),
   ]);
-  map.set('codex', codexMod.createCodexAdapter({ home, mock }));
-  map.set('claude', claudeMod.createClaudeAdapter({ home, mock }));
+  // `PAGR_MOCK_AGENT_DELAY_MS` stretches the scripted mock turns (E2E scripts use it).
+  const delayMs = Number.parseInt(env.PAGR_MOCK_AGENT_DELAY_MS ?? '', 10);
+  const mockOptions = Number.isFinite(delayMs) && delayMs > 0 ? { delayMs } : {};
+  map.set('codex', codexMod.createCodexAdapter({ home, mock, mockOptions }));
+  map.set('claude', claudeMod.createClaudeAdapter({ home, mock, mockOptions }));
   return map;
 }
 
@@ -53,7 +57,7 @@ async function runForeground(ctx: CliContext, opts: { mock: boolean }): Promise<
   });
   let adapters: Map<Provider, CodingAgentAdapter>;
   try {
-    adapters = await buildAdapters(ctx.home, opts.mock);
+    adapters = await buildAdapters(ctx.home, opts.mock, ctx.env);
   } catch (err) {
     if (!opts.mock) throw err;
     logger.warn('adapter packages unavailable; using core FakeAdapter', {

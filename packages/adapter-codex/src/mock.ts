@@ -27,7 +27,7 @@ const newApprovalId = () => `apr_${randomUUID().replace(/-/g, '')}`;
 /**
  * Process-free Codex stand-in for E2E without Codex installed (env `PAGR_MOCK_AGENTS=1`).
  * Scripted turn: started → progress "Running tests…" → (approval for `npm run db:migrate` when the
- * instruction mentions "migrate") → completed "All 12 tests pass." Honours steer/queue/stop.
+ * instruction mentions "migrate"/"migration") → completed "All 12 tests pass." Honours steer/queue/stop.
  */
 export class MockCodexAdapter implements CodingAgentAdapter {
   readonly provider = 'codex' as const;
@@ -179,7 +179,7 @@ export class MockCodexAdapter implements CodingAgentAdapter {
     this.setStatus(s, 'working', { activeTurn: true });
     this.event(s, 'started', 'Turn started');
     this.after(s, this.delay / 3, () => this.event(s, 'progress', 'Running tests…'));
-    if (/migrate/i.test(instruction)) {
+    if (/migrat/i.test(instruction)) {
       this.after(s, this.delay, () => this.requestApproval(s));
     } else {
       this.after(s, this.delay, () => this.finish(s, 'All 12 tests pass.'));
@@ -206,7 +206,8 @@ export class MockCodexAdapter implements CodingAgentAdapter {
       providerRequestId,
       actionType: 'command_execution',
       preview: 'npm run db:migrate',
-      hints: { productionHint: true },
+      // No production/secrets hints: classifies as Tier B, so the demo can approve by text.
+      hints: {},
       expiresAt: new Date(Date.now() + this.approvalTimeoutMs).toISOString(),
     });
   }
