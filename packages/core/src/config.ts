@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { readJson, writeJson } from './jsonFile.js';
+import { inspectJson, type JsonFileProblem, readJson, writeJson } from './jsonFile.js';
 
 /** `~/.pagr/config.json` — never contains secrets. */
 export const BridgeConfig = z.object({
@@ -17,6 +17,30 @@ export type BridgeConfig = z.infer<typeof BridgeConfig>;
 export function readConfig(file: string): BridgeConfig {
   const parsed = BridgeConfig.safeParse(readJson<unknown>(file, {}));
   return parsed.success ? parsed.data : BridgeConfig.parse({});
+}
+
+/**
+ * `readConfig` with the reason it fell back. A `config.json` that is corrupt or of the wrong
+ * shape reads as an empty config, i.e. "not paired" — which sends users down completely the
+ * wrong path. `doctor` and `connect` use this so they can say what actually happened.
+ */
+export function inspectConfig(file: string): { config: BridgeConfig; problem?: JsonFileProblem } {
+  const raw = inspectJson<unknown>(file, {});
+  if (raw.problem) return { config: BridgeConfig.parse({}), problem: raw.problem };
+  const parsed = BridgeConfig.safeParse(raw.value);
+  if (parsed.success) return { config: parsed.data };
+  const issue = parsed.error.issues[0];
+  return {
+    config: BridgeConfig.parse({}),
+    problem: {
+      code: 'wrong_shape',
+      file,
+      message: `${file} is not a valid pagr config${
+        issue ? ` (${issue.path.join('.') || '(root)'}: ${issue.message})` : ''
+      }`,
+      hint: 're-pair with `pagr connect --force`, or delete the file and run `pagr connect`',
+    },
+  };
 }
 
 export function writeConfig(file: string, cfg: BridgeConfig): void {

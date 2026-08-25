@@ -7,7 +7,23 @@ import { daemonStatus, socketPath } from '../ipc.js';
 import { bold, dim, ok, printJson, warn } from '../output.js';
 import { resolveWebUrl } from '../urls.js';
 
-export async function runLogout(ctx: CliContext, opts: { purge?: boolean }): Promise<void> {
+export interface LogoutResult {
+  deviceId: string | null;
+  launchAgentRemoved: boolean;
+  storeKind: string;
+  removed: string[];
+  revokeUrl: string | null;
+}
+
+/**
+ * Tear down the local half of a pairing. `report: false` lets `uninstall` reuse it without
+ * printing a second document — `--json` must emit exactly one.
+ */
+export async function runLogout(
+  ctx: CliContext,
+  opts: { purge?: boolean; report?: boolean },
+): Promise<LogoutResult> {
+  const report = opts.report !== false;
   const config = readConfig(ctx.paths.configFile);
   const removedAgent = uninstallLaunchAgent({
     exec: (f, a) => void ctx.exec(f, a),
@@ -27,13 +43,17 @@ export async function runLogout(ctx: CliContext, opts: { purge?: boolean }): Pro
   // Only clear a stale socket: a daemon still answering (e.g. a foreground `daemon run`) keeps it.
   const sock = socketPath(ctx);
   if (existsSync(sock) && !(await daemonStatus(ctx))) rmSync(sock, { force: true });
+  const result: LogoutResult = {
+    deviceId: config.deviceId ?? null,
+    launchAgentRemoved: removedAgent,
+    storeKind: store.kind,
+    removed,
+    revokeUrl: config.deviceId ? `${resolveWebUrl(ctx.env, config)}/app/devices` : null,
+  };
+  if (!report) return result;
   if (ctx.json) {
-    printJson(ctx, {
-      deviceId: config.deviceId ?? null,
-      launchAgentRemoved: removedAgent,
-      removed,
-    });
-    return;
+    printJson(ctx, result);
+    return result;
   }
   ctx.out(
     ok(removedAgent ? 'daemon stopped and launch agent removed' : 'no launch agent to remove'),
@@ -46,14 +66,13 @@ export async function runLogout(ctx: CliContext, opts: { purge?: boolean }): Pro
         : `config removed ${dim('(projects kept; use --purge to drop them)')}`,
     ),
   );
-  if (config.deviceId) {
+  if (result.revokeUrl) {
     ctx.out('');
     ctx.out(
-      warn(
-        `also revoke ${bold(config.deviceId)} from the dashboard: ${resolveWebUrl(ctx.env, config)}/app/devices`,
-      ),
+      warn(`also revoke ${bold(config.deviceId ?? '')} from the dashboard: ${result.revokeUrl}`),
     );
   }
+  return result;
 }
 
 export async function runUninstall(ctx: CliContext, opts: { yes?: boolean }): Promise<void> {
@@ -61,12 +80,16 @@ export async function runUninstall(ctx: CliContext, opts: { yes?: boolean }): Pr
     const okToGo = await ctx.confirm(
       `Remove the pagr daemon, device key and everything under ${ctx.home}?`,
     );
-    if (!okToGo) throw new CliError('aborted', EXIT.usage, 'pass --yes to skip the prompt');
+    if (!okToGo)
+      throw new CliError('aborted', EXIT.usage, {
+        code: 'aborted',
+        hint: 'pass --yes to skip the prompt',
+      });
   }
-  await runLogout(ctx, { purge: true });
+  const logout = await runLogout(ctx, { purge: true, report: !ctx.json });
   if (existsSync(ctx.home)) rmSync(ctx.home, { recursive: true, force: true });
   if (ctx.json) {
-    printJson(ctx, { removed: ctx.home });
+    printJson(ctx, { removed: ctx.home, logout });
     return;
   }
   ctx.out(ok(`removed ${ctx.home}`));
@@ -78,7 +101,7 @@ export function registerLogout(program: Command, getCtx: () => CliContext): void
     .command('logout')
     .description('stop the daemon, delete the device key and pairing config')
     .option('--purge', 'also remove the project registry')
-    .action((opts: { purge?: boolean }) => runLogout(getCtx(), opts));
+    .action(async (opts: { purge?: boolean }) => void (await runLogout(getCtx(), opts)));
   program
     .command('uninstall')
     .description('logout, remove the launch agent and delete ~/.pagr')

@@ -1,7 +1,25 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ensurePaths, getPaths, resolvePagrHome, resolveSocketPath } from './paths.js';
+import {
+  auditPermissions,
+  checkHomeWritable,
+  ensurePaths,
+  getPaths,
+  PagrHomeError,
+  repairPermissions,
+  resolvePagrHome,
+  resolveSocketPath,
+  usesShortSocketFallback,
+} from './paths.js';
 import { useTempHome } from './testUtil.js';
 
 describe('paths', () => {
@@ -46,5 +64,86 @@ describe('paths', () => {
     expect(resolveSocketPath(join(t.home, 'never'))).toBe(
       join(t.home, 'never', 'run', 'daemon.sock'),
     );
+  });
+});
+
+describe('paths · writability and permissions', () => {
+  const t = useTempHome();
+
+  it('checkHomeWritable proves it by writing, and cleans up after itself', () => {
+    const home = join(t.home, 'pagr');
+    expect(checkHomeWritable(home)).toEqual({ ok: true });
+    expect(readdirSync(home)).toEqual([]);
+  });
+
+  it('an unwritable home is reported with a permission code and a fix', () => {
+    const home = join(t.home, 'locked');
+    mkdirSync(home, { recursive: true });
+    chmodSync(home, 0o500);
+    try {
+      const r = checkHomeWritable(home);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toBeInstanceOf(PagrHomeError);
+        expect(r.error.code).toBe('permission');
+        expect(r.error.hint).toContain('chmod 700');
+      }
+    } finally {
+      chmodSync(home, 0o700);
+    }
+  });
+
+  it('a file where a directory belongs is reported, not crashed on', () => {
+    const home = join(t.home, 'afile');
+    writeFileSync(home, 'not a directory');
+    const err = (() => {
+      try {
+        ensurePaths(home);
+      } catch (e) {
+        return e;
+      }
+    })() as PagrHomeError;
+    expect(err).toBeInstanceOf(PagrHomeError);
+    expect(['not_a_directory', 'io']).toContain(err.code);
+    expect(err.hint).toBeTruthy();
+  });
+
+  it('auditPermissions flags anything group- or world-readable', () => {
+    const home = join(t.home, 'pagr2');
+    const p = ensurePaths(home);
+    writeFileSync(p.configFile, '{}', { mode: 0o644 });
+    chmodSync(p.logsDir, 0o755);
+    const issues = auditPermissions(p);
+    expect(issues.map((i) => i.path).sort()).toEqual([p.configFile, p.logsDir].sort());
+    expect(issues.find((i) => i.path === p.configFile)).toMatchObject({
+      actual: '644',
+      expected: '600',
+      kind: 'file',
+    });
+  });
+
+  it('repairPermissions tightens exactly those paths and is then idempotent', () => {
+    const home = join(t.home, 'pagr3');
+    const p = ensurePaths(home);
+    writeFileSync(p.configFile, '{}', { mode: 0o666 });
+    expect(repairPermissions(p)).toEqual([p.configFile]);
+    expect(statSync(p.configFile).mode & 0o777).toBe(0o600);
+    expect(repairPermissions(p)).toEqual([]);
+    expect(auditPermissions(p)).toEqual([]);
+  });
+
+  it('a stricter-than-required mode is not a finding', () => {
+    const home = join(t.home, 'pagr4');
+    const p = ensurePaths(home);
+    writeFileSync(p.configFile, '{}', { mode: 0o400 });
+    expect(auditPermissions(p)).toEqual([]);
+  });
+
+  it('usesShortSocketFallback matches what chooseSocketPath actually does', () => {
+    const shortHome = join(t.home, 'p');
+    const longHome = join(t.home, 'y'.repeat(120), 'pagr');
+    expect(usesShortSocketFallback(shortHome)).toBe(false);
+    expect(usesShortSocketFallback(longHome)).toBe(true);
+    expect(ensurePaths(longHome).socketPath).not.toContain(longHome);
   });
 });

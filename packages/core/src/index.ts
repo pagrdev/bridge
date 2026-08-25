@@ -10,6 +10,7 @@ export * from './dispatcher.js';
 export * from './events.js';
 export * from './identity.js';
 export * from './ipc.js';
+export * from './jsonFile.js';
 export * from './keychain.js';
 export * from './logging.js';
 export * from './pairing.js';
