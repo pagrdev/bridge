@@ -3,6 +3,7 @@ import { deleteIdentity, readConfig, uninstallLaunchAgent } from '@pagr/bridge-c
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
+import { daemonStatus, socketPath } from '../ipc.js';
 import { bold, dim, ok, printJson, warn } from '../output.js';
 import { resolveWebUrl } from '../urls.js';
 
@@ -23,7 +24,9 @@ export async function runLogout(ctx: CliContext, opts: { purge?: boolean }): Pro
       removed.push(f);
     }
   }
-  if (existsSync(ctx.paths.socketPath)) rmSync(ctx.paths.socketPath, { force: true });
+  // Only clear a stale socket: a daemon still answering (e.g. a foreground `daemon run`) keeps it.
+  const sock = socketPath(ctx);
+  if (existsSync(sock) && !(await daemonStatus(ctx))) rmSync(sock, { force: true });
   if (ctx.json) {
     printJson(ctx, {
       deviceId: config.deviceId ?? null,

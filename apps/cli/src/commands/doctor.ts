@@ -3,7 +3,7 @@ import { launchAgentPlistPath, readConfig } from '@pagr/bridge-core';
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
-import { daemonStatus } from '../ipc.js';
+import { daemonStatus, socketPath } from '../ipc.js';
 import { bad, bold, dim, ok, printJson, warn } from '../output.js';
 import { launchAgentLoaded } from './daemon.js';
 
@@ -78,7 +78,7 @@ export async function runChecks(ctx: CliContext): Promise<Check[]> {
     status: status ? 'ok' : 'fail',
     detail: status
       ? `pid ${status.pid}, transport ${status.transport}`
-      : `no socket at ${ctx.paths.socketPath}`,
+      : `no socket at ${socketPath(ctx)}`,
     ...(status
       ? {}
       : { fix: 'run `pagr daemon install` (or `pagr daemon run`), then `pagr daemon logs`' }),

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import type { BridgeFrame, GatewayFrame, Provider } from '@pagr/protocol';
@@ -15,6 +15,7 @@ import {
   renderPlist,
   uninstallLaunchAgent,
 } from './daemon.js';
+import { DaemonAlreadyRunningError } from './daemonLock.js';
 import { verifyRaw } from './identity.js';
 import { IpcClient } from './ipc.js';
 import { MemorySecretStore } from './keychain.js';
@@ -427,5 +428,49 @@ describe('launch agent', () => {
     expect(calls.at(-1)).toEqual(['bootout', 'gui/501/dev.pagr.bridge']);
     expect(uninstallLaunchAgent({ launchAgentsDir: dir, uid: 501, exec })).toBe(false);
     vi.restoreAllMocks();
+  });
+});
+
+describe('daemon single instance', () => {
+  const t = useTempHome('pagr-daemon-single-');
+  const mk = (home: string) =>
+    createDaemon({ home, adapters: new Map(), secretStore: new MemorySecretStore() });
+
+  it('a second daemon on the same home fails with a clear error and never unlinks the live socket', async () => {
+    const home = join(t.home, 'pagr');
+    const first = await mk(home);
+    await first.start();
+    const lockFile = join(home, 'run', 'daemon.lock');
+    expect(readFileSync(lockFile, 'utf8').trim()).toBe(String(process.pid));
+    const second = await mk(home);
+    let err: unknown;
+    try {
+      await second.start();
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(DaemonAlreadyRunningError);
+    expect((err as Error).message).toBe(
+      `another pagr daemon is already running for ${home} (pid ${process.pid})`,
+    );
+    await second.stop(); // non-owner shutdown: lock + socket must survive
+    expect(existsSync(lockFile)).toBe(true);
+    expect(existsSync(first.paths.socketPath)).toBe(true);
+    expect(
+      await new IpcClient(first.paths.socketPath).call<{ pid: number }>('status'),
+    ).toMatchObject({ pid: process.pid });
+    await first.stop();
+    expect(existsSync(lockFile)).toBe(false);
+    expect(existsSync(first.paths.socketPath)).toBe(false);
+  });
+
+  it('reclaims a stale lock left by a dead pid', async () => {
+    const home = join(t.home, 'pagr');
+    mkdirSync(join(home, 'run'), { recursive: true });
+    writeFileSync(join(home, 'run', 'daemon.lock'), '2147483000\n');
+    const d = await mk(home);
+    await d.start();
+    expect(readFileSync(join(home, 'run', 'daemon.lock'), 'utf8').trim()).toBe(String(process.pid));
+    await d.stop();
   });
 });

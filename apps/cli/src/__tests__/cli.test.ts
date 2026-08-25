@@ -1,7 +1,13 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IpcServer } from '@pagr/bridge-core';
-import { getPaths, IpcClientError, PRIVATE_KEY_SECRET, readConfig } from '@pagr/bridge-core';
+import {
+  DaemonAlreadyRunningError,
+  getPaths,
+  IpcClientError,
+  PRIVATE_KEY_SECRET,
+  readConfig,
+} from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EXIT } from '../errors.js';
 import { fakeDaemon, type Harness, harness, lastJson, plain } from './helpers.js';
@@ -275,6 +281,30 @@ describe('daemon', () => {
     };
     expect(await h.run(['daemon', 'run'])).toBe(EXIT.ok);
     expect(seen).toBe(true);
+  });
+  it('run surfaces "already running" from core as exit 5 with the core message', async () => {
+    h.overrides.runDaemonForever = async () => {
+      throw new DaemonAlreadyRunningError(h.home, 777);
+    };
+    expect(await h.run(['daemon', 'run'])).toBe(EXIT.precondition);
+    const err = plain(h.stderr);
+    expect(err).toContain(`another pagr daemon is already running for ${h.home} (pid 777)`);
+    expect(err).toContain('daemon stop');
+  });
+  it('status reports the pid from the lock file even when the socket is unreachable', async () => {
+    const p = getPaths(h.home);
+    mkdirSync(p.runDir, { recursive: true });
+    writeFileSync(p.lockFile, `${process.pid}\n`);
+    expect(await h.run(['--json', 'daemon', 'status'])).toBe(EXIT.ok);
+    expect(lastJson(h)).toMatchObject({ running: false, lockPid: process.pid });
+    h.stdout.length = 0;
+    expect(await h.run(['daemon', 'status'])).toBe(EXIT.ok);
+    expect(plain(h.stdout)).toContain(`lock held by pid ${process.pid}`);
+    // a live daemon: lock pid is reported alongside the IPC status
+    server = await fakeDaemon(h.home, { status: () => status({ pid: process.pid }) });
+    h.stdout.length = 0;
+    expect(await h.run(['--json', 'daemon', 'status'])).toBe(EXIT.ok);
+    expect(lastJson(h)).toMatchObject({ running: true, lockPid: process.pid });
   });
 });
 

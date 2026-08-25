@@ -6,10 +6,11 @@ import type { FetchLike } from './attachments.js';
 import { cleanupTmp } from './attachments.js';
 import { IdempotencyCache, verifyIncoming } from './commandGuard.js';
 import { type BridgeConfig, readConfig, updateConfig } from './config.js';
+import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
 import { Dispatcher } from './dispatcher.js';
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, loadOrCreateIdentity } from './identity.js';
-import { IpcMethodError, IpcServer } from './ipc.js';
+import { IpcMethodError, IpcServer, IpcSocketBusyError } from './ipc.js';
 import type { SecretStore } from './keychain.js';
 import { type Logger, silentLogger } from './logging.js';
 import { ensurePaths, type PagrPaths } from './paths.js';
@@ -392,6 +393,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   }
 
   let cleanupTimer: NodeJS.Timeout | null = null;
+
+  let lock: DaemonLock | null = null;
   const daemon: Daemon = {
     paths,
     identity,
@@ -404,7 +407,18 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       return transport;
     },
     async start() {
-      await ipc.listen();
+      // Single instance per PAGR_HOME: take the pid lock, then bind the socket. Either step
+      // finding a live daemon means we must not proceed (two daemons would share one device
+      // identity and flap the gateway).
+      lock = acquireDaemonLock({ lockPath: paths.lockFile, home: o.home });
+      try {
+        await ipc.listen();
+      } catch (err) {
+        lock.release();
+        lock = null;
+        if (err instanceof IpcSocketBusyError) throw new DaemonAlreadyRunningError(o.home, err.pid);
+        throw err;
+      }
       cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now);
       cleanupTimer = setInterval(() => {
         cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now);
@@ -424,7 +438,9 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       if (cleanupTimer) clearInterval(cleanupTimer);
       await dispatcher.shutdown();
       await transport?.stop();
-      await ipc.close();
+      await ipc.close(); // unlinks the socket only if this instance bound it
+      lock?.release(); // unlinks the lock only if it still records our pid
+      lock = null;
       logger.info('daemon stopped');
     },
     status,
@@ -441,10 +457,12 @@ export async function startDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     d = await createDaemon(o);
     await d.start();
   } catch (err) {
-    // Fail loudly: a daemon that cannot listen on its IPC socket is useless, and launchd would
-    // otherwise keep restarting a silently broken process.
     const message = err instanceof Error ? err.message : String(err);
     logger.error('daemon failed to start', { message });
+    // Another instance owns this home: let the caller (CLI) report it with its own exit code.
+    if (err instanceof DaemonAlreadyRunningError) throw err;
+    // Fail loudly: a daemon that cannot listen on its IPC socket is useless, and launchd would
+    // otherwise keep restarting a silently broken process.
     process.stderr.write(`pagr daemon: failed to start: ${message}\n`);
     process.exit(1);
   }

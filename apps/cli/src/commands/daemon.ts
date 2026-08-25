@@ -2,11 +2,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import {
   type CodingAgentAdapter,
   createLogger,
+  DaemonAlreadyRunningError,
   ensurePaths,
   FakeAdapter,
   installLaunchAgent,
+  isPidAlive,
   launchAgentPlistPath,
   readConfig,
+  readDaemonLock,
   startDaemon,
   uninstallLaunchAgent,
 } from '@pagr/bridge-core';
@@ -14,7 +17,7 @@ import type { Provider } from '@pagr/protocol';
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
-import { daemonStatus } from '../ipc.js';
+import { daemonStatus, socketPath } from '../ipc.js';
 import { bad, dim, kv, ok, printJson, warn } from '../output.js';
 
 /** Mirrors core's launchAgent label (not re-exported from the core index). */
@@ -112,15 +115,28 @@ export function runDaemonUninstall(ctx: CliContext): boolean {
   return removed;
 }
 
+/** Pid recorded in `run/daemon.lock`, if that process is still alive. */
+export function lockedPid(ctx: CliContext): number | null {
+  const lock = readDaemonLock(ctx.paths.lockFile);
+  return lock && isPidAlive(lock.pid) ? lock.pid : null;
+}
+
 export async function runDaemonStatus(ctx: CliContext): Promise<void> {
   const plist = launchAgentPlistPath(ctx.launchAgentsDir);
   const installed = existsSync(plist);
   const loaded = installed && launchAgentLoaded(ctx);
   const status = await daemonStatus(ctx);
+  const lockPid = lockedPid(ctx);
+  const sock = socketPath(ctx);
   if (ctx.json) {
-    printJson(ctx, { installed, loaded, plist, running: Boolean(status), status });
+    printJson(ctx, { installed, loaded, plist, running: Boolean(status), lockPid, status });
     return;
   }
+  const daemonLine = status
+    ? ok(`running (pid ${status.pid}, since ${status.startedAt})`)
+    : lockPid
+      ? warn(`not reachable, but lock held by pid ${lockPid} (socket ${sock} did not answer)`)
+      : bad('not running');
   ctx.out(
     kv([
       [
@@ -129,12 +145,10 @@ export async function runDaemonStatus(ctx: CliContext): Promise<void> {
           ? ok(loaded ? 'installed, loaded' : 'installed, not loaded')
           : bad('not installed'),
       ],
-      [
-        'daemon',
-        status ? ok(`running (pid ${status.pid}, since ${status.startedAt})`) : bad('not running'),
-      ],
+      ['daemon', daemonLine],
       ['transport', status ? status.transport : '—'],
-      ['socket', ctx.paths.socketPath],
+      ['lock', lockPid ? `pid ${lockPid} (${ctx.paths.lockFile})` : 'none'],
+      ['socket', sock],
       ['log', ctx.paths.logFile],
     ]),
   );
@@ -164,7 +178,17 @@ export function registerDaemon(program: Command, getCtx: () => CliContext): void
     .action(async (opts: { mock?: boolean }) => {
       const ctx = getCtx();
       const mock = Boolean(opts.mock) || ctx.env.PAGR_MOCK_AGENTS === '1';
-      await (ctx.runDaemonForever ?? runForeground)(ctx, { mock });
+      try {
+        await (ctx.runDaemonForever ?? runForeground)(ctx, { mock });
+      } catch (err) {
+        if (err instanceof DaemonAlreadyRunningError)
+          throw new CliError(
+            err.message,
+            EXIT.precondition,
+            'stop it first with `pagr daemon stop` (launchd) or kill that pid, then retry',
+          );
+        throw err;
+      }
     });
   d.command('install')
     .description('install + start the launchd agent')

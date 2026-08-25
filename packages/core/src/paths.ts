@@ -10,6 +10,7 @@ import { isAbsolute, join } from 'node:path';
  *   projects.json   local project registry (the ONLY place local paths live)
  *   sessions.json   sessionId → provider session mapping
  *   replay.json     best-effort persisted nonce cache
+ *   run/daemon.lock pid of the running daemon (O_EXCL; single-instance guard)
  *   run/daemon.sock local IPC socket (0600). If that path would exceed the 104-byte
  *                   `sun_path` limit (long PAGR_HOME), the socket lives in a short per-user
  *                   runtime dir instead and its location is written to run/daemon.sock.path.
@@ -24,6 +25,8 @@ export interface PagrPaths {
   replayFile: string;
   policyFile: string;
   runDir: string;
+  /** Single-instance lock holding the daemon pid. */
+  lockFile: string;
   socketPath: string;
   /** Text file holding the socket path actually in use (for hooks / CLI / adapters). */
   socketPathFile: string;
@@ -87,6 +90,7 @@ export function getPaths(home: string = resolvePagrHome()): PagrPaths {
     replayFile: join(home, 'replay.json'),
     policyFile: join(home, 'policy.json'),
     runDir: join(home, 'run'),
+    lockFile: join(home, 'run', 'daemon.lock'),
     socketPath: chooseSocketPath(home),
     socketPathFile: join(home, 'run', 'daemon.sock.path'),
     tmpDir: join(home, 'tmp'),

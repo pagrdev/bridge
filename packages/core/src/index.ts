@@ -5,6 +5,7 @@ export * from './attachments.js';
 export * from './commandGuard.js';
 export * from './config.js';
 export * from './daemon.js';
+export * from './daemonLock.js';
 export * from './dispatcher.js';
 export * from './events.js';
 export * from './identity.js';

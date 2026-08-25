@@ -39,6 +39,42 @@ export class IpcMethodError extends Error {
 }
 
 const MAX_LINE = 1024 * 1024;
+const PROBE_TIMEOUT_MS = 2000;
+
+/** Thrown by `IpcServer.listen()` when something is already answering on the socket path. */
+export class IpcSocketBusyError extends Error {
+  constructor(
+    readonly socketPath: string,
+    readonly pid: number | undefined,
+  ) {
+    super(
+      pid === undefined
+        ? `another daemon is already listening on ${socketPath}`
+        : `another daemon is already listening on ${socketPath} (pid ${pid})`,
+    );
+    this.name = 'IpcSocketBusyError';
+  }
+}
+
+/**
+ * Is a daemon alive behind this socket? Only a refused/missing connection proves it dead;
+ * anything that accepts the connection (even without a `status` method) is treated as live,
+ * because unlinking a socket someone is bound to silently orphans them.
+ */
+async function probeSocket(socketPath: string): Promise<{ alive: boolean; pid?: number }> {
+  try {
+    const res = await new IpcClient(socketPath).call<unknown>(
+      'status',
+      undefined,
+      PROBE_TIMEOUT_MS,
+    );
+    const pid = (res as { pid?: unknown } | null)?.pid;
+    return typeof pid === 'number' ? { alive: true, pid } : { alive: true };
+  } catch (err) {
+    if (err instanceof IpcClientError && err.code === 'connect') return { alive: false };
+    return { alive: true };
+  }
+}
 
 export interface IpcServerOptions {
   socketPath: string;
@@ -50,6 +86,8 @@ export class IpcServer {
   private server: Server | null = null;
   private readonly sockets = new Set<Socket>();
   private readonly logger: Logger;
+  /** True only while this instance has bound the socket; gates every unlink in `close()`. */
+  private bound = false;
   readonly socketPath: string;
 
   constructor(opts: IpcServerOptions) {
@@ -72,11 +110,15 @@ export class IpcServer {
       );
     }
     if (existsSync(this.socketPath)) {
-      // Stale socket from a previous run (or something squatting). Only unlink sockets we own.
+      // An existing socket is either stale (previous run crashed) or live (another daemon on
+      // this home). Only unlink sockets we own AND that nobody answers on.
       const st = statSync(this.socketPath);
       if (!st.isSocket()) throw new Error(`${this.socketPath} exists and is not a socket`);
       if (st.uid !== process.getuid?.())
         throw new Error(`${this.socketPath} owned by another user`);
+      const probe = await probeSocket(this.socketPath);
+      if (probe.alive) throw new IpcSocketBusyError(this.socketPath, probe.pid);
+      this.logger.info('removing stale ipc socket', { socketPath: this.socketPath });
       unlinkSync(this.socketPath);
     }
     const server = createServer((sock) => this.onConnection(sock));
@@ -88,6 +130,7 @@ export class IpcServer {
         resolve();
       });
     });
+    this.bound = true;
     chmodSync(this.socketPath, 0o600);
     const st = statSync(this.socketPath);
     if (st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
@@ -97,12 +140,21 @@ export class IpcServer {
     this.logger.info('ipc listening', { socketPath: this.socketPath });
   }
 
+  /**
+   * Stop listening. The socket file is removed only if this instance bound it: a server whose
+   * `listen()` was refused must never unlink the socket a live daemon is serving on.
+   */
   async close(): Promise<void> {
     for (const s of this.sockets) s.destroy();
     this.sockets.clear();
     const server = this.server;
     this.server = null;
+    const owned = this.bound;
+    this.bound = false;
+    // Note: libuv itself unlinks the path when a bound server closes; the explicit unlink below
+    // just covers the case where that did not happen.
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (!owned) return;
     try {
       if (existsSync(this.socketPath)) unlinkSync(this.socketPath);
     } catch {

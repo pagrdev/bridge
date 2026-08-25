@@ -1,7 +1,8 @@
-import { statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { IpcClient, IpcMethodError, IpcServer } from './ipc.js';
+import { IpcClient, IpcMethodError, IpcServer, IpcSocketBusyError } from './ipc.js';
 import { ensurePaths } from './paths.js';
 import { useTempHome } from './testUtil.js';
 
@@ -48,5 +49,58 @@ describe('ipc', () => {
     const long = new IpcServer({ socketPath: join(t.home, 'z'.repeat(110), 'daemon.sock') });
     await expect(long.listen()).rejects.toThrow(/too long/);
     await server.listen();
+  });
+});
+
+describe('ipc single instance', () => {
+  const t = useTempHome('pagr-ipc-single-');
+
+  it('refuses to listen while a live daemon answers on the socket; the loser never unlinks it', async () => {
+    const socketPath = ensurePaths(join(t.home, 'p')).socketPath;
+    const live = new IpcServer({ socketPath });
+    live.registerMethod('status', () => ({ pid: 111 }));
+    await live.listen();
+    const loser = new IpcServer({ socketPath });
+    let err: unknown;
+    try {
+      await loser.listen();
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(IpcSocketBusyError);
+    expect((err as IpcSocketBusyError).pid).toBe(111);
+    expect((err as Error).message).toMatch(/already .*pid 111/);
+    await loser.close(); // must not touch the live socket
+    expect(existsSync(socketPath)).toBe(true);
+    expect(await new IpcClient(socketPath).call('status')).toEqual({ pid: 111 });
+    await live.close();
+    expect(existsSync(socketPath)).toBe(false);
+  });
+
+  it('still refuses when the listener does not implement status (something is bound)', async () => {
+    const socketPath = ensurePaths(join(t.home, 'q')).socketPath;
+    const live = new IpcServer({ socketPath });
+    await live.listen();
+    const loser = new IpcServer({ socketPath });
+    await expect(loser.listen()).rejects.toBeInstanceOf(IpcSocketBusyError);
+    await loser.close();
+    expect(existsSync(socketPath)).toBe(true);
+    await live.close();
+  });
+
+  it('unlinks a dead socket (ECONNREFUSED) and listens', async () => {
+    const socketPath = ensurePaths(join(t.home, 'r')).socketPath;
+    // Simulate a crash: a child binds the socket and is SIGKILLed, so nothing unlinks the file.
+    const child = spawnSync(process.execPath, [
+      '-e',
+      `require('node:net').createServer().listen(${JSON.stringify(socketPath)}, () => process.kill(process.pid, 'SIGKILL'))`,
+    ]);
+    expect(child.signal).toBe('SIGKILL');
+    expect(existsSync(socketPath)).toBe(true);
+    const next = new IpcServer({ socketPath });
+    next.registerMethod('echo', (p) => p);
+    await next.listen();
+    expect(await new IpcClient(socketPath).call('echo', 2)).toBe(2);
+    await next.close();
   });
 });
