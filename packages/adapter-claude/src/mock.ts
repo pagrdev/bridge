@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { statSync } from 'node:fs';
+import { basename } from 'node:path';
 import type {
   AdapterEvent,
   AgentConnectionStatus,
@@ -18,19 +20,45 @@ interface MockSession {
   timers: NodeJS.Timeout[];
   pendingApproval: { approvalId: string; providerRequestId: string; timer: NodeJS.Timeout } | null;
   queued: string[];
+  /** Appended to the next completion so the attachment chain is assertable end-to-end. */
+  attachmentNote: string | null;
 }
 
 const now = () => new Date().toISOString();
 const newApprovalId = () => `apr_${randomUUID().replace(/-/g, '')}`;
 
 /**
+ * Reads the attachments the dispatcher downloaded before it deletes them (it unlinks each file as
+ * soon as the adapter call returns), so the note proves the bytes really arrived on this Mac.
+ */
+export function describeMockAttachments(paths: readonly string[]): string | null {
+  if (paths.length === 0) return null;
+  let bytes = 0;
+  const present: string[] = [];
+  for (const p of paths) {
+    try {
+      bytes += statSync(p).size;
+      present.push(basename(p));
+    } catch {
+      // deleted or never written — reported as missing below
+    }
+  }
+  if (present.length === 0) return `📎 ${paths.length} attachment(s) missing on disk.`;
+  return `📎 ${present.length} screenshot${present.length === 1 ? '' : 's'} (${bytes} bytes: ${present.join(', ')}) received.`;
+}
+
+/**
  * Process-free Claude stand-in (env `PAGR_MOCK_AGENTS=1`).
  * Scripted turn: started → progress "Reading auth module…" → (approval for a Write when the
  * instruction mentions "write") → completed "Auth flow implemented, 68 tests pass."
- * No steering: follow-ups during a turn are queued and delivered after completion.
+ * No steering: follow-ups during a turn are queued and delivered after completion. Attachments the
+ * dispatcher downloaded are recorded in `deliveredImages` and named in that turn's completion
+ * ("📎 1 screenshot (…) received.").
  */
 export class MockClaudeAdapter implements CodingAgentAdapter {
   readonly provider = 'claude' as const;
+  /** Every `localImagePaths` array handed to this adapter, per session (E2E introspection). */
+  readonly deliveredImages = new Map<string, string[]>();
   private readonly sessions = new Map<string, MockSession>();
   private readonly listeners = new Set<(e: AdapterEvent) => void>();
   private readonly delay: number;
@@ -93,11 +121,20 @@ export class MockClaudeAdapter implements CodingAgentAdapter {
       timers: [],
       pendingApproval: null,
       queued: [],
+      attachmentNote: null,
     };
     this.sessions.set(input.sessionId, s);
+    this.record(s, input.sessionId, input.localImagePaths);
     this.emit({ kind: 'session', session: s.summary });
     this.runTurn(s, input.instruction);
     return s.summary;
+  }
+
+  /** Snapshot the attachments now: the dispatcher unlinks them the moment this call returns. */
+  private record(s: MockSession, sessionId: string, localImagePaths: readonly string[]): void {
+    if (localImagePaths.length === 0) return;
+    this.deliveredImages.set(sessionId, [...localImagePaths]);
+    s.attachmentNote = describeMockAttachments(localImagePaths);
   }
 
   async sendInstruction(
@@ -105,6 +142,7 @@ export class MockClaudeAdapter implements CodingAgentAdapter {
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
     const s = this.sessions.get(input.sessionId);
     if (!s) throw new Error(`unknown session ${input.sessionId}`);
+    this.record(s, input.sessionId, input.localImagePaths);
     if (s.summary.activeTurn) {
       s.queued.push(input.instruction);
       this.event(s, 'queued_followup', input.instruction);
@@ -205,7 +243,9 @@ export class MockClaudeAdapter implements CodingAgentAdapter {
     });
   }
 
-  private finish(s: MockSession, message: string): void {
+  private finish(s: MockSession, summary: string): void {
+    const message = s.attachmentNote ? `${summary} ${s.attachmentNote}` : summary;
+    s.attachmentNote = null; // the note belongs to the turn the images arrived on
     this.after(s, this.delay / 3, () => {
       this.event(s, 'agent_message', message);
       this.setStatus(s, 'completed', { activeTurn: false });

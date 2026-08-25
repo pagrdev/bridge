@@ -218,6 +218,209 @@ export class IpcServer {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Claude Code Channel bridge  (ADR 0001 mode `approved-channel` — research preview)
+// ---------------------------------------------------------------------------
+//
+// A "channel" is an MCP stdio server Claude Code spawns and pushes events into
+// (https://code.claude.com/docs/en/channels-reference, fetched 2026-08-24). The Pagr channel
+// server (`@pagr/claude-channel`) is that MCP server; it talks to this daemon over the same
+// Unix socket the hooks use. Everything below is additive: nothing here runs unless the
+// channel server actually connects and calls these methods.
+//
+// Two methods:
+//   channel.poll     {cwd, cursor?}            → long-poll for texts queued for that project
+//   channel.outbound {sessionId?, cwd, text}   → Claude's `reply` tool → cloud → user's phone
+//
+// A project becomes *channel-attached* on its first `channel.poll`; that is what flips the
+// Claude adapter from "queue a follow-up" to real live steering.
+
+/** One queued inbound text, addressed by a per-project monotonic cursor. */
+export interface ChannelMessage {
+  seq: number;
+  text: string;
+}
+
+export interface ChannelPollResult {
+  cursor: number;
+  messages: ChannelMessage[];
+}
+
+/** Session identity the daemon has bound to a channel-attached project. */
+export interface ChannelSessionBinding {
+  cwd: string;
+  projectId: string;
+}
+
+interface ChannelQueue {
+  seq: number;
+  messages: ChannelMessage[];
+  waiters: Set<() => void>;
+  attachedAt: string;
+}
+
+/** Keep the tail only: a channel that stops polling must not grow the daemon's heap. */
+const CHANNEL_QUEUE_MAX = 200;
+/** Long-poll ceiling. Well under Claude Code's own stdio patience and any proxy idle timeout. */
+export const CHANNEL_POLL_TIMEOUT_MS = 25_000;
+
+/**
+ * In-memory inbound queue + session bindings shared by the daemon's IPC methods and the Claude
+ * adapter. Keyed by the *registered project root*, so a channel started in a subdirectory still
+ * lands on the same queue. Nothing is persisted: a channel that dies loses its backlog, which is
+ * correct — replaying a steer into a session that no longer exists would be worse than dropping it.
+ */
+export class ChannelBridge {
+  private readonly queues = new Map<string, ChannelQueue>();
+  private readonly bindings = new Map<string, ChannelSessionBinding>();
+
+  private queue(cwd: string): ChannelQueue {
+    let q = this.queues.get(cwd);
+    if (!q) {
+      q = { seq: 0, messages: [], waiters: new Set(), attachedAt: new Date().toISOString() };
+      this.queues.set(cwd, q);
+    }
+    return q;
+  }
+
+  /** Mark a project root as served by a live channel. Called on every `channel.poll`. */
+  attach(cwd: string): void {
+    this.queue(cwd);
+  }
+
+  isAttached(cwd: string): boolean {
+    return this.queues.has(cwd);
+  }
+
+  attachedProjects(): string[] {
+    return [...this.queues.keys()];
+  }
+
+  /** Remember which channel-attached project a `ses_…` belongs to (adapter lookup path). */
+  bindSession(sessionId: string, binding: ChannelSessionBinding): void {
+    this.bindings.set(sessionId, binding);
+  }
+
+  bindingFor(sessionId: string): ChannelSessionBinding | undefined {
+    return this.bindings.get(sessionId);
+  }
+
+  /** Queue a text for injection and wake any long-poll waiting on this project. */
+  enqueue(cwd: string, text: string): ChannelMessage {
+    const q = this.queue(cwd);
+    q.seq += 1;
+    const msg: ChannelMessage = { seq: q.seq, text };
+    q.messages.push(msg);
+    if (q.messages.length > CHANNEL_QUEUE_MAX)
+      q.messages.splice(0, q.messages.length - CHANNEL_QUEUE_MAX);
+    for (const wake of [...q.waiters]) wake();
+    return msg;
+  }
+
+  /** Everything newer than `cursor`, waiting up to `timeoutMs` for the first arrival. */
+  async poll(cwd: string, cursor: number, timeoutMs: number): Promise<ChannelPollResult> {
+    const q = this.queue(cwd);
+    const take = (): ChannelPollResult | null => {
+      const messages = q.messages.filter((m) => m.seq > cursor);
+      if (messages.length === 0) return null;
+      return { cursor: messages[messages.length - 1]?.seq ?? cursor, messages };
+    };
+    const immediate = take();
+    if (immediate) return immediate;
+    await new Promise<void>((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        q.waiters.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, Math.max(0, timeoutMs));
+      timer.unref?.();
+      q.waiters.add(wake);
+    });
+    return take() ?? { cursor: Math.min(cursor, q.seq), messages: [] };
+  }
+
+  /** Drop every queue and binding (daemon shutdown, tests). */
+  reset(): void {
+    for (const q of this.queues.values()) for (const wake of [...q.waiters]) wake();
+    this.queues.clear();
+    this.bindings.clear();
+  }
+}
+
+let sharedChannelBridge: ChannelBridge | null = null;
+
+/**
+ * Process-wide bridge. The daemon and the Claude adapter live in the same process but are
+ * wired through different packages, so they meet here rather than through constructor plumbing.
+ */
+export function getChannelBridge(): ChannelBridge {
+  if (!sharedChannelBridge) sharedChannelBridge = new ChannelBridge();
+  return sharedChannelBridge;
+}
+
+const ChannelPollParams = z.object({
+  cwd: z.string().min(1),
+  cursor: z.number().int().nonnegative().optional(),
+});
+
+const ChannelOutboundParams = z.object({
+  sessionId: z.string().min(1).max(200).optional(),
+  cwd: z.string().min(1),
+  text: z.string().min(1).max(4000),
+});
+
+export interface ChannelIpcDeps {
+  bridge?: ChannelBridge;
+  /** Map a channel's cwd onto a registered project, or null when it is not registered. */
+  resolveProject(cwd: string): { projectId: string; path: string } | null;
+  /** Existing local `ses_…` ids for this project, bound so live steering can find the queue. */
+  claudeSessionsIn(projectId: string): string[];
+  /** Mint (or reuse) the local session id representing this interactive Claude Code session. */
+  ensureSession(input: { projectId: string; sessionId?: string | undefined }): string;
+  /** Emit a `session.event` of kind `agent_message` so the cloud texts the user. */
+  emitAgentMessage(input: { sessionId: string; projectId: string; text: string }): void;
+  pollTimeoutMs?: number;
+}
+
+/**
+ * Register `channel.poll` and `channel.outbound` on an existing IPC server. Purely additive —
+ * no existing method changes behaviour, and a daemon that never registers these is unaffected.
+ */
+export function registerChannelMethods(ipc: IpcServer, deps: ChannelIpcDeps): ChannelBridge {
+  const bridge = deps.bridge ?? getChannelBridge();
+  const timeoutMs = deps.pollTimeoutMs ?? CHANNEL_POLL_TIMEOUT_MS;
+
+  const project = (cwd: string) => {
+    const rec = deps.resolveProject(cwd);
+    if (!rec) throw new IpcMethodError('unknown_project', 'cwd is not inside a registered project');
+    return rec;
+  };
+
+  ipc.registerMethod('channel.poll', async (params) => {
+    const p = ChannelPollParams.parse(params);
+    const rec = project(p.cwd);
+    bridge.attach(rec.path);
+    // Re-bind on every poll: a session minted after the channel started (permission hook,
+    // cloud-started turn) becomes steerable within one poll interval.
+    for (const sessionId of deps.claudeSessionsIn(rec.projectId))
+      bridge.bindSession(sessionId, { cwd: rec.path, projectId: rec.projectId });
+    const res = await bridge.poll(rec.path, p.cursor ?? 0, timeoutMs);
+    return { ...res, projectId: rec.projectId, projectPath: rec.path };
+  });
+
+  ipc.registerMethod('channel.outbound', (params) => {
+    const p = ChannelOutboundParams.parse(params);
+    const rec = project(p.cwd);
+    const sessionId = deps.ensureSession({ projectId: rec.projectId, sessionId: p.sessionId });
+    bridge.bindSession(sessionId, { cwd: rec.path, projectId: rec.projectId });
+    deps.emitAgentMessage({ sessionId, projectId: rec.projectId, text: p.text });
+    return { ok: true, sessionId, projectId: rec.projectId };
+  });
+
+  return bridge;
+}
+
 export class IpcClientError extends Error {
   constructor(
     readonly code: string,

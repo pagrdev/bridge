@@ -1,7 +1,10 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AdapterEvent } from '@pagr/bridge-core';
 import { describe, expect, it } from 'vitest';
 import { createCodexAdapter } from './index.js';
-import { MockCodexAdapter } from './mock.js';
+import { describeMockAttachments, MockCodexAdapter } from './mock.js';
 
 const SES = 'ses_00000000000000000000000000000001';
 const PROJ = 'proj_0000000000000000000000000000000a';
@@ -71,6 +74,64 @@ describe('MockCodexAdapter', () => {
     const done = await c.until((e) => e.kind === 'session_event' && e.type === 'completed');
     expect(done).toMatchObject({ summary: 'All 12 tests pass.' });
     await a.shutdown();
+  });
+
+  it('completes with the linter script when the instruction mentions lint', async () => {
+    const a = new MockCodexAdapter({ delayMs: 30 });
+    const c = collect(a);
+    await a.startSession({
+      sessionId: SES,
+      project,
+      instruction: 'run the linter',
+      localImagePaths: [],
+      readOnly: false,
+    });
+    const done = await c.until((e) => e.kind === 'session_event' && e.type === 'completed');
+    expect(done).toMatchObject({ summary: 'Linter clean: 0 problems.' });
+    await a.shutdown();
+  });
+
+  it('records the delivered attachments and names them in that turn’s completion', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pagr-mock-att-'));
+    const img = join(dir, 'att_0123.png');
+    writeFileSync(img, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const a = new MockCodexAdapter({ delayMs: 30 });
+    const c = collect(a);
+    await a.startSession({
+      sessionId: SES,
+      project,
+      instruction: 'fix the button spacing',
+      localImagePaths: [img],
+      readOnly: false,
+    });
+    expect(a.deliveredImages.get(SES)).toEqual([img]);
+    const done = await c.until((e) => e.kind === 'session_event' && e.type === 'completed');
+    expect(done).toMatchObject({
+      summary: 'All 12 tests pass. 📎 1 screenshot (8 bytes: att_0123.png) received.',
+    });
+    // The note belongs to that turn only — the next one is unadorned.
+    await a.sendInstruction({
+      sessionId: SES,
+      instruction: 'again',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    const completions = c.events.flatMap((e) =>
+      e.kind === 'session_event' && e.type === 'completed' ? [e.summary] : [],
+    );
+    expect(completions).toEqual([
+      'All 12 tests pass. 📎 1 screenshot (8 bytes: att_0123.png) received.',
+      'All 12 tests pass.',
+    ]);
+    await a.shutdown();
+  });
+
+  it('reports attachments the dispatcher already deleted instead of pretending', () => {
+    expect(describeMockAttachments([])).toBeNull();
+    expect(describeMockAttachments(['/nope/att_1.png'])).toBe(
+      '📎 1 attachment(s) missing on disk.',
+    );
   });
 
   it('honours steer, queue and stop', async () => {

@@ -1,5 +1,6 @@
 import { Command, CommanderError } from 'commander';
 import { registerBilling } from './commands/billing.js';
+import { registerClaude } from './commands/claude.js';
 import { registerConnect } from './commands/connect.js';
 import { registerDaemon } from './commands/daemon.js';
 import { registerDoctor } from './commands/doctor.js';
@@ -47,6 +48,7 @@ export function createProgram(overrides: ContextOverrides = {}): Command {
   registerSessions(program, getCtx);
   registerDaemon(program, getCtx);
   registerBilling(program, getCtx);
+  registerClaude(program, getCtx);
   registerLogout(program, getCtx);
   return program;
 }

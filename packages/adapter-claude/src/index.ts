@@ -2,9 +2,19 @@ import os from 'node:os';
 import path from 'node:path';
 import type { CodingAgentAdapter } from '@pagr/bridge-core';
 import { ClaudeAdapter, type ClaudeAdapterOptions } from './adapter.js';
+import { channelModeEnabled } from './channel-mode.js';
 import { MockClaudeAdapter, type MockClaudeOptions } from './mock.js';
 
 export { ClaudeAdapter, type ClaudeAdapterOptions, newApprovalId } from './adapter.js';
+export {
+  CHANNEL_FLAG_ENV,
+  CHANNEL_PROBE_DETAIL,
+  ChannelMode,
+  type ChannelTarget,
+  channelCapabilities,
+  channelModeEnabled,
+  channelStatus,
+} from './channel-mode.js';
 export { ClaudeProcess, type ClaudeProcessOptions } from './claude-process.js';
 export { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 export { bundledHookPath, hookSettings, installHooks } from './hooks/install.js';
@@ -23,6 +33,8 @@ export interface CreateClaudeAdapterOptions extends Partial<Omit<ClaudeAdapterOp
   /** Use the scripted in-process mock. Defaults to `PAGR_MOCK_AGENTS=1`. */
   mock?: boolean;
   mockOptions?: MockClaudeOptions;
+  /** Environment consulted for `PAGR_CLAUDE_CHANNEL`; defaults to `process.env`. */
+  processEnv?: NodeJS.ProcessEnv;
 }
 
 export function defaultPagrHome(): string {
@@ -30,8 +42,14 @@ export function defaultPagrHome(): string {
 }
 
 export function createClaudeAdapter(opts: CreateClaudeAdapterOptions = {}): CodingAgentAdapter {
-  const mock = opts.mock ?? process.env.PAGR_MOCK_AGENTS === '1';
+  const env = opts.processEnv ?? process.env;
+  const mock = opts.mock ?? env.PAGR_MOCK_AGENTS === '1';
   if (mock) return new MockClaudeAdapter(opts.mockOptions);
-  const { home, mock: _m, mockOptions: _mo, ...rest } = opts;
-  return new ClaudeAdapter({ home: home ?? defaultPagrHome(), ...rest });
+  const { home, mock: _m, mockOptions: _mo, processEnv: _pe, ...rest } = opts;
+  // ADR 0001: `approved-channel` is feature-flagged and off unless the operator opts in.
+  return new ClaudeAdapter({
+    ...rest,
+    home: home ?? defaultPagrHome(),
+    channel: opts.channel ?? channelModeEnabled(env),
+  });
 }

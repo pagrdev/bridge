@@ -6,12 +6,14 @@ import path from 'node:path';
 import type {
   AdapterEvent,
   AgentConnectionStatus,
+  ChannelBridge,
   CodingAgentAdapter,
   SendInstructionInput,
   SessionSummary,
   StartSessionInput,
 } from '@pagr/bridge-core';
 import { resolveSocketPath } from '@pagr/bridge-core';
+import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.js';
 import { ClaudeProcess } from './claude-process.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 import { FileLogger } from './logger.js';
@@ -26,6 +28,10 @@ export interface ClaudeAdapterOptions {
   /** Extra env for spawned processes (tests). */
   env?: NodeJS.ProcessEnv;
   log?: boolean;
+  /** ADR 0001 `approved-channel`. Set by `createClaudeAdapter` from `PAGR_CLAUDE_CHANNEL=1`. */
+  channel?: boolean;
+  /** Test seam; defaults to the daemon's process-wide bridge. */
+  channelBridge?: ChannelBridge;
 }
 
 interface LiveSession {
@@ -50,6 +56,12 @@ interface PendingApproval {
 
 export const newApprovalId = (): string => `apr_${randomUUID().replace(/-/g, '')}`;
 const now = () => new Date().toISOString();
+
+/** Attachments are referenced by local path; Claude reads them with its own tools. */
+const withImages = (instruction: string, images: string[]): string =>
+  images.length
+    ? `${images.map((p) => `See screenshot at ${p}`).join('\n')}\n\n${instruction}`
+    : instruction;
 
 const CAPABILITIES = {
   canStartSession: true,
@@ -76,6 +88,8 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly listeners = new Set<(e: AdapterEvent) => void>();
   private readonly map: SessionMap;
+  /** Non-null only under `PAGR_CLAUDE_CHANNEL=1` (ADR 0001 `approved-channel`, dev flag only). */
+  private readonly channel: ChannelMode | null;
   private shuttingDown = false;
 
   constructor(private readonly opts: ClaudeAdapterOptions) {
@@ -83,6 +97,9 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       opts.log === false ? null : path.join(opts.home, 'logs', 'claude.log'),
     );
     this.map = new SessionMap(path.join(opts.home, 'claude-sessions.json'));
+    this.channel = opts.channel
+      ? new ChannelMode(...(opts.channelBridge ? [opts.channelBridge] : []))
+      : null;
   }
 
   subscribe(emit: (e: AdapterEvent) => void): () => void {
@@ -135,7 +152,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       capabilities: { ...CAPABILITIES },
     };
     if (authStatus !== 'authenticated') status.detail = 'Run `claude` once and sign in';
-    return status;
+    return this.channel ? channelStatus(status) : status;
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -217,6 +234,21 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   async sendInstruction(
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
+    // Channel mode: if a Pagr channel server is polling for this session's project, the text is
+    // injected into the *running* Claude Code session (`notifications/claude/channel`). That is
+    // real live steering — the one case where ADR 0001 permits `delivered: 'steered'`.
+    const target = this.channel?.resolve(input.sessionId, this.locationOf(input.sessionId));
+    if (this.channel && target) {
+      this.channel.deliver(target, withImages(input.instruction, input.localImagePaths));
+      this.emit({
+        kind: 'session_event',
+        sessionId: input.sessionId,
+        projectId: target.projectId,
+        type: 'followup_delivered',
+        summary: clip(input.instruction, 500),
+      });
+      return { delivered: 'steered' };
+    }
     const live = this.requireLive(input.sessionId);
     if (live.activeTurn && live.proc?.alive) {
       // No live steering without Channels: queue and deliver after `result` (ADR 0001).
@@ -386,11 +418,17 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     proc.start();
   }
 
+  /** Registered project a session belongs to, as far as this adapter knows. */
+  private locationOf(sessionId: string): ChannelTarget | null {
+    const live = this.sessions.get(sessionId);
+    if (live) return { cwd: live.projectPath, projectId: live.summary.projectId };
+    const p = this.map.get(sessionId);
+    return p ? { cwd: p.projectPath, projectId: p.projectId } : null;
+  }
+
   private sendTurn(live: LiveSession, instruction: string, images: string[]): void {
     if (!live.proc?.alive) throw new Error('claude process not running');
-    const text = images.length
-      ? `${images.map((p) => `See screenshot at ${p}`).join('\n')}\n\n${instruction}`
-      : instruction;
+    const text = withImages(instruction, images);
     live.activeTurn = true;
     live.lastText = '';
     live.proc.sendUser(text);

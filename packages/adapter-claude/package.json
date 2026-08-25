@@ -2,6 +2,15 @@
   "name": "@pagr/bridge-adapter-claude",
   "version": "0.1.0",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stagberry-labs/pagr-bridge.git",
+    "directory": "packages/adapter-claude"
+  },
+  "homepage": "https://github.com/stagberry-labs/pagr-bridge/tree/main/packages/adapter-claude#readme",
+  "bugs": {
+    "url": "https://github.com/stagberry-labs/pagr-bridge/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,10 +21,11 @@
     }
   },
   "files": [
-    "dist",
-    "src/hooks",
-    "src/generated"
+    "dist"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/hooks && cp src/hooks/permission.mjs dist/hooks/permission.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",

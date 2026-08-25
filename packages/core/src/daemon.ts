@@ -10,7 +10,7 @@ import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from '.
 import { Dispatcher } from './dispatcher.js';
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, loadOrCreateIdentity } from './identity.js';
-import { IpcMethodError, IpcServer, IpcSocketBusyError } from './ipc.js';
+import { IpcMethodError, IpcServer, IpcSocketBusyError, registerChannelMethods } from './ipc.js';
 import type { SecretStore } from './keychain.js';
 import { type Logger, silentLogger } from './logging.js';
 import { ensurePaths, type PagrPaths } from './paths.js';
@@ -390,6 +390,62 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
 
   function dispatcherDeviceId(): string {
     return identity.deviceId ?? `dev_${'0'.repeat(32)}`;
+  }
+
+  // --- Claude Code Channel (ADR 0001 `approved-channel`, research preview) -------------------
+  // Additive and flag-gated: without PAGR_CLAUDE_CHANNEL=1 these methods are never registered
+  // and the daemon behaves exactly as before. See integrations/claude-channel/README.md.
+  const channelEnv = o.env ?? process.env;
+  if (channelEnv.PAGR_CLAUDE_CHANNEL === '1') {
+    registerChannelMethods(ipc, {
+      resolveProject: (cwd) => {
+        const rec = registry.findByPath(cwd);
+        return rec ? { projectId: rec.projectId, path: rec.path } : null;
+      },
+      claudeSessionsIn: (projectId) =>
+        sessions
+          .list()
+          .filter((s) => s.provider === 'claude' && s.projectId === projectId)
+          .map((s) => s.sessionId),
+      ensureSession: ({ projectId, sessionId }) => {
+        if (sessionId && sessions.has(sessionId)) return sessionId;
+        // One stable local session per project for the user's own channel-attached Claude Code,
+        // mirroring the hook path in `approval.request`.
+        const id = sessionId ?? syntheticSessionId('claude', `channel:${projectId}`);
+        const existing = sessions.get(id);
+        const ts = now().toISOString();
+        const rec = sessions.upsert({
+          sessionId: id,
+          provider: 'claude',
+          projectId,
+          providerSessionId: existing?.providerSessionId ?? id,
+          status: existing?.status ?? 'working',
+          startedAt: existing?.startedAt ?? ts,
+          updatedAt: ts,
+        });
+        if (!existing)
+          emit(makeEvent(dispatcherDeviceId(), 'session.updated', summaryOf(rec), { now }));
+        return id;
+      },
+      emitAgentMessage: ({ sessionId, projectId, text }) => {
+        emit(
+          makeEvent(
+            dispatcherDeviceId(),
+            'session.event',
+            {
+              sessionId,
+              projectId,
+              provider: 'claude',
+              kind: 'agent_message',
+              summary: text.slice(0, 2000),
+              at: now().toISOString(),
+            },
+            { now },
+          ),
+        );
+      },
+    });
+    logger.warn('Claude Code channel IPC enabled (research preview; dev flag only)');
   }
 
   let cleanupTimer: NodeJS.Timeout | null = null;

@@ -33,7 +33,15 @@ packages/core             daemon, device auth, transport, guard, projects, IPC, 
 packages/adapter-codex    Codex app-server adapter
 packages/adapter-claude   Claude Code CLI + hooks adapter
 apps/cli                  the `pagr` command
+integrations/             optional add-ons, not part of the default install
+packaging/                Homebrew formula template + release runbook
 ```
+
+Optional: [`integrations/claude-channel`](integrations/claude-channel/README.md) is a Claude Code
+*channel* server that lets Pagr steer an in-flight Claude turn instead of queueing a follow-up.
+Channels are an Anthropic **research preview** and custom ones require
+`--dangerously-load-development-channels`, so it is off unless you set `PAGR_CLAUDE_CHANNEL=1`.
+Nothing in the default install depends on it.
 
 ## Develop
 
