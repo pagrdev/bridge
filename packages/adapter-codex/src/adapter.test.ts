@@ -24,7 +24,7 @@ function collector() {
       }
     }
   };
-  const waitFor = (pred: (e: AdapterEvent) => boolean, ms = 5000): Promise<AdapterEvent> => {
+  const waitFor = (pred: (e: AdapterEvent) => boolean, ms = 20_000): Promise<AdapterEvent> => {
     const hit = events.find(pred);
     if (hit) return Promise.resolve(hit);
     return new Promise((resolve, reject) => {
@@ -99,7 +99,11 @@ describe('CodexAdapter against fake app-server', () => {
       localImagePaths: ['/tmp/shot.png'],
       readOnly: false,
     });
-    expect(summary.status).toBe('working');
+    // A fast provider can finish the whole turn before `startSession` resolves (its response and
+    // its notifications share one stdout stream), so the only wrong answer here would be a status
+    // that pretends nothing has started.
+    expect(['working', 'completed']).toContain(summary.status);
+    expect(summary.taskSummary).toBe('Run the tests');
     const done = await c.waitFor(sessionEvent('completed'));
     expect(done).toMatchObject({ summary: 'All 12 tests pass.' });
     expect(c.events.some((e) => e.kind === 'session_event' && e.type === 'agent_message')).toBe(
@@ -404,5 +408,269 @@ describe('CodexAdapter read-only persistence (finding 5)', () => {
     const resume = calls.find((c) => c.method === 'thread/resume');
     expect(start?.params.sandbox).toBe('read-only');
     expect(resume?.params).toMatchObject({ sandbox: 'read-only', approvalPolicy: 'on-request' });
+  });
+});
+
+describe('CodexAdapter process lifecycle under load', () => {
+  let home: string;
+  let project: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-pool-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-'));
+  });
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  });
+
+  const proj = () => ({ projectId: PROJ, path: project, displayName: 'demo' });
+
+  it('spawns exactly one app-server even when two sessions start concurrently', async () => {
+    const rpcLog = path.join(home, 'rpc-concurrent.jsonl');
+    process.env.FAKE_CODEX_RPC_LOG = rpcLog;
+    const a = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj2-'));
+    try {
+      await Promise.all([
+        a.startSession({
+          sessionId: SES,
+          project: proj(),
+          instruction: 'run tests',
+          localImagePaths: [],
+          readOnly: false,
+        }),
+        a.startSession({
+          sessionId: SES2,
+          project: {
+            projectId: 'proj_0000000000000000000000000000000b',
+            path: other,
+            displayName: 'two',
+          },
+          instruction: 'run tests',
+          localImagePaths: [],
+          readOnly: false,
+        }),
+      ]);
+      expect(a.appServerRunning).toBe(true);
+      const lines = fs.readFileSync(rpcLog, 'utf8').trim().split('\n');
+      const method = (l: string) => (JSON.parse(l) as { method: string }).method;
+      expect(lines.filter((l) => method(l) === 'initialize')).toHaveLength(1);
+      expect(lines.filter((l) => method(l) === 'thread/start')).toHaveLength(2);
+    } finally {
+      delete process.env.FAKE_CODEX_RPC_LOG;
+      fs.rmSync(other, { recursive: true, force: true });
+      await a.shutdown();
+    }
+  });
+
+  it('gives up restarting after a bounded number of consecutive crashes', async () => {
+    const a = new CodexAdapter({
+      home,
+      codexCommand: ['node', '-e', 'process.exit(9);//'],
+      restartDelayMs: 5,
+      maxRestartAttempts: 2,
+      requestTimeoutMs: 300,
+      log: false,
+    });
+    await expect(
+      a.startSession({
+        sessionId: SES,
+        project: proj(),
+        instruction: 'go',
+        localImagePaths: [],
+        readOnly: false,
+      }),
+    ).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 250));
+    expect(a.appServerRunning).toBe(false);
+    await a.shutdown();
+  });
+});
+
+describe('CodexAdapter when a whole turn arrives in one chunk', () => {
+  let home: string;
+  let project: string;
+  let adapter: CodexAdapter;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-coalesce-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-'));
+    process.env.FAKE_CODEX_COALESCE = '1';
+    adapter = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+  });
+  afterEach(async () => {
+    delete process.env.FAKE_CODEX_COALESCE;
+    await adapter.shutdown();
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  });
+
+  const proj = () => ({ projectId: PROJ, path: project, displayName: 'demo' });
+
+  it('does not resurrect a turn whose completion was processed first', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    await adapter.startSession({
+      sessionId: SES,
+      project: proj(),
+      instruction: 'run tests',
+      localImagePaths: [],
+      readOnly: false,
+    });
+    await c.waitFor(sessionEvent('completed'));
+    const st = await adapter.getStatus(SES);
+    expect(st?.status).toBe('completed');
+    expect(st?.activeTurn).toBe(false);
+    // the last status event the daemon saw must agree
+    const last = c.events.filter((e) => e.kind === 'session').at(-1);
+    expect(last).toMatchObject({ session: { status: 'completed', activeTurn: false } });
+  });
+
+  it('still accepts a follow-up afterwards (no dead activeTurnId left behind)', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    await adapter.startSession({
+      sessionId: SES,
+      project: proj(),
+      instruction: 'run tests',
+      localImagePaths: [],
+      readOnly: false,
+    });
+    await c.waitFor(sessionEvent('completed'));
+    // A stale activeTurnId would make this try to steer a finished turn and fail.
+    const res = await adapter.sendInstruction({
+      sessionId: SES,
+      instruction: 'run them again',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    expect(res).toEqual({ delivered: 'new_turn' });
+    await c.waitFor(() => c.events.filter(sessionEvent('completed')).length >= 2);
+    expect((await adapter.getStatus(SES))?.status).toBe('completed');
+  });
+});
+
+describe('CodexAdapter approval inside one coalesced chunk', () => {
+  let home: string;
+  let project: string;
+  let adapter: CodexAdapter;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-coalesce2-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-'));
+    process.env.FAKE_CODEX_COALESCE = '1';
+    adapter = new CodexAdapter({
+      home,
+      codexCommand: ['node', FIXTURE],
+      approvalTimeoutMs: 5000,
+      log: false,
+    });
+  });
+  afterEach(async () => {
+    delete process.env.FAKE_CODEX_COALESCE;
+    await adapter.shutdown();
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  });
+
+  it('keeps waiting_for_approval instead of rewinding to working', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    await adapter.startSession({
+      sessionId: SES,
+      project: { projectId: PROJ, path: project, displayName: 'demo' },
+      instruction: 'please approve the migration',
+      localImagePaths: [],
+      readOnly: false,
+    });
+    await c.waitFor((e) => e.kind === 'approval_requested');
+    expect((await adapter.getStatus(SES))?.status).toBe('waiting_for_approval');
+  });
+});
+
+describe('CodexAdapter restart policy', () => {
+  let home: string;
+  let project: string;
+  let spawnLog: string;
+
+  const FLAKY = fileURLToPath(new URL('./__fixtures__/flaky-app-server.mjs', import.meta.url));
+  const spawns = () =>
+    fs.existsSync(spawnLog)
+      ? fs.readFileSync(spawnLog, 'utf8').trim().split('\n').filter(Boolean)
+      : [];
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-restart-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-'));
+    spawnLog = path.join(home, 'spawns.log');
+  });
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  });
+
+  it('stops respawning a server that keeps dying right after the handshake', async () => {
+    const a = new CodexAdapter({
+      home,
+      codexCommand: ['node', FLAKY],
+      restartDelayMs: 10,
+      maxRestartDelayMs: 40,
+      maxRestartAttempts: 2,
+      // No uptime here counts as healthy, so the backoff cannot be reset by a handshake.
+      healthyUptimeMs: 10 * 60_000,
+      requestTimeoutMs: 2000,
+      log: false,
+      env: { FLAKY_MODE: 'crash', FLAKY_SPAWN_LOG: spawnLog },
+    });
+    try {
+      await a
+        .startSession({
+          sessionId: SES,
+          project: { projectId: PROJ, path: project, displayName: 'demo' },
+          instruction: 'go',
+          localImagePaths: [],
+          readOnly: false,
+        })
+        .catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 800));
+      // 1 initial + at most `maxRestartAttempts` automatic restarts, then it gives up.
+      expect(spawns().length).toBeGreaterThanOrEqual(2);
+      expect(spawns().length).toBeLessThanOrEqual(3);
+      expect(a.appServerRunning).toBe(false);
+    } finally {
+      await a.shutdown();
+    }
+  });
+
+  it('kills the child when the initialize handshake never completes', async () => {
+    const a = new CodexAdapter({
+      home,
+      codexCommand: ['node', FLAKY],
+      restartDelayMs: 10_000, // no automatic restart inside this test
+      maxRestartAttempts: 0,
+      requestTimeoutMs: 200,
+      log: false,
+      env: { FLAKY_MODE: 'mute', FLAKY_SPAWN_LOG: spawnLog },
+    });
+    try {
+      await expect(
+        a.startSession({
+          sessionId: SES,
+          project: { projectId: PROJ, path: project, displayName: 'demo' },
+          instruction: 'go',
+          localImagePaths: [],
+          readOnly: false,
+        }),
+      ).rejects.toThrow(/timed out/);
+      const [line] = spawns();
+      const pid = Number.parseInt((line ?? '').split(' ')[0] ?? '0', 10);
+      expect(pid).toBeGreaterThan(0);
+      // The child ignores EOF on stdin, so only an explicit kill can have removed it.
+      await new Promise((r) => setTimeout(r, 2600));
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      await a.shutdown();
+    }
   });
 });

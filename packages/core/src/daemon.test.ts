@@ -474,3 +474,118 @@ describe('daemon single instance', () => {
     await d.stop();
   });
 });
+
+describe('daemon startup reconciliation', () => {
+  const t = useTempHome('pagr-daemon-recon-');
+
+  const seed = (home: string, records: Array<Record<string, unknown>>) => {
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, 'sessions.json'),
+      JSON.stringify(Object.fromEntries(records.map((r) => [r.sessionId as string, r]))),
+    );
+  };
+
+  const rec = (over: Record<string, unknown> = {}) => ({
+    sessionId: ids.ses(),
+    provider: 'codex',
+    projectId: ids.proj(),
+    providerSessionId: 'thr_1',
+    status: 'working',
+    startedAt: '2026-08-20T00:00:00.000Z',
+    updatedAt: '2026-08-20T00:00:00.000Z',
+    ...over,
+  });
+
+  it('never leaves a session claiming to work after a restart', async () => {
+    const home = join(t.home, 'pagr');
+    const zombie = rec({ status: 'working' });
+    const waiting = rec({ status: 'waiting_for_approval' });
+    const done = rec({ status: 'completed' });
+    seed(home, [zombie, waiting, done]);
+    const codex = new FakeAdapter('codex');
+    const d = await createDaemon({
+      home,
+      adapters: new Map<Provider, CodingAgentAdapter>([['codex', codex]]),
+      secretStore: new MemorySecretStore(),
+    });
+    await d.start();
+    try {
+      expect(d.sessions.get(zombie.sessionId as string)?.status).toBe('stopped');
+      expect(d.sessions.get(waiting.sessionId as string)?.status).toBe('stopped');
+      expect(d.sessions.get(done.sessionId as string)?.status).toBe('completed');
+      expect(d.dispatcher.activeSessionCount()).toBe(0);
+    } finally {
+      await d.stop();
+    }
+  });
+
+  it('re-attaches a session the provider can still resume', async () => {
+    const home = join(t.home, 'pagr');
+    const live = rec({ status: 'working' });
+    seed(home, [live]);
+    const codex = new FakeAdapter('codex');
+    codex.sessions.set(live.sessionId as string, {
+      sessionId: live.sessionId as string,
+      projectId: live.projectId as string,
+      provider: 'codex',
+      status: 'idle',
+      activeTurn: false,
+      startedAt: live.startedAt as string,
+      updatedAt: live.updatedAt as string,
+    });
+    const d = await createDaemon({
+      home,
+      adapters: new Map<Provider, CodingAgentAdapter>([['codex', codex]]),
+      secretStore: new MemorySecretStore(),
+    });
+    await d.start();
+    try {
+      expect(d.sessions.get(live.sessionId as string)?.status).toBe('idle');
+    } finally {
+      await d.stop();
+    }
+  });
+
+  it('bounds sessions.json on startup', async () => {
+    const home = join(t.home, 'pagr');
+    const old = new Date(Date.now() - 60 * 24 * 3600_000).toISOString();
+    seed(
+      home,
+      Array.from({ length: 6 }, () => rec({ status: 'completed', updatedAt: old })),
+    );
+    const d = await createDaemon({
+      home,
+      adapters: new Map(),
+      secretStore: new MemorySecretStore(),
+    });
+    await d.start();
+    try {
+      expect(d.sessions.size).toBe(0); // all far past the retention window
+    } finally {
+      await d.stop();
+    }
+  });
+
+  it('answers channel.status honestly whether or not the flag is on', async () => {
+    const home = join(t.home, 'pagr');
+    mkdirSync(home, { recursive: true });
+    const d = await createDaemon({
+      home,
+      adapters: new Map(),
+      secretStore: new MemorySecretStore(),
+      env: {},
+    });
+    await d.start();
+    try {
+      const via = await new IpcClient(d.paths.socketPath).call<{
+        enabled: boolean;
+        canSteerLive: boolean;
+      }>('channel.status');
+      expect(via).toEqual({ enabled: false, attachedProjects: [], canSteerLive: false });
+      expect(d.channelStatus().enabled).toBe(false);
+    } finally {
+      await d.stop();
+    }
+  });
+});

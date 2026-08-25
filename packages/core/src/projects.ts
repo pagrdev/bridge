@@ -1,10 +1,20 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { ProjectSummary } from '@pagr/protocol';
 import type { LocalProject } from './adapters/types.js';
 import { readJson, writeJson } from './jsonFile.js';
+import {
+  inferProjectNames,
+  MAX_ALIAS,
+  MAX_ALIASES,
+  MAX_DISPLAY_NAME,
+  resolveNameCollisions,
+  type ScanOptions,
+  type ScanRootsResult,
+  scanForRepos,
+} from './scan.js';
 
 export interface ProjectRecord extends LocalProject {
   aliases: string[];
@@ -13,10 +23,26 @@ export interface ProjectRecord extends LocalProject {
   repoHint?: RepoHint;
 }
 
+/**
+ * What `add()` returns: the persisted record plus a report of anything the registry had to
+ * change to keep names unambiguous. The extra fields are never written to `projects.json`.
+ */
+export interface AddedProject extends ProjectRecord {
+  renamedFrom?: string;
+  droppedAliases?: string[];
+}
+
 export interface RepoHint {
   host?: string;
   name?: string;
   defaultBranch?: string;
+}
+
+export interface DiscoveredRepo {
+  path: string;
+  repoHint?: RepoHint;
+  /** Project id when this path is already in the registry — scan results stay safe to re-run. */
+  registeredAs?: string;
 }
 
 export interface AddProjectOptions {
@@ -85,7 +111,7 @@ export class ProjectRegistry {
     return ['/', '/System', '/private/etc', '/etc', '/usr', '/bin', '/sbin', '/Library', this.home];
   }
 
-  add(inputPath: string, opts: AddProjectOptions = {}): ProjectRecord {
+  add(inputPath: string, opts: AddProjectOptions = {}): AddedProject {
     const abs = resolve(inputPath);
     if (!existsSync(abs)) throw new ProjectError('not_found', `path does not exist: ${abs}`);
     const path = realpathSync(abs);
@@ -110,23 +136,81 @@ export class ProjectRegistry {
       if (existing.path === path)
         throw new ProjectError('duplicate', `already registered as ${existing.projectId}`);
     }
-    const displayName = (opts.displayName?.trim() || basename(path)).slice(0, 80);
+    const hint = repoHint(path);
+    const inferred = inferProjectNames(path, hint);
+    const explicitName = opts.displayName?.trim();
+    const explicitAliases = opts.aliases
+      ?.map((a) => a.trim())
+      .filter(Boolean)
+      .map((a) => a.slice(0, MAX_ALIAS));
+
+    // A name the user typed must never be silently changed: if it is already taken, say so.
+    if (explicitName) {
+      const clash = this.findByName(explicitName);
+      if (clash)
+        throw new ProjectError(
+          'duplicate',
+          `the name "${explicitName}" already refers to ${clash.displayName} (${clash.projectId})`,
+        );
+    }
+    for (const alias of explicitAliases ?? []) {
+      const clash = this.findByName(alias);
+      if (clash)
+        throw new ProjectError(
+          'duplicate',
+          `the alias "${alias}" already refers to ${clash.displayName} (${clash.projectId})`,
+        );
+    }
+
+    const [resolved] = resolveNameCollisions(
+      [
+        {
+          path,
+          displayName: (explicitName || inferred.displayName).slice(0, MAX_DISPLAY_NAME),
+          aliases: explicitAliases ?? inferred.aliases,
+        },
+      ],
+      this.list().map((p) => ({ displayName: p.displayName, aliases: p.aliases })),
+    );
+    if (!resolved) throw new ProjectError('duplicate', 'could not pick a unique name');
+
     const rec: ProjectRecord = {
       projectId: this.idGen(),
       path,
-      displayName,
-      aliases: (opts.aliases ?? [])
-        .map((a) => a.trim())
-        .filter(Boolean)
-        .slice(0, 10),
+      displayName: resolved.displayName,
+      aliases: resolved.aliases.slice(0, MAX_ALIASES),
       allowNonGit,
       addedAt: this.now().toISOString(),
     };
-    const hint = repoHint(path);
     if (hint) rec.repoHint = hint;
     this.map.set(rec.projectId, rec);
     this.persist();
-    return rec;
+    return {
+      ...rec,
+      ...(resolved.renamedFrom ? { renamedFrom: resolved.renamedFrom } : {}),
+      ...(resolved.droppedAliases ? { droppedAliases: resolved.droppedAliases } : {}),
+    };
+  }
+
+  /** Case-insensitive lookup by display name or alias. Ids are matched by `resolve`/`has`. */
+  findByName(ref: string): ProjectRecord | undefined {
+    const lc = ref.trim().toLowerCase();
+    if (!lc) return undefined;
+    for (const rec of this.map.values()) {
+      if (rec.displayName.toLowerCase() === lc) return rec;
+      if (rec.aliases.some((a) => a.toLowerCase() === lc)) return rec;
+    }
+    return undefined;
+  }
+
+  /** Every project a `<ref>` could mean: exact id, then name, then alias. */
+  matches(ref: string): ProjectRecord[] {
+    const lc = ref.trim().toLowerCase();
+    const byId = this.map.get(ref);
+    if (byId) return [byId];
+    const byName = this.list().filter((p) => p.displayName.toLowerCase() === lc);
+    if (byName.length) return byName;
+    return this.list().filter((p) => p.aliases.some((a) => a.toLowerCase() === lc));
   }
 
   remove(projectId: string): boolean {
@@ -196,33 +280,23 @@ export class ProjectRegistry {
     return best;
   }
 
-  /** Shallow (depth ≤ 3) search for git repositories under the given roots. */
-  discover(roots: string[], maxDepth = 3): string[] {
-    const found = new Set<string>();
-    const walk = (dir: string, depth: number) => {
-      if (depth > maxDepth) return;
-      let entries: string[];
-      try {
-        entries = readdirSync(dir);
-      } catch {
-        return;
-      }
-      if (entries.includes('.git')) {
-        found.add(safeRealpath(dir));
-        return; // don't descend into repos
-      }
-      for (const name of entries) {
-        if (name.startsWith('.') || name === 'node_modules' || name === 'Library') continue;
-        const full = join(dir, name);
-        try {
-          if (statSync(full).isDirectory()) walk(full, depth + 1);
-        } catch {
-          // unreadable
-        }
-      }
+  /**
+   * Bounded search for git repositories under `roots`, annotated with whether each one is
+   * already registered. Never walks the home directory itself (see `scanForRepos`).
+   */
+  async discover(
+    roots: string[],
+    opts: ScanOptions = {},
+  ): Promise<ScanRootsResult & { repos: DiscoveredRepo[] }> {
+    const res = await scanForRepos(roots, { home: this.home, ...opts });
+    const registered = new Map(this.list().map((p) => [p.path, p]));
+    return {
+      ...res,
+      repos: res.repos.map((r) => {
+        const existing = registered.get(safeRealpath(r.path));
+        return existing ? { ...r, registeredAs: existing.projectId } : { ...r };
+      }),
     };
-    for (const r of roots) if (existsSync(r)) walk(resolve(r), 1);
-    return [...found].sort();
   }
 
   private persist(): void {

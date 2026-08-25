@@ -3,10 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AdapterEvent } from '@pagr/bridge-core';
-import { ChannelBridge } from '@pagr/bridge-core';
+import { ChannelBridge, getChannelBridge } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from './adapter.js';
 import {
+  CHANNEL_ARMED_DETAIL,
   CHANNEL_FLAG_ENV,
   CHANNEL_PROBE_DETAIL,
   ChannelMode,
@@ -83,14 +84,43 @@ describe('ClaudeAdapter in channel mode', () => {
     fs.rmSync(project, { recursive: true, force: true });
   });
 
-  it('probe reports approved-channel with live external messages', async () => {
+  it('probe reports approved-channel once a channel is actually attached', async () => {
     const adapter = build(true);
+    bridge.attach(project);
     const s = await adapter.probe();
     expect(s.mode).toBe('approved-channel');
     expect(s.capabilities.canReceiveLiveExternalMessages).toBe(true);
     expect(s.capabilities.canSteerActiveTurn).toBe(true);
-    expect(s.detail).toContain('dangerously-load-development-channels');
     expect(s.detail).toContain(CHANNEL_PROBE_DETAIL);
+    await adapter.shutdown();
+  });
+
+  it('does NOT claim live steering while the flag is on but no channel is attached', async () => {
+    const adapter = build(true);
+    const s = await adapter.probe();
+    // The flag only means the daemon would accept a channel. Reporting `canSteerActiveTurn`
+    // here would make the cloud promise a live interrupt for something that will be queued.
+    expect(s.mode).toBe('cli-hooks');
+    expect(s.capabilities.canSteerActiveTurn).toBe(false);
+    expect(s.capabilities.canReceiveLiveExternalMessages).toBe(false);
+    expect(s.detail).toContain(CHANNEL_ARMED_DETAIL);
+    expect(s.detail).toContain('QUEUED');
+    await adapter.shutdown();
+  });
+
+  it('stops claiming live steering once the channel stops polling', async () => {
+    let clock = 1_000_000;
+    const ttlBridge = new ChannelBridge(() => clock, 1000);
+    const adapter = new ClaudeAdapter({
+      home,
+      claudeCommand: ['node', FIXTURE],
+      channel: true,
+      channelBridge: ttlBridge,
+    });
+    ttlBridge.attach(project);
+    expect((await adapter.probe()).capabilities.canSteerActiveTurn).toBe(true);
+    clock += 2000;
+    expect((await adapter.probe()).capabilities.canSteerActiveTurn).toBe(false);
     await adapter.shutdown();
   });
 
@@ -178,7 +208,11 @@ describe('createClaudeAdapter', () => {
         claudeCommand: ['node', FIXTURE],
         processEnv: { [CHANNEL_FLAG_ENV]: '1' },
       });
+      // Armed but nothing polling: the mode only flips once a channel is really there.
+      expect((await on.probe()).detail).toContain(CHANNEL_ARMED_DETAIL);
+      getChannelBridge().attach(home);
       expect((await on.probe()).mode).toBe('approved-channel');
+      getChannelBridge().reset();
       await on.shutdown();
       const off = createClaudeAdapter({
         home,

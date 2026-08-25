@@ -273,3 +273,72 @@ describe('doctor · exit codes and summary', () => {
 
 const readPlistWith = (path: string, from: string, to: string): string =>
   readFileSync(path, 'utf8').replace(from, to);
+
+describe('doctor · Claude Code live steering', () => {
+  it('says follow-ups are queued when channel mode is off', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () => daemonStatus(),
+      'channel.status': () => ({ enabled: false, attachedProjects: [], canSteerLive: false }),
+    });
+    const r = await report(['--offline']);
+    expect(check(r, 'live steering')?.status).toBe('skip');
+    expect(check(r, 'live steering')?.detail).toContain('queued, not steered');
+  });
+
+  it('warns when the flag is on but nothing is attached', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () => daemonStatus(),
+      'channel.status': () => ({ enabled: true, attachedProjects: [], canSteerLive: false }),
+    });
+    const r = await report(['--offline']);
+    const c = check(r, 'live steering');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('QUEUED');
+    expect(c?.fix).toContain('--dangerously-load-development-channels');
+  });
+
+  it('reports live steering as available only when a channel is attached', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () => daemonStatus(),
+      'channel.status': () => ({
+        enabled: true,
+        attachedProjects: ['/code/app'],
+        canSteerLive: true,
+      }),
+    });
+    const r = await report(['--offline']);
+    expect(check(r, 'live steering')?.status).toBe('ok');
+    expect(check(r, 'live steering')?.detail).toContain('can steer live');
+  });
+
+  it('skips the check entirely when the daemon is down', async () => {
+    const r = await report(['--offline']);
+    expect(check(r, 'live steering')?.status).toBe('skip');
+    expect(check(r, 'live steering')?.detail).toContain('daemon not running');
+  });
+
+  it('reports whether this project has the channel server in .mcp.json', async () => {
+    const project = join(h.home, '..', 'proj');
+    mkdirSync(project, { recursive: true });
+    h.overrides.env = { ...h.overrides.env, PAGR_DOCTOR_PROJECT: project };
+    let r = await report(['--offline']);
+    expect(check(r, 'claude channel')?.status).toBe('skip');
+    expect(check(r, 'claude channel')?.fix).toContain('channel-setup');
+
+    writeFileSync(
+      join(project, '.mcp.json'),
+      JSON.stringify({ mcpServers: { pagr: { command: 'node', args: ['/s.mjs'] } } }),
+    );
+    r = await report(['--offline']);
+    expect(check(r, 'claude channel')?.status).toBe('ok');
+  });
+
+  it('names a broken .mcp.json instead of pretending it is absent', async () => {
+    const project = join(h.home, '..', 'proj2');
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, '.mcp.json'), '{ not json');
+    h.overrides.env = { ...h.overrides.env, PAGR_DOCTOR_PROJECT: project };
+    const r = await report(['--offline']);
+    expect(check(r, 'claude channel')?.detail).toContain('invalid JSON');
+  });
+});

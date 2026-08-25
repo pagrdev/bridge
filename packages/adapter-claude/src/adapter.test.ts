@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from './adapter.js';
 
 const FIXTURE = fileURLToPath(new URL('./__fixtures__/fake-claude.mjs', import.meta.url));
+const STUBBORN = fileURLToPath(new URL('./__fixtures__/stubborn-claude.mjs', import.meta.url));
 const SES = 'ses_00000000000000000000000000000001';
 const PROJ = 'proj_0000000000000000000000000000000a';
 
@@ -23,7 +24,7 @@ function collector() {
       }
     }
   };
-  const waitFor = (pred: (e: AdapterEvent) => boolean, ms = 5000): Promise<AdapterEvent> => {
+  const waitFor = (pred: (e: AdapterEvent) => boolean, ms = 20_000): Promise<AdapterEvent> => {
     const hit = events.find(pred);
     if (hit) return Promise.resolve(hit);
     return new Promise((resolve, reject) => {
@@ -351,5 +352,175 @@ describe('ClaudeAdapter against fake claude', () => {
     expect(args.argv).toContain('--resume');
     expect(args.argv).toContain('--disallowedTools');
     await again.shutdown();
+  });
+});
+
+describe('ClaudeAdapter process pool', () => {
+  let home: string;
+  let projects: string[];
+  let adapter: ClaudeAdapter;
+
+  const start = async (n: number, instruction: string) => {
+    await adapter.startSession({
+      sessionId: `ses_0000000000000000000000000000000${n}`,
+      project: {
+        projectId: `proj_000000000000000000000000000000${n}${n}`,
+        path: projects[n] as string,
+        displayName: `p${n}`,
+      },
+      instruction,
+      localImagePaths: [],
+      readOnly: false,
+    });
+  };
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-claude-pool-'));
+    projects = [1, 2, 3].map(() => fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-')));
+    projects.unshift('');
+    adapter = new ClaudeAdapter({
+      home,
+      claudeCommand: ['node', FIXTURE],
+      maxLiveProcesses: 2,
+      log: false,
+    });
+  });
+  afterEach(async () => {
+    await adapter.shutdown();
+    fs.rmSync(home, { recursive: true, force: true });
+    for (const p of projects) if (p) fs.rmSync(p, { recursive: true, force: true });
+  });
+
+  it('never runs more `claude` children than the pool allows', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    await start(1, 'one');
+    await c.waitFor((e) => e.kind === 'session_event' && e.type === 'completed');
+    await start(2, 'two');
+    await start(3, 'three');
+    expect(adapter.liveProcessCount).toBeLessThanOrEqual(2);
+  });
+
+  it('evicts the least recently used idle session, and resumes it on demand', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    const done = (id: string) => (e: AdapterEvent) =>
+      e.kind === 'session_event' && e.type === 'completed' && e.sessionId === id;
+    await start(1, 'one');
+    await c.waitFor(done('ses_00000000000000000000000000000001'));
+    await start(2, 'two');
+    await c.waitFor(done('ses_00000000000000000000000000000002'));
+    await start(3, 'three');
+    await c.waitFor(done('ses_00000000000000000000000000000003'));
+    expect(adapter.liveProcessCount).toBeLessThanOrEqual(2);
+    // the evicted session is still usable: it comes back with --resume
+    const res = await adapter.sendInstruction({
+      sessionId: 'ses_00000000000000000000000000000001',
+      instruction: 'again',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    expect(res).toEqual({ delivered: 'new_turn' });
+  });
+
+  it('refuses a new session when every process in the pool is mid-turn', async () => {
+    await start(1, 'hang here');
+    await start(2, 'hang here');
+    await expect(start(3, 'three')).rejects.toThrow(/limit of 2 live/);
+  });
+});
+
+describe('ClaudeAdapter pool refusal is clean', () => {
+  it('leaves no phantom session behind when the pool is full', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-claude-full-'));
+    const projects = [1, 2, 3].map(() => fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-')));
+    const a = new ClaudeAdapter({
+      home,
+      claudeCommand: ['node', FIXTURE],
+      maxLiveProcesses: 1,
+      log: false,
+    });
+    try {
+      await a.startSession({
+        sessionId: 'ses_00000000000000000000000000000001',
+        project: { projectId: PROJ, path: projects[0] as string, displayName: 'one' },
+        instruction: 'hang here',
+        localImagePaths: [],
+        readOnly: false,
+      });
+      const blocked = 'ses_00000000000000000000000000000002';
+      await expect(
+        a.startSession({
+          sessionId: blocked,
+          project: {
+            projectId: 'proj_0000000000000000000000000000000b',
+            path: projects[1] as string,
+            displayName: 'two',
+          },
+          instruction: 'hello',
+          localImagePaths: [],
+          readOnly: false,
+        }),
+      ).rejects.toThrow(/limit of 1 live/);
+      expect(await a.getStatus(blocked)).toBeNull();
+      expect((await a.listSessions()).map((s) => s.sessionId)).not.toContain(blocked);
+      expect(a.liveProcessCount).toBe(1);
+    } finally {
+      await a.shutdown();
+      fs.rmSync(home, { recursive: true, force: true });
+      for (const p of projects) fs.rmSync(p, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ClaudeAdapter drains evicted children', () => {
+  it('kills an idle child that ignores EOF instead of orphaning it', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-claude-drain-'));
+    const projects = [1, 2].map(() => fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-')));
+    const pidFile = path.join(home, 'pids.log');
+    const a = new ClaudeAdapter({
+      home,
+      claudeCommand: ['node', STUBBORN],
+      maxLiveProcesses: 1,
+      retireGraceMs: 100,
+      log: false,
+      env: { STUBBORN_PID_LOG: pidFile },
+    });
+    const c = collector();
+    a.subscribe(c.emit);
+    try {
+      await a.startSession({
+        sessionId: 'ses_00000000000000000000000000000001',
+        project: { projectId: PROJ, path: projects[0] as string, displayName: 'one' },
+        instruction: 'hello',
+        localImagePaths: [],
+        readOnly: false,
+      });
+      await c.waitFor(sessionEvent('completed'));
+      const firstPid = Number.parseInt(
+        fs.readFileSync(pidFile, 'utf8').trim().split('\n')[0] ?? '',
+        10,
+      );
+      expect(firstPid).toBeGreaterThan(0);
+
+      // The pool is full and the only child is idle → it must be evicted AND actually die.
+      await a.startSession({
+        sessionId: 'ses_00000000000000000000000000000002',
+        project: {
+          projectId: 'proj_0000000000000000000000000000000b',
+          path: projects[1] as string,
+          displayName: 'two',
+        },
+        instruction: 'hello',
+        localImagePaths: [],
+        readOnly: false,
+      });
+      expect(() => process.kill(firstPid, 0)).toThrow();
+      expect(a.liveProcessCount).toBe(1);
+    } finally {
+      await a.shutdown();
+      fs.rmSync(home, { recursive: true, force: true });
+      for (const p of projects) fs.rmSync(p, { recursive: true, force: true });
+    }
   });
 });

@@ -24,7 +24,23 @@ if (process.argv.includes('--version')) {
   process.exit(0);
 }
 
-const out = (o) => process.stdout.write(`${JSON.stringify(o)}\n`);
+// FAKE_CODEX_COALESCE=1 buffers every line of a turn and writes them as ONE chunk, so the
+// `turn/start` response and the whole turn (including `turn/completed`) reach the adapter
+// together. That is the ordering a fast real turn produces under load, and it used to leave the
+// session stuck at "working" with a dead activeTurnId.
+const COALESCE = process.env.FAKE_CODEX_COALESCE === '1';
+let buffered = '';
+const out = (o) => {
+  const line = `${JSON.stringify(o)}\n`;
+  if (COALESCE) buffered += line;
+  else process.stdout.write(line);
+};
+const flush = () => {
+  if (!buffered) return;
+  const chunk = buffered;
+  buffered = '';
+  process.stdout.write(chunk);
+};
 let seq = 1000;
 const threads = new Map(); // id -> { cwd, activeTurn }
 const pendingServerReqs = new Map(); // id -> resolve
@@ -35,6 +51,8 @@ function requestFromServer(method, params) {
   return new Promise((resolve) => {
     pendingServerReqs.set(id, resolve);
     out({ id, method, params });
+    // Must reach the client now, or a coalesced run would deadlock waiting for its own answer.
+    flush();
   });
 }
 
@@ -192,7 +210,9 @@ async function runTurn(threadId, turnId, input) {
 }
 
 const rl = readline.createInterface({ input: process.stdin });
-rl.on('line', (line) => {
+
+/** Returns true when the reply is deferred (the turn flushes its own coalesced chunk). */
+function handleLine(line) {
   if (!line.trim()) return;
   let m;
   try {
@@ -326,8 +346,8 @@ rl.on('line', (line) => {
           turn: { id: turnId, items: [], itemsView: 'summary', status: 'inProgress', error: null },
         },
       });
-      setImmediate(() => runTurn(params.threadId, turnId, params.input));
-      return;
+      setImmediate(() => void runTurn(params.threadId, turnId, params.input).then(flush, flush));
+      return true;
     }
     case 'turn/steer': {
       const t = threads.get(params.threadId);
@@ -348,5 +368,9 @@ rl.on('line', (line) => {
     default:
       out({ id, error: { code: -32601, message: `unknown method ${method}` } });
   }
+}
+
+rl.on('line', (line) => {
+  if (!handleLine(line)) flush();
 });
 rl.on('close', () => process.exit(0));

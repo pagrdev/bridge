@@ -257,12 +257,20 @@ interface ChannelQueue {
   messages: ChannelMessage[];
   waiters: Set<() => void>;
   attachedAt: string;
+  /** Epoch ms of the last `channel.poll`. 0 for a queue created by an enqueue with no channel. */
+  lastPollMs: number;
 }
 
 /** Keep the tail only: a channel that stops polling must not grow the daemon's heap. */
 const CHANNEL_QUEUE_MAX = 200;
 /** Long-poll ceiling. Well under Claude Code's own stdio patience and any proxy idle timeout. */
 export const CHANNEL_POLL_TIMEOUT_MS = 25_000;
+/**
+ * A channel counts as live only while it keeps polling. Two long-poll periods of silence means
+ * the user quit that `claude`, and continuing to advertise live steering for it would make the
+ * bridge tell the cloud something untrue.
+ */
+export const CHANNEL_ATTACH_TTL_MS = CHANNEL_POLL_TIMEOUT_MS * 2;
 
 /**
  * In-memory inbound queue + session bindings shared by the daemon's IPC methods and the Claude
@@ -274,10 +282,22 @@ export class ChannelBridge {
   private readonly queues = new Map<string, ChannelQueue>();
   private readonly bindings = new Map<string, ChannelSessionBinding>();
 
+  constructor(
+    private readonly now: () => number = () => Date.now(),
+    private readonly attachTtlMs: number = CHANNEL_ATTACH_TTL_MS,
+  ) {}
+
   private queue(cwd: string): ChannelQueue {
     let q = this.queues.get(cwd);
     if (!q) {
-      q = { seq: 0, messages: [], waiters: new Set(), attachedAt: new Date().toISOString() };
+      q = {
+        seq: 0,
+        messages: [],
+        waiters: new Set(),
+        attachedAt: new Date(this.now()).toISOString(),
+        // Not attached until something actually polls: an enqueue alone proves nothing.
+        lastPollMs: 0,
+      };
       this.queues.set(cwd, q);
     }
     return q;
@@ -285,15 +305,17 @@ export class ChannelBridge {
 
   /** Mark a project root as served by a live channel. Called on every `channel.poll`. */
   attach(cwd: string): void {
-    this.queue(cwd);
+    this.queue(cwd).lastPollMs = this.now();
   }
 
+  /** True only while a channel server has polled within the TTL. */
   isAttached(cwd: string): boolean {
-    return this.queues.has(cwd);
+    const q = this.queues.get(cwd);
+    return q !== undefined && q.lastPollMs > 0 && this.now() - q.lastPollMs <= this.attachTtlMs;
   }
 
   attachedProjects(): string[] {
-    return [...this.queues.keys()];
+    return [...this.queues.keys()].filter((cwd) => this.isAttached(cwd));
   }
 
   /** Remember which channel-attached project a `ses_…` belongs to (adapter lookup path). */
@@ -319,6 +341,9 @@ export class ChannelBridge {
 
   /** Everything newer than `cursor`, waiting up to `timeoutMs` for the first arrival. */
   async poll(cwd: string, cursor: number, timeoutMs: number): Promise<ChannelPollResult> {
+    // Polling *is* the proof of life, so it renews the attachment itself rather than relying on
+    // every caller to remember to call `attach` first.
+    this.attach(cwd);
     const q = this.queue(cwd);
     const take = (): ChannelPollResult | null => {
       const messages = q.messages.filter((m) => m.seq > cursor);

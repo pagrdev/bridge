@@ -109,5 +109,32 @@ risk tiering; the bridge only ever reports.
 
 `~/.pagr/run/daemon.sock`, newline-delimited JSON `{ id, method, params }` → `{ id, result }` |
 `{ id, error: { code, message } }`. Methods: `status`, `projects.list`, `projects.add`, `projects.remove`,
-`sessions.list`, `approvals.list`, `approval.request` (blocks until decision/timeout, returns
-`{ approvalId, decision, resolution }`), `agent.event`. See `packages/core/src/ipc.ts` and `daemon.ts`.
+`sessions.list`, `sessions.reconcile`, `channel.status`, `approvals.list`, `approval.request` (blocks
+until decision/timeout, returns `{ approvalId, decision, resolution }`), `agent.event`. Under
+`PAGR_CLAUDE_CHANNEL=1` two more are registered: `channel.poll` and `channel.outbound`.
+See `packages/core/src/ipc.ts` and `daemon.ts`.
+
+- `sessions.reconcile` → `[{ sessionId, provider, projectId, status, outcome, reason }]`, where
+  `outcome` is `resumable` | `terminated` | `failed`. The daemon runs this itself on startup, so a
+  session that was working when the daemon died never survives as a zombie.
+- `channel.status` → `{ enabled, attachedProjects, canSteerLive }`. `enabled` only means the flag is
+  set; `canSteerLive` is the one that says a follow-up would really interrupt a turn.
+
+## Concurrency rules (bridge-side, no protocol change)
+
+`agent.start_session` is refused with `errorCode: capability_unsupported` and a human-readable
+`message` when:
+
+| situation | why |
+| --- | --- |
+| a write-capable session already holds that working tree (or one containing it) | neither provider isolates the other; two agents in one checkout overwrite each other. Read-only sessions may share a tree, and a separate `git worktree` is a separate tree. Override locally with `PAGR_ALLOW_CONCURRENT_WRITERS=1` |
+| this provider already has `PAGR_MAX_SESSIONS_PER_PROVIDER` (default 4) live sessions | bounded process pool |
+| the device already has `PAGR_MAX_SESSIONS` (default 8) live sessions | bounded process pool |
+
+"Live" means `starting`, `working`, `waiting_for_approval` or `waiting_for_user`. There is no
+protocol field for "the user explicitly asked for two writers in one tree", so that consent is
+expressed locally on the device (see `packages/core/src/concurrency.ts`).
+
+`AgentCapabilities.canSteerActiveTurn` is reported per probe and reflects what the device can do
+*at that moment*: Claude Code reports `true` only while a channel is actually attached and polling,
+never merely because `PAGR_CLAUDE_CHANNEL=1` is set.

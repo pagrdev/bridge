@@ -18,6 +18,7 @@ import {
   PendingApprovalRegistry,
 } from './approvals.js';
 import { deleteAttachment, type FetchLike, fetchAttachment } from './attachments.js';
+import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.js';
 import { makeEvent } from './events.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
@@ -61,6 +62,8 @@ export interface DispatcherOptions {
   logger?: Logger;
   osVersion?: string;
   attachmentTimeoutMs?: number;
+  /** Workspace + resource rules for concurrent sessions. Defaults to `SessionGuard.fromEnv()`. */
+  guard?: SessionGuard;
 }
 
 /**
@@ -69,6 +72,7 @@ export interface DispatcherOptions {
  */
 export class Dispatcher {
   readonly approvals: PendingApprovalRegistry;
+  readonly guard: SessionGuard;
   policy: PublicPolicy;
   private readonly logger: Logger;
   private readonly now: () => Date;
@@ -77,6 +81,7 @@ export class Dispatcher {
 
   constructor(private readonly o: DispatcherOptions) {
     this.logger = o.logger ?? silentLogger;
+    this.guard = o.guard ?? SessionGuard.fromEnv();
     this.now = o.now ?? (() => new Date());
     this.policy = readPolicy(o.policyFile);
     this.approvals = new PendingApprovalRegistry({ now: this.now });
@@ -239,30 +244,106 @@ export class Dispatcher {
     }
   }
 
+  /**
+   * Every session that currently holds a process or a working tree, with the project root it
+   * occupies. A session whose project has since been unregistered still holds a process, so it
+   * keeps counting against the budget — but with a null path, so it cannot be used to refuse a
+   * working tree the bridge can no longer name.
+   */
+  private liveClaims(): WorkspaceClaim[] {
+    const out: WorkspaceClaim[] = [];
+    for (const rec of this.o.sessions.list()) {
+      if (!isLiveStatus(rec.status)) continue;
+      let projectPath: string | null;
+      try {
+        projectPath = this.o.registry.resolve(rec.projectId).path;
+      } catch {
+        // The project was unregistered (or removed and re-added under a new id) while this
+        // session ran. The path recorded when it started still names the tree it is writing to.
+        projectPath = rec.projectPath ?? null;
+      }
+      out.push({
+        sessionId: rec.sessionId,
+        provider: rec.provider,
+        projectId: rec.projectId,
+        projectPath,
+        writeCapable: rec.readOnly !== true,
+      });
+    }
+    return out;
+  }
+
   private async startSession(p: CommandPayload<'agent.start_session'>): Promise<SessionSummary> {
     const adapter = this.adapterFor(p.provider);
     const project = this.o.registry.resolve(p.projectId);
-    return this.withAttachments(p.attachments, async (localImagePaths) => {
-      const summary = await adapter.startSession({
+    // Refuse loudly and with a reason, rather than letting two agents race in one checkout or
+    // forking `claude` until the Mac swaps. `capability_unsupported` is the ack code for "this
+    // device will not do that", which is exactly what this is.
+    const refusal = this.guard.check(
+      {
         sessionId: p.sessionId,
-        project,
-        instruction: p.instruction,
-        localImagePaths,
-        readOnly: p.readOnly,
-        ...(p.displayName ? { displayName: p.displayName } : {}),
-      });
-      this.o.sessions.upsert({
-        sessionId: summary.sessionId,
         provider: p.provider,
         projectId: p.projectId,
-        providerSessionId: summary.sessionId,
-        status: summary.status,
-        startedAt: summary.startedAt,
-        updatedAt: summary.updatedAt,
+        projectPath: project.path,
+        writeCapable: !p.readOnly,
+      },
+      this.liveClaims(),
+    );
+    if (refusal) {
+      this.logger.warn('refused to start session', {
+        code: refusal.code,
+        sessionId: p.sessionId,
+        provider: p.provider,
       });
-      this.send('session.updated', summary);
-      return summary;
+      throw new DispatchError('capability_unsupported', refusal.message);
+    }
+    // Claim the tree synchronously, before the first `await`. Commands are dispatched
+    // fire-and-forget, so two `agent.start_session` for one project delivered in the same tick
+    // would otherwise both see an empty set of live claims and both pass the check above.
+    const reservedAt = this.now().toISOString();
+    this.o.sessions.upsert({
+      sessionId: p.sessionId,
+      provider: p.provider,
+      projectId: p.projectId,
+      providerSessionId: p.sessionId,
+      status: 'starting',
+      readOnly: p.readOnly,
+      projectPath: project.path,
+      startedAt: reservedAt,
+      updatedAt: reservedAt,
     });
+    try {
+      return await this.withAttachments(p.attachments, async (localImagePaths) => {
+        const summary = await adapter.startSession({
+          sessionId: p.sessionId,
+          project,
+          instruction: p.instruction,
+          localImagePaths,
+          readOnly: p.readOnly,
+          ...(p.displayName ? { displayName: p.displayName } : {}),
+        });
+        this.o.sessions.upsert({
+          sessionId: summary.sessionId,
+          provider: p.provider,
+          projectId: p.projectId,
+          providerSessionId: summary.sessionId,
+          status: summary.status,
+          readOnly: p.readOnly,
+          projectPath: project.path,
+          startedAt: summary.startedAt,
+          updatedAt: summary.updatedAt,
+        });
+        this.send('session.updated', summary);
+        return summary;
+      });
+    } catch (err) {
+      // The reservation must not outlive a start that failed, or it would hold this tree and a
+      // slot in the budget forever. Only a record still sitting at `starting` is ours to drop:
+      // anything else means the adapter got far enough to report real progress.
+      if (this.o.sessions.get(p.sessionId)?.status === 'starting')
+        this.o.sessions.remove(p.sessionId);
+      throw err;
+    }
   }
 
   private async sendInstruction(p: CommandPayload<'agent.send_instruction'>) {
@@ -291,14 +372,24 @@ export class Dispatcher {
         });
       }
       if (res.delivered === 'queued') {
-        this.o.sessions.upsert({ ...rec, updatedAt: this.now().toISOString() });
+        // Re-read: the record captured before the adapter call may already be stale.
+        this.o.sessions.upsert({
+          ...(this.o.sessions.get(p.sessionId) ?? rec),
+          updatedAt: this.now().toISOString(),
+        });
       } else {
         // A new turn (or steer) means the session is working again — even if the local record
-        // said `completed`. Adapters also emit their own `session` event; this keeps the local
-        // store and the cloud consistent regardless of adapter timing.
+        // said `completed`. But a fast provider can finish the whole turn before this line runs,
+        // and stamping `working` over that would leave a session claiming to work forever. The
+        // store is only written from here when the adapter has emitted nothing since the command
+        // started (`upsert` always stores a fresh object, so identity is a reliable "unchanged").
         const at = this.now().toISOString();
-        const updated = this.o.sessions.upsert({ ...rec, status: 'working', updatedAt: at });
         const live = await adapter.getStatus(p.sessionId);
+        const cur = this.o.sessions.get(p.sessionId);
+        const adapterSpoke = cur !== null && cur !== rec;
+        const status = adapterSpoke ? cur.status : (live?.status ?? 'working');
+        const activeTurn = adapterSpoke ? isLiveStatus(cur.status) : (live?.activeTurn ?? true);
+        const updated = this.o.sessions.upsert({ ...(cur ?? rec), status, updatedAt: at });
         this.send('session.updated', {
           ...(live ?? {
             sessionId: updated.sessionId,
@@ -306,8 +397,8 @@ export class Dispatcher {
             provider: updated.provider,
             startedAt: updated.startedAt,
           }),
-          status: 'working',
-          activeTurn: true,
+          status,
+          activeTurn,
           updatedAt: at,
         });
       }
@@ -411,6 +502,9 @@ export class Dispatcher {
           projectId: s.projectId,
           providerSessionId: rec?.providerSessionId ?? s.sessionId,
           status: s.status,
+          // Never widen a read-only session, or forget which tree it holds, on a status update.
+          ...(rec?.readOnly !== undefined ? { readOnly: rec.readOnly } : {}),
+          ...(rec?.projectPath !== undefined ? { projectPath: rec.projectPath } : {}),
           startedAt: s.startedAt,
           updatedAt: s.updatedAt,
         });
@@ -467,11 +561,7 @@ export class Dispatcher {
   }
 
   activeSessionCount(): number {
-    return this.o.sessions
-      .list()
-      .filter((s) =>
-        ['starting', 'working', 'waiting_for_approval', 'waiting_for_user'].includes(s.status),
-      ).length;
+    return this.o.sessions.list().filter((s) => isLiveStatus(s.status)).length;
   }
 
   async shutdown(): Promise<void> {

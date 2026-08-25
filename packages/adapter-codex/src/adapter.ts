@@ -47,8 +47,16 @@ export interface CodexAdapterOptions {
   approvalTimeoutMs?: number;
   requestTimeoutMs?: number;
   bridgeVersion?: string;
-  /** Restart delay after an unexpected app-server exit. */
+  /** Base restart delay after an unexpected app-server exit; doubles each attempt. */
   restartDelayMs?: number;
+  /** Ceiling for the restart backoff. */
+  maxRestartDelayMs?: number;
+  /** Consecutive automatic restarts before the adapter gives up until the next command. */
+  maxRestartAttempts?: number;
+  /** How long an app-server must stay up to count as healthy and clear the backoff. */
+  healthyUptimeMs?: number;
+  /** Extra environment for the spawned app-server (tests; `CODEX_HOME` isolation). */
+  env?: NodeJS.ProcessEnv;
   /** Disable file logging (tests). */
   log?: boolean;
 }
@@ -64,7 +72,17 @@ interface LiveSession {
   agentBuffers: Map<string, string>;
   lastAgentMessage: string;
   queued: Array<{ instruction: string; images: string[] }>;
+  /**
+   * Turns the notification stream has already reported on before the `turn/start` response
+   * promise was resolved. Both travel on one stdout stream, so a whole fast turn — start,
+   * approval request, completion — can be parsed out of a single chunk while resolving the
+   * response is still a queued microtask.
+   */
+  observedTurnIds: Set<string>;
 }
+
+/** Enough to cover a coalesced chunk; the set is per session and pruned on every insert. */
+const OBSERVED_TURN_MEMORY = 32;
 
 interface PendingApproval {
   approvalId: string;
@@ -105,8 +123,13 @@ export class CodexAdapter implements CodingAgentAdapter {
   private readonly listeners = new Set<(e: AdapterEvent) => void>();
   private readonly map: SessionMap;
   private client: AppServerClient | null = null;
+  /** In-flight spawn. Without this, two concurrent sessions each start their own app-server. */
+  private starting: Promise<AppServerClient> | null = null;
   private shuttingDown = false;
   private restartTimer: NodeJS.Timeout | null = null;
+  private restartAttempts = 0;
+  /** When the current app-server finished its handshake; null while none is up. */
+  private startedAtMs: number | null = null;
 
   constructor(private readonly opts: CodexAdapterOptions) {
     this.logger = new FileLogger(
@@ -122,6 +145,11 @@ export class CodexAdapter implements CodingAgentAdapter {
     return () => {
       this.listeners.delete(emit);
     };
+  }
+
+  /** One `codex app-server` serves every Codex session; this says whether it is up. */
+  get appServerRunning(): boolean {
+    return this.client?.running === true;
   }
 
   async probe(): Promise<AgentConnectionStatus> {
@@ -227,6 +255,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       agentBuffers: new Map(),
       lastAgentMessage: '',
       queued: [],
+      observedTurnIds: new Set(),
     };
     this.sessions.set(input.sessionId, live);
     this.byThread.set(threadId, input.sessionId);
@@ -240,8 +269,18 @@ export class CodexAdapter implements CodingAgentAdapter {
       lastStatus: 'starting',
       ...(input.displayName ? { displayName: input.displayName } : {}),
     });
-    this.emit({ kind: 'session', session: summary });
-    await this.startTurn(live, input.instruction, input.localImagePaths);
+    // No `starting` event before the first turn is accepted: the daemon writes every session
+    // event straight into its store, and a start that then throws would leave a permanently
+    // "live" record holding this working tree and a slot in the session budget. `startTurn`
+    // emits `working` on success, which is the first thing the daemon should hear about.
+    try {
+      await this.startTurn(live, input.instruction, input.localImagePaths);
+    } catch (err) {
+      this.sessions.delete(input.sessionId);
+      this.byThread.delete(threadId);
+      this.map.remove(input.sessionId);
+      throw err;
+    }
     return live.summary;
   }
 
@@ -324,6 +363,7 @@ export class CodexAdapter implements CodingAgentAdapter {
         resolution: 'canceled',
       });
     }
+    this.starting = null;
     await this.client?.stop();
     this.client = null;
     this.logger.close();
@@ -382,36 +422,65 @@ export class CodexAdapter implements CodingAgentAdapter {
     });
   }
 
-  private async ensureClient(): Promise<AppServerClient> {
-    if (this.client?.running) return this.client;
-    if (this.shuttingDown) throw new Error('adapter is shut down');
+  /**
+   * The single shared app-server, spawned at most once even under concurrent callers. Two
+   * sessions starting at the same moment used to each construct a client and the second one
+   * replaced the first, orphaning its threads — so this memoises the in-flight spawn.
+   */
+  private ensureClient(): Promise<AppServerClient> {
+    if (this.client?.running) return Promise.resolve(this.client);
+    if (this.shuttingDown) return Promise.reject(new Error('adapter is shut down'));
+    if (this.starting) return this.starting;
+    // An explicit command means the operator wants another go: forget the give-up state.
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     const [bin, ...rest] = this.opts.codexCommand ?? ['codex'];
     const client = new AppServerClient({
       command: [bin ?? 'codex', ...rest, 'app-server'],
       clientVersion: this.opts.bridgeVersion ?? '0.1.0',
       logger: this.logger,
       ...(this.opts.requestTimeoutMs ? { requestTimeoutMs: this.opts.requestTimeoutMs } : {}),
+      ...(this.opts.env ? { env: { ...process.env, ...this.opts.env } } : {}),
     });
     client.on('notification', (n) => this.onNotification(n));
     client.on('request', (r) => this.onServerRequest(r));
     client.on('exit', (info) => this.onExit(info.expected));
     this.client = client;
-    await client.start();
-    // Threads must be re-resumed in a fresh process.
-    for (const s of this.sessions.values()) s.loaded = false;
-    return client;
+    this.starting = client
+      .start()
+      .then(() => {
+        this.startedAtMs = Date.now();
+        // Threads must be re-resumed in a fresh process.
+        for (const s of this.sessions.values()) s.loaded = false;
+        return client;
+      })
+      .catch(async (err: Error) => {
+        // `start()` spawns first and rejects later (initialize timed out, or answered with an
+        // error). The child is still alive at that point, so dropping the reference without
+        // stopping it would leak one `codex app-server` per attempt.
+        if (this.client === client) this.client = null;
+        await client.stop().catch(() => {});
+        throw err;
+      })
+      .finally(() => {
+        this.starting = null;
+      });
+    return this.starting;
   }
 
   private onExit(expected: boolean): void {
     if (expected || this.shuttingDown) return;
-    for (const live of this.sessions.values()) {
-      if (live.activeTurnId) {
-        live.activeTurnId = null;
-        this.setStatus(live, 'failed', { activeTurn: false, endedAt: now() });
-        this.sessionEvent(live, 'failed', 'Codex app-server exited unexpectedly');
-      }
-      live.loaded = false;
-    }
+    // Reset the backoff only for a server that actually stayed up. Resetting on a successful
+    // handshake instead would pin the delay at `restartDelayMs` forever for the common failure
+    // — a server that starts fine and dies seconds later — which is the crash loop this guards.
+    const upFor = this.startedAtMs === null ? 0 : Date.now() - this.startedAtMs;
+    const base = this.opts.restartDelayMs ?? 2000;
+    if (upFor >= (this.opts.healthyUptimeMs ?? Math.max(60_000, base * 10)))
+      this.restartAttempts = 0;
+    this.startedAtMs = null;
+    this.failLiveSessions('Codex app-server exited unexpectedly');
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
       this.pending.delete(p.approvalId);
@@ -421,7 +490,19 @@ export class CodexAdapter implements CodingAgentAdapter {
         resolution: 'canceled',
       });
     }
-    const delay = this.opts.restartDelayMs ?? 2000;
+    // Back off exponentially and give up after a few tries. A crash loop that respawns every
+    // two seconds forever is indistinguishable from a fork bomb, and the sessions it would
+    // serve have already been reported failed.
+    const maxAttempts = this.opts.maxRestartAttempts ?? 5;
+    if (this.restartAttempts >= maxAttempts) {
+      this.logger.log('error', 'app-server keeps exiting; not restarting again', {
+        attempts: this.restartAttempts,
+      });
+      return;
+    }
+    const cap = this.opts.maxRestartDelayMs ?? 30_000;
+    const delay = Math.min(cap, base * 2 ** this.restartAttempts);
+    this.restartAttempts++;
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
       this.ensureClient().catch((err) =>
@@ -429,6 +510,18 @@ export class CodexAdapter implements CodingAgentAdapter {
       );
     }, delay);
     this.restartTimer.unref();
+  }
+
+  /** Any session with a turn in flight when the provider died is failed, never left "working". */
+  private failLiveSessions(reason: string): void {
+    for (const live of this.sessions.values()) {
+      if (live.activeTurnId) {
+        live.activeTurnId = null;
+        this.setStatus(live, 'failed', { activeTurn: false, endedAt: now() });
+        this.sessionEvent(live, 'failed', reason);
+      }
+      live.loaded = false;
+    }
   }
 
   private async requireLive(sessionId: string): Promise<LiveSession> {
@@ -456,6 +549,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       agentBuffers: new Map(),
       lastAgentMessage: '',
       queued: [],
+      observedTurnIds: new Set(),
     };
     this.sessions.set(sessionId, live);
     this.byThread.set(p.threadId, sessionId);
@@ -484,9 +578,32 @@ export class CodexAdapter implements CodingAgentAdapter {
       threadId: live.threadId,
       input: buildInput(instruction, images),
     });
+    // The response and every notification for this turn share one stdout stream. A fast turn can
+    // be fully parsed out of a single chunk — `turn/started`, an approval request, even
+    // `turn/completed` — while resolving this promise is still a queued microtask. Stamping
+    // `working` here would then rewind a session that is already finished (stuck "working"
+    // forever, with a dead `activeTurnId` to steer into) or already waiting for an approval.
+    if (live.observedTurnIds.delete(res.turn.id)) {
+      this.logger.log('info', 'turn was already reported before its start response', {
+        turnId: res.turn.id,
+        status: live.summary.status,
+      });
+      live.summary = { ...live.summary, taskSummary: clip(instruction, 500) };
+      return;
+    }
     live.activeTurnId = res.turn.id;
     live.lastAgentMessage = '';
     this.setStatus(live, 'working', { activeTurn: true, taskSummary: clip(instruction, 500) });
+  }
+
+  /** Note a turn the stream has reported on, so a late `turn/start` response cannot rewind it. */
+  private rememberObserved(live: LiveSession, turnId: string): void {
+    live.observedTurnIds.add(turnId);
+    while (live.observedTurnIds.size > OBSERVED_TURN_MEMORY) {
+      const oldest = live.observedTurnIds.values().next().value;
+      if (oldest === undefined) break;
+      live.observedTurnIds.delete(oldest);
+    }
   }
 
   // ---- notifications ----
@@ -499,6 +616,8 @@ export class CodexAdapter implements CodingAgentAdapter {
         const live = this.liveByThread(threadId);
         if (!live) return;
         live.activeTurnId = turn.id;
+        live.lastAgentMessage = '';
+        this.rememberObserved(live, turn.id);
         if (live.summary.status !== 'working')
           this.setStatus(live, 'working', { activeTurn: true });
         this.sessionEvent(live, 'started', 'Turn started', turn.id);
@@ -557,6 +676,7 @@ export class CodexAdapter implements CodingAgentAdapter {
         const live = this.liveByThread(threadId);
         if (!live) return;
         live.activeTurnId = null;
+        this.rememberObserved(live, turn.id);
         this.cancelApprovalsFor(live.summary.sessionId);
         const final = live.lastAgentMessage || `Turn ${turn.status}`;
         if (turn.status === 'failed') {

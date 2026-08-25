@@ -116,13 +116,61 @@ describe('ProjectRegistry', () => {
     expect(reg.findByPath('relative/path')).toBeUndefined();
   });
 
-  it('discover finds repos shallowly and skips node_modules', () => {
-    makeRepo(join(home, 'a'));
-    makeRepo(join(home, 'x', 'b'));
-    makeRepo(join(home, 'x', 'y', 'z', 'deep'));
-    makeRepo(join(home, 'node_modules', 'pkg'));
-    const found = reg.discover([home]);
-    expect(found).toEqual([join(home, 'a'), join(home, 'x', 'b')]);
+  it('discover finds repos shallowly, skips node_modules and marks registered ones', async () => {
+    const roots = join(home, 'code');
+    makeRepo(join(roots, 'a'));
+    makeRepo(join(roots, 'x', 'b'));
+    makeRepo(join(roots, 'x', 'y', 'z', 'deep'));
+    makeRepo(join(roots, 'node_modules', 'pkg'));
+    const a = reg.add(join(roots, 'a'));
+    const found = await reg.discover([roots]);
+    expect(found.repos.map((r) => r.path)).toEqual([join(roots, 'a'), join(roots, 'x', 'b')]);
+    expect(found.repos[0]?.registeredAs).toBe(a.projectId);
+    expect(found.repos[1]?.registeredAs).toBeUndefined();
+  });
+
+  it('refuses to discover the home directory itself', async () => {
+    await expect(reg.discover([home])).rejects.toThrow(/home directory/);
+  });
+
+  it('infers a display name and a GitHub alias, and reports collisions it resolved', () => {
+    const one = join(home, 'work', 'checkout');
+    makeRepo(one, 'git@github.com:acme/widgets.git');
+    const p = reg.add(one);
+    expect(p.displayName).toBe('checkout');
+    expect(p.aliases).toEqual(['widgets']);
+
+    const two = join(home, 'other', 'checkout');
+    makeRepo(two, 'git@github.com:acme/widgets.git');
+    const q = reg.add(two);
+    expect(q.displayName).toBe('other/checkout');
+    expect(q.renamedFrom).toBe('checkout');
+    expect(q.aliases).toEqual([]);
+    expect(q.droppedAliases).toEqual(['widgets']);
+  });
+
+  it('refuses an explicit name or alias that already refers to another project', () => {
+    const one = join(home, 'one');
+    const two = join(home, 'two');
+    makeRepo(one);
+    makeRepo(two);
+    reg.add(one, { displayName: 'Alpha', aliases: ['a'] });
+    expect(() => reg.add(two, { displayName: 'alpha' })).toThrow(/already refers to Alpha/);
+    expect(() => reg.add(two, { displayName: 'Beta', aliases: ['A'] })).toThrow(
+      /alias "A" already refers to/,
+    );
+    expect(reg.add(two, { displayName: 'Beta', aliases: ['b'] }).displayName).toBe('Beta');
+  });
+
+  it('resolves a project by id, name or alias, and reports ambiguity', () => {
+    const one = join(home, 'one');
+    makeRepo(one);
+    const p = reg.add(one, { displayName: 'Alpha', aliases: ['a'] });
+    expect(reg.matches(p.projectId)).toHaveLength(1);
+    expect(reg.matches('alpha')[0]?.projectId).toBe(p.projectId);
+    expect(reg.matches('A')[0]?.projectId).toBe(p.projectId);
+    expect(reg.matches('nope')).toEqual([]);
+    expect(reg.findByName('ALPHA')?.projectId).toBe(p.projectId);
   });
 
   it('parses remote urls and missing hints', () => {

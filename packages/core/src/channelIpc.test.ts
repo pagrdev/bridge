@@ -39,7 +39,30 @@ describe('ChannelBridge', () => {
     b.enqueue('/a', 'for a');
     b.enqueue('/b', 'for b');
     expect((await b.poll('/a', 0, 0)).messages.map((m) => m.text)).toEqual(['for a']);
-    expect(b.attachedProjects().sort()).toEqual(['/a', '/b']);
+    // Only a project something is actually polling counts as attached; a queued text does not
+    // prove a channel exists (see CHANNEL_ATTACH_TTL_MS).
+    expect(b.attachedProjects()).toEqual(['/a']);
+  });
+
+  it('stops reporting a channel as attached once it stops polling', async () => {
+    let clock = 1_000_000;
+    const b = new ChannelBridge(() => clock, 1000);
+    await b.poll('/p', 0, 0);
+    expect(b.isAttached('/p')).toBe(true);
+    clock += 999;
+    expect(b.isAttached('/p')).toBe(true);
+    clock += 2;
+    expect(b.isAttached('/p')).toBe(false);
+    expect(b.attachedProjects()).toEqual([]);
+    // a fresh poll re-attaches it
+    await b.poll('/p', 0, 0);
+    expect(b.isAttached('/p')).toBe(true);
+  });
+
+  it('does not treat an enqueue as an attachment', () => {
+    const b = new ChannelBridge();
+    b.enqueue('/p', 'steer me');
+    expect(b.isAttached('/p')).toBe(false);
   });
 
   it('attaches on poll and reports attachment', async () => {

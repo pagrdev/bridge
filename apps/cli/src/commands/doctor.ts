@@ -1,4 +1,6 @@
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import type { ChannelStatus } from '@pagr/bridge-core';
 import {
   auditPermissions,
   checkHomeWritable,
@@ -21,9 +23,10 @@ import {
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
-import { daemonStatus, socketPath } from '../ipc.js';
+import { daemonStatus, ipc, socketPath } from '../ipc.js';
 import { bad, bold, dim, ok, printJson, warn } from '../output.js';
 import { resolveApiUrl } from '../urls.js';
+import { LAUNCH_COMMAND, MCP_CONFIG_FILE, MCP_SERVER_KEY } from './claude.js';
 
 export interface Check {
   name: string;
@@ -303,6 +306,43 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
     }
   }
 
+  // ---- Claude Code live steering ------------------------------------------
+  // Two separate truths, reported separately, because "configured" and "actually able to steer"
+  // are routinely confused and the product must never claim the wrong one.
+  const projectDir = ctx.env.PAGR_DOCTOR_PROJECT ?? process.cwd();
+  const mcpFile = join(projectDir, MCP_CONFIG_FILE);
+  const mcp = readMcpEntry(mcpFile);
+  add({
+    name: 'claude channel',
+    status: mcp.present ? 'ok' : 'skip',
+    detail: mcp.present
+      ? `\`${MCP_SERVER_KEY}\` server configured in ${mcpFile}`
+      : mcp.problem
+        ? `${mcpFile}: ${mcp.problem}`
+        : `not configured in ${mcpFile} (optional)`,
+    ...(mcp.present
+      ? {}
+      : { fix: 'run `pagr claude channel-setup --dry-run` to see exactly what it would do' }),
+  });
+
+  const channel = status ? await channelStatusOf(ctx) : null;
+  add({
+    name: 'live steering',
+    status: !status ? 'skip' : channel?.canSteerLive ? 'ok' : channel?.enabled ? 'warn' : 'skip',
+    detail: !status
+      ? 'daemon not running'
+      : channel === null
+        ? 'the daemon did not answer channel.status (older bridge?)'
+        : channel.canSteerLive
+          ? `can steer live — ${channel.attachedProjects.length} channel(s) attached`
+          : channel.enabled
+            ? 'PAGR_CLAUDE_CHANNEL=1 but no channel is attached: follow-ups will be QUEUED'
+            : 'follow-ups are queued, not steered (channel mode off — this is the default)',
+    ...(status && channel?.enabled && !channel.canSteerLive
+      ? { fix: `start Claude Code with \`${LAUNCH_COMMAND}\` inside a registered project` }
+      : {}),
+  });
+
   // ---- launchd ------------------------------------------------------------
   if (!ctx.hasLaunchctl()) {
     add({
@@ -341,6 +381,28 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
     }
   }
   return checks;
+}
+
+/** Does this project's `.mcp.json` carry the Pagr channel server? Never throws. */
+function readMcpEntry(file: string): { present: boolean; problem?: string } {
+  if (!existsSync(file)) return { present: false };
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8') || '{}');
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+      return { present: false, problem: 'not a JSON object' };
+    const servers = (parsed as { mcpServers?: Record<string, unknown> }).mcpServers;
+    return { present: Boolean(servers && MCP_SERVER_KEY in servers) };
+  } catch (err) {
+    return { present: false, problem: `invalid JSON (${(err as Error).message})` };
+  }
+}
+
+async function channelStatusOf(ctx: CliContext): Promise<ChannelStatus | null> {
+  try {
+    return await ipc(ctx).call<ChannelStatus>('channel.status', undefined, 3000);
+  } catch {
+    return null;
+  }
 }
 
 function launchAgentLoadedSafely(ctx: CliContext): boolean {

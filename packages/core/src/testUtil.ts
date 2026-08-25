@@ -9,6 +9,19 @@ export function tempHome(prefix = 'pagr-test-'): { home: string; cleanup: () => 
   return { home, cleanup: () => rmSync(home, { recursive: true, force: true }) };
 }
 
+/** Run `fn` with a fresh temp dir that is removed afterwards, even on failure. */
+export async function withTempHome<T>(
+  fn: (home: string) => Promise<T> | T,
+  prefix = 'pagr-test-',
+): Promise<T> {
+  const t = tempHome(prefix);
+  try {
+    return await fn(t.home);
+  } finally {
+    t.cleanup();
+  }
+}
+
 /** Per-test temp dir. Read `.home` inside tests only. */
 export function useTempHome(prefix = 'pagr-test-'): { readonly home: string } {
   let cur: ReturnType<typeof tempHome> | null = null;

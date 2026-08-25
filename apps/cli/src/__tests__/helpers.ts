@@ -28,6 +28,10 @@ export interface Harness {
   launchctl: boolean;
   /** Fire every registered Ctrl-C handler. */
   interrupt(): void;
+  /** Answers handed to `ctx.prompt`, in order; '' once exhausted. */
+  promptAnswers: string[];
+  /** Questions `ctx.prompt` was asked. */
+  prompts: string[];
   /** Milliseconds the injected clock advances on every `sleep()`. */
   clockStepMs: number;
   /** The injected clock's current value. */
@@ -58,6 +62,8 @@ export function harness(extra: ContextOverrides = {}): Harness {
     interrupt: () => {
       for (const fn of [...interruptHandlers]) fn();
     },
+    promptAnswers: [],
+    prompts: [],
     overrides: {},
     run: (argv) => run(argv, h.overrides),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
@@ -80,6 +86,10 @@ export function harness(extra: ContextOverrides = {}): Harness {
       return h.browserOpens;
     },
     confirm: async () => true,
+    prompt: async (q) => {
+      h.prompts.push(q);
+      return h.promptAnswers.shift() ?? '';
+    },
     hasLaunchctl: () => h.launchctl,
     onInterrupt: (fn) => {
       interruptHandlers.add(fn);

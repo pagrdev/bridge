@@ -39,6 +39,8 @@ export interface CliContext {
   /** Resolves false when no browser could be launched (SSH, headless, no handler). */
   openBrowser(url: string): Promise<boolean>;
   confirm(question: string): Promise<boolean>;
+  /** Free-text answer to a question. Returns '' when there is no TTY to ask. */
+  prompt(question: string): Promise<string>;
   /** Is launchd available on this machine? False in containers and on non-macOS. */
   hasLaunchctl(): boolean;
   /**
@@ -97,6 +99,17 @@ function defaultConfirm(question: string): Promise<boolean> {
   );
 }
 
+function defaultPrompt(question: string): Promise<string> {
+  if (!process.stdin.isTTY) return Promise.resolve('');
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  return new Promise((resolve) =>
+    rl.question(`${question} `, (a) => {
+      rl.close();
+      resolve(a.trim());
+    }),
+  );
+}
+
 function defaultTcpConnect(host: string, port: number, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = createConnection({ host, port });
@@ -150,6 +163,7 @@ export function createContext(overrides: ContextOverrides = {}): CliContext {
     execStream: defaultExecStream,
     openBrowser: defaultOpenBrowser,
     confirm: defaultConfirm,
+    prompt: defaultPrompt,
     hasLaunchctl: () => existsSync(LAUNCHCTL),
     onInterrupt: defaultOnInterrupt,
     secretStore: () => createSecretStore({ home, env }),

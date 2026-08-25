@@ -298,3 +298,151 @@ describe('PAGR_HOME edge cases', () => {
     expect(statSync(h.home).mode & 0o777).toBe(0o700);
   });
 });
+
+describe('pagr projects at scale', () => {
+  const mkrepo = (name: string, remote?: string) => {
+    const dir = join(h.home, '..', name);
+    mkdirSync(join(dir, '.git'), { recursive: true });
+    if (remote)
+      writeFileSync(join(dir, '.git', 'config'), `[remote "origin"]\n\turl = ${remote}\n`);
+    return dir;
+  };
+
+  it('shows name, aliases, path and id for every project', async () => {
+    await h.run(['project', 'add', mkrepo('alpha', 'git@github.com:acme/alpha-svc.git')]);
+    await h.run(['project', 'add', mkrepo('beta')]);
+    h.stdout.length = 0;
+    expect(await h.run(['projects'])).toBe(EXIT.ok);
+    const text = out();
+    expect(text).toContain('NAME');
+    expect(text).toContain('ALIASES');
+    expect(text).toContain('LIVE');
+    expect(text).toContain('alpha-svc');
+    expect(text).toContain('2 project(s)');
+  });
+
+  it('marks projects with a live session when the daemon is up', async () => {
+    await h.run(['project', 'add', repo, '--name', 'Widgets']);
+    const listed = JSON.parse(readFileSync(getPaths(h.home).projectsFile, 'utf8')) as Record<
+      string,
+      { projectId: string }
+    >;
+    const projectId = Object.values(listed)[0]?.projectId as string;
+    server = await fakeDaemon(h.home, {
+      status: () => status(),
+      'projects.list': () => Object.values(listed),
+      'sessions.list': () => [
+        {
+          sessionId: `ses_${'1'.repeat(32)}`,
+          provider: 'codex',
+          projectId,
+          providerSessionId: 'thr',
+          status: 'working',
+          startedAt: '2026-08-25T00:00:00.000Z',
+          updatedAt: '2026-08-25T00:00:00.000Z',
+        },
+        {
+          sessionId: `ses_${'2'.repeat(32)}`,
+          provider: 'claude',
+          projectId,
+          providerSessionId: 'c',
+          status: 'completed',
+          startedAt: '2026-08-25T00:00:00.000Z',
+          updatedAt: '2026-08-25T00:00:00.000Z',
+        },
+      ],
+    });
+    h.stdout.length = 0;
+    expect(await h.run(['projects'])).toBe(EXIT.ok);
+    expect(out()).toContain('codex:working');
+    // a completed session is not "live" and must not be shown as such
+    expect(out()).not.toContain('claude:completed');
+  });
+
+  it('--json includes the live sessions per project', async () => {
+    await h.run(['project', 'add', repo]);
+    h.stdout.length = 0;
+    expect(await h.run(['projects', '--json'])).toBe(EXIT.ok);
+    const doc = lastJson(h) as Array<{ displayName: string; sessions: unknown[] }>;
+    expect(doc[0]?.sessions).toEqual([]);
+  });
+
+  it('refuses an explicit --name that already refers to another project', async () => {
+    await h.run(['project', 'add', mkrepo('one'), '--name', 'Widgets']);
+    expect(await h.run(['project', 'add', mkrepo('two'), '--name', 'widgets'])).toBe(
+      EXIT.precondition,
+    );
+    expect(err()).toContain('already refers to Widgets');
+  });
+
+  it('auto-qualifies an inferred name instead of registering two of the same', async () => {
+    mkdirSync(join(h.home, '..', 'x', 'app', '.git'), { recursive: true });
+    mkdirSync(join(h.home, '..', 'y', 'app', '.git'), { recursive: true });
+    await h.run(['project', 'add', join(h.home, '..', 'x', 'app')]);
+    h.stdout.length = 0;
+    expect(await h.run(['project', 'add', join(h.home, '..', 'y', 'app')])).toBe(EXIT.ok);
+    expect(out()).toContain('y/app');
+    expect(out()).toContain('was taken');
+  });
+});
+
+describe('pagr sessions --reconcile', () => {
+  it('reports what it cleared', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () => status(),
+      'sessions.reconcile': () => [
+        {
+          sessionId: `ses_${'1'.repeat(32)}`,
+          provider: 'codex',
+          projectId: `proj_${'a'.repeat(32)}`,
+          status: 'stopped',
+          outcome: 'terminated',
+          reason: 'the daemon restarted and the provider no longer knows this session',
+        },
+      ],
+    });
+    expect(await h.run(['sessions', '--reconcile'])).toBe(EXIT.ok);
+    expect(out()).toContain('terminated');
+    expect(out()).toContain('no longer knows');
+  });
+
+  it('says so when there is nothing to clear', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () => status(),
+      'sessions.reconcile': () => [],
+    });
+    expect(await h.run(['sessions', '--reconcile'])).toBe(EXIT.ok);
+    expect(out()).toContain('nothing to reconcile');
+  });
+
+  it('shows the project name and a live count in the plain listing', async () => {
+    const projectId = `proj_${'a'.repeat(32)}`;
+    server = await fakeDaemon(h.home, {
+      status: () => status(),
+      'projects.list': () => [
+        {
+          projectId,
+          path: '/x',
+          displayName: 'Widgets',
+          aliases: [],
+          allowNonGit: false,
+          addedAt: '',
+        },
+      ],
+      'sessions.list': () => [
+        {
+          sessionId: `ses_${'1'.repeat(32)}`,
+          provider: 'codex',
+          projectId,
+          providerSessionId: 't',
+          status: 'working',
+          startedAt: '2026-08-25T00:00:00.000Z',
+          updatedAt: '2026-08-25T00:00:00.000Z',
+        },
+      ],
+    });
+    expect(await h.run(['sessions'])).toBe(EXIT.ok);
+    expect(out()).toContain('Widgets');
+    expect(out()).toContain('1 session(s), 1 live');
+  });
+});

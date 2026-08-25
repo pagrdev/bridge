@@ -25,6 +25,14 @@ export interface ClaudeAdapterOptions {
   /** Base command, default `['claude']`. Tests pass `['node', fixture]`. */
   claudeCommand?: string[];
   approvalTimeoutMs?: number;
+  /**
+   * Ceiling on `claude` children alive at once. A finished session keeps its process (so the
+   * next instruction needs no re-spawn), which without a cap means one process per session
+   * forever. Idle processes are ended least-recently-used first; `--resume` brings them back.
+   */
+  maxLiveProcesses?: number;
+  /** How long an evicted child gets to exit on EOF before it is signalled. */
+  retireGraceMs?: number;
   /** Extra env for spawned processes (tests). */
   env?: NodeJS.ProcessEnv;
   log?: boolean;
@@ -33,6 +41,8 @@ export interface ClaudeAdapterOptions {
   /** Test seam; defaults to the daemon's process-wide bridge. */
   channelBridge?: ChannelBridge;
 }
+
+export const DEFAULT_MAX_CLAUDE_PROCESSES = 6;
 
 interface LiveSession {
   summary: SessionSummary;
@@ -43,6 +53,8 @@ interface LiveSession {
   activeTurn: boolean;
   lastText: string;
   queued: Array<{ instruction: string; images: string[] }>;
+  /** For LRU eviction of idle processes when the pool is full. */
+  lastActivityMs: number;
 }
 
 interface PendingApproval {
@@ -109,6 +121,11 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     };
   }
 
+  /** `claude` children alive right now, including any still being drained out of the pool. */
+  get liveProcessCount(): number {
+    return this.processCount(null);
+  }
+
   async probe(): Promise<AgentConnectionStatus> {
     const version = await this.run(['--version']);
     if (version === null) {
@@ -152,7 +169,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       capabilities: { ...CAPABILITIES },
     };
     if (authStatus !== 'authenticated') status.detail = 'Run `claude` once and sign in';
-    return this.channel ? channelStatus(status) : status;
+    return this.channel ? channelStatus(status, this.channel.hasAttachedProject()) : status;
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -192,6 +209,9 @@ export class ClaudeAdapter implements CodingAgentAdapter {
 
   async startSession(input: StartSessionInput): Promise<SessionSummary> {
     if (this.shuttingDown) throw new Error('adapter is shut down');
+    // Fail before recording anything: a session that never got a process has nothing to resume,
+    // so leaving it in the map would show a phantom session in `pagr sessions` forever.
+    await this.reserveProcessSlot(null);
     const claudeSessionId = randomUUID();
     const ts = now();
     const live: LiveSession = {
@@ -213,6 +233,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       activeTurn: false,
       lastText: '',
       queued: [],
+      lastActivityMs: Date.now(),
     };
     this.sessions.set(input.sessionId, live);
     this.map.set(input.sessionId, {
@@ -225,9 +246,18 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       lastStatus: 'starting',
       ...(input.displayName ? { displayName: input.displayName } : {}),
     });
-    this.emit({ kind: 'session', session: live.summary });
-    this.spawn(live, { kind: 'new', id: claudeSessionId });
-    this.sendTurn(live, input.instruction, input.localImagePaths);
+    // No `starting` event before the process exists: the daemon writes every session event
+    // straight into its store, and a start that then throws would leave a permanently "live"
+    // record holding this working tree and a slot in the session budget. `sendTurn` emits
+    // `working` on success, which is the first thing the daemon should hear about.
+    try {
+      this.spawn(live, { kind: 'new', id: claudeSessionId });
+      this.sendTurn(live, input.instruction, input.localImagePaths);
+    } catch (err) {
+      this.sessions.delete(input.sessionId);
+      this.map.remove(input.sessionId);
+      throw err;
+    }
     return live.summary;
   }
 
@@ -256,7 +286,10 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       this.sessionEvent(live, 'queued_followup', clip(input.instruction, 500));
       return { delivered: 'queued' };
     }
-    if (!live.proc?.alive) this.spawn(live, { kind: 'resume', id: live.claudeSessionId });
+    if (!live.proc?.alive) {
+      await this.reserveProcessSlot(live);
+      this.spawn(live, { kind: 'resume', id: live.claudeSessionId });
+    }
     this.sendTurn(live, input.instruction, input.localImagePaths);
     return { delivered: 'new_turn' };
   }
@@ -379,15 +412,90 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       activeTurn: false,
       lastText: '',
       queued: [],
+      lastActivityMs: Date.now(),
     };
     this.sessions.set(sessionId, live);
     return live;
+  }
+
+  /** Every session whose `claude` child is still running. */
+  private liveProcesses(): LiveSession[] {
+    return [...this.sessions.values()].filter((s) => s.proc?.alive);
+  }
+
+  /**
+   * Children the pool has asked to leave but which have not exited yet. They still occupy a slot:
+   * counting only the ones we still hold a session reference for would let a child that ignores
+   * EOF push the real process count past the cap while the bookkeeping says otherwise.
+   */
+  private readonly draining = new Set<ClaudeProcess>();
+
+  private processCount(exclude: LiveSession | null): number {
+    return (
+      this.liveProcesses().filter((s) => s !== exclude).length +
+      [...this.draining].filter((p) => p.alive).length
+    );
+  }
+
+  /**
+   * Make room in the process pool before spawning. Idle children (no turn in flight) are ended
+   * oldest-first — they resume from disk with `--resume`, so nothing is lost. If every child is
+   * mid-turn the caller is told rather than the Mac being asked to run one more.
+   */
+  private async reserveProcessSlot(exclude: LiveSession | null): Promise<void> {
+    const max = this.opts.maxLiveProcesses ?? DEFAULT_MAX_CLAUDE_PROCESSES;
+    if (this.processCount(exclude) < max) return;
+    const idle = this.liveProcesses()
+      .filter((s) => s !== exclude && !s.activeTurn)
+      .sort((a, b) => a.lastActivityMs - b.lastActivityMs);
+    for (const victim of idle) {
+      if (this.processCount(exclude) < max) break;
+      await this.retire(victim, max);
+    }
+    if (this.processCount(exclude) >= max)
+      throw new Error(
+        `${this.processCount(exclude)} Claude Code sessions are already mid-turn, which is this ` +
+          `device's limit of ${max} live \`claude\` processes — stop one and try again`,
+      );
+  }
+
+  /**
+   * End an idle child and wait for it to actually go. Closing stdin is enough for a well-behaved
+   * `claude -p`, but the handle is kept (and escalated to SIGINT/SIGTERM/SIGKILL) so a child that
+   * ignores EOF cannot outlive the daemon.
+   */
+  private async retire(live: LiveSession, max: number): Promise<void> {
+    const proc = live.proc;
+    if (!proc) return;
+    live.proc = null;
+    this.draining.add(proc);
+    this.logger.log('info', 'ending idle claude process to stay under the pool limit', {
+      sessionId: live.summary.sessionId,
+      max,
+    });
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      proc.once('exit', done);
+      proc.end();
+      const timer = setTimeout(() => {
+        void proc.stop().finally(done);
+      }, this.opts.retireGraceMs ?? 1500);
+      timer.unref();
+    });
+    this.draining.delete(proc);
   }
 
   private spawn(
     live: LiveSession,
     session: { kind: 'new'; id: string } | { kind: 'resume'; id: string },
   ): void {
+    live.lastActivityMs = Date.now();
     const proc = new ClaudeProcess({
       command: this.opts.claudeCommand ?? ['claude'],
       cwd: live.projectPath,
@@ -485,7 +593,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
         if (ev.ok) {
           this.setStatus(live, 'completed', { activeTurn: false });
           this.sessionEvent(live, 'completed', text || 'Turn completed');
-          this.deliverQueued(live);
+          void this.deliverQueued(live);
         } else {
           this.setStatus(live, 'failed', { activeTurn: false, endedAt: now() });
           this.sessionEvent(live, 'failed', `${ev.subtype}: ${text || 'Turn failed'}`);
@@ -566,11 +674,14 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     return false;
   }
 
-  private deliverQueued(live: LiveSession): void {
+  private async deliverQueued(live: LiveSession): Promise<void> {
     const next = live.queued.shift();
     if (!next) return;
     try {
-      if (!live.proc?.alive) this.spawn(live, { kind: 'resume', id: live.claudeSessionId });
+      if (!live.proc?.alive) {
+        await this.reserveProcessSlot(live);
+        this.spawn(live, { kind: 'resume', id: live.claudeSessionId });
+      }
       this.sendTurn(live, next.instruction, next.images);
       this.sessionEvent(live, 'followup_delivered', clip(next.instruction, 500));
     } catch (err) {
@@ -583,6 +694,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     status: SessionSummary['status'],
     patch: Partial<SessionSummary> = {},
   ): void {
+    live.lastActivityMs = Date.now();
     live.summary = { ...live.summary, ...patch, status, updatedAt: now() };
     this.map.update(live.summary.sessionId, {
       lastStatus: status,

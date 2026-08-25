@@ -18,10 +18,20 @@ export function channelModeEnabled(env: NodeJS.ProcessEnv = process.env): boolea
 }
 
 export const CHANNEL_PROBE_DETAIL =
-  'Claude Code channel mode is ON (PAGR_CLAUDE_CHANNEL=1). This is a research-preview, ' +
-  'development-flag-only path: run `pagr claude channel-setup`, then start Claude Code with ' +
-  '`claude --dangerously-load-development-channels server:pagr`. Messages inject into the ' +
-  'running session; without the flag Pagr falls back to queued follow-ups (cli-hooks).';
+  'Claude Code channel mode is ON (PAGR_CLAUDE_CHANNEL=1) and a channel is attached, so ' +
+  'instructions inject into the running Claude Code turn. This is a research-preview, ' +
+  'development-flag-only path.';
+
+/**
+ * What the cloud is told when the flag is on but nothing is polling. The distinction matters:
+ * `canSteerActiveTurn: true` makes the product promise "I interrupted your agent", and that must
+ * never be said about a follow-up that will actually sit in a queue.
+ */
+export const CHANNEL_ARMED_DETAIL =
+  'Claude Code channel mode is enabled (PAGR_CLAUDE_CHANNEL=1) but no channel is attached yet, ' +
+  'so instructions will be QUEUED, not steered. Run `pagr claude channel-setup`, then start ' +
+  'Claude Code with `claude --dangerously-load-development-channels server:pagr` in a ' +
+  'registered project.';
 
 /** Where a session lives, as far as the channel is concerned. */
 export interface ChannelTarget {
@@ -61,6 +71,15 @@ export class ChannelMode {
   isAttached(cwd: string): boolean {
     return this.bridge.isAttached(cwd);
   }
+
+  /** Any project with a live channel right now — i.e. can this device steer at all? */
+  hasAttachedProject(): boolean {
+    return this.bridge.attachedProjects().length > 0;
+  }
+
+  attachedProjects(): string[] {
+    return this.bridge.attachedProjects();
+  }
 }
 
 /**
@@ -74,12 +93,23 @@ export function channelCapabilities(base: AgentCapabilities): AgentCapabilities 
   return { ...base, canSteerActiveTurn: true, canReceiveLiveExternalMessages: true };
 }
 
-/** Patch a `cli-hooks` probe result into an `approved-channel` one. */
-export function channelStatus(base: AgentConnectionStatus): AgentConnectionStatus {
+/**
+ * Patch a `cli-hooks` probe result for channel mode.
+ *
+ * `attached` is the truth the cloud needs: the flag being on only means the daemon *accepts* a
+ * channel. Until a channel server is actually polling for a registered project, nothing can be
+ * steered, so the capability stays false and the mode stays `cli-hooks` — the bridge reports what
+ * it can do this second, not what it could do if the user ran another command.
+ */
+export function channelStatus(
+  base: AgentConnectionStatus,
+  attached = false,
+): AgentConnectionStatus {
+  const detail = attached ? CHANNEL_PROBE_DETAIL : CHANNEL_ARMED_DETAIL;
   return {
     ...base,
-    mode: 'approved-channel',
-    capabilities: channelCapabilities(base.capabilities),
-    detail: base.detail ? `${base.detail}. ${CHANNEL_PROBE_DETAIL}` : CHANNEL_PROBE_DETAIL,
+    mode: attached ? 'approved-channel' : base.mode,
+    capabilities: attached ? channelCapabilities(base.capabilities) : { ...base.capabilities },
+    detail: base.detail ? `${base.detail}. ${detail}` : detail,
   };
 }

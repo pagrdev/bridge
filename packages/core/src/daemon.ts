@@ -5,18 +5,31 @@ import type { CodingAgentAdapter } from './adapters/types.js';
 import type { FetchLike } from './attachments.js';
 import { cleanupTmp } from './attachments.js';
 import { IdempotencyCache, verifyIncoming } from './commandGuard.js';
+import { SessionGuard } from './concurrency.js';
 import { type BridgeConfig, readConfig, updateConfig } from './config.js';
 import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
 import { Dispatcher } from './dispatcher.js';
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, loadOrCreateIdentity } from './identity.js';
-import { IpcMethodError, IpcServer, IpcSocketBusyError, registerChannelMethods } from './ipc.js';
+import {
+  type ChannelBridge,
+  IpcMethodError,
+  IpcServer,
+  IpcSocketBusyError,
+  registerChannelMethods,
+} from './ipc.js';
 import type { SecretStore } from './keychain.js';
 import { type Logger, silentLogger } from './logging.js';
 import { ensurePaths, type PagrPaths } from './paths.js';
 import { ProjectError, ProjectRegistry } from './projects.js';
+import { type ReconciledSession, reconcileSessions } from './reconcile.js';
 import { ReplayCache } from './replay.js';
-import { type SessionRecord, SessionStore } from './sessions.js';
+import {
+  DEFAULT_MAX_SESSION_RECORDS,
+  DEFAULT_SESSION_RETENTION_MS,
+  type SessionRecord,
+  SessionStore,
+} from './sessions.js';
 import { GatewayClient } from './transport.js';
 
 export interface CreateDaemonOptions {
@@ -34,6 +47,10 @@ export interface CreateDaemonOptions {
   heartbeatMs?: number;
   backoff?: { baseMs?: number; maxMs?: number };
   tmpCleanupOlderThanMs?: number;
+  /** How long terminal sessions stay in `sessions.json` (default one week). */
+  sessionRetentionMs?: number;
+  /** Hard ceiling on rows in `sessions.json` (default 500). */
+  maxSessionRecords?: number;
   /** Environment for security checks (`PAGR_ENV`, `PAGR_ALLOW_INSECURE_WS`); defaults to process.env. */
   env?: NodeJS.ProcessEnv;
 }
@@ -67,6 +84,13 @@ export interface Daemon {
   start(): Promise<void>;
   stop(): Promise<void>;
   status(): DaemonStatus;
+  /** Whether Claude Code live steering is enabled AND actually reachable right now. */
+  channelStatus(): ChannelStatus;
+  /**
+   * Bring `sessions.json` back in line with reality. Called by `start()`; exposed so tests and
+   * `pagr sessions --reconcile` can force it.
+   */
+  reconcile(): Promise<ReconciledSession[]>;
   /** Feed a raw command envelope (as the gateway would). Returns the ack event. */
   handleEnvelope(envelope: unknown): Promise<DeviceEvent>;
 }
@@ -115,7 +139,15 @@ const ProjectAddParams = z.object({
   allowNonGit: z.boolean().optional(),
 });
 
-const SESSION_RETENTION_MS = 7 * 24 * 3600_000;
+/** Reported by `pagr status` / `pagr doctor` so users can see the live-steering truth. */
+export interface ChannelStatus {
+  /** `PAGR_CLAUDE_CHANNEL=1`: the daemon registered the channel IPC methods. */
+  enabled: boolean;
+  /** Project roots with a channel server actually polling right now. */
+  attachedProjects: string[];
+  /** True only when at least one project can be steered live this second. */
+  canSteerLive: boolean;
+}
 
 /** Stable `ses_…` id for a provider session the bridge did not spawn (hook path). */
 export function syntheticSessionId(provider: Provider, providerSessionId?: string): string {
@@ -162,6 +194,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     policyFile: paths.policyFile,
     now,
     logger: logger.child({ mod: 'dispatcher' }),
+    guard: SessionGuard.fromEnv(o.env ?? process.env),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
 
@@ -293,6 +326,16 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     return { projectId };
   });
   ipc.registerMethod('sessions.list', () => sessions.list());
+  ipc.registerMethod('sessions.reconcile', async () =>
+    (await daemon.reconcile()).map((c) => ({
+      sessionId: c.record.sessionId,
+      provider: c.record.provider,
+      projectId: c.record.projectId,
+      status: c.record.status,
+      outcome: c.outcome,
+      reason: c.reason,
+    })),
+  );
   ipc.registerMethod('approvals.list', () => dispatcher.approvals.list());
   ipc.registerMethod('approval.request', (params) => {
     const p = ApprovalRequestParams.parse(params);
@@ -325,7 +368,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         startedAt: existing?.startedAt ?? ts,
         updatedAt: ts,
       });
-      emit(makeEvent(dispatcherDeviceId(), 'session.updated', summaryOf(rec), { now }));
+      emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
     }
     return new Promise<{
       approvalId: string;
@@ -347,7 +390,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
           if (!p.sessionId) {
             const rec = sessions.setStatus(sessionId, 'idle');
             if (rec)
-              emit(makeEvent(dispatcherDeviceId(), 'session.updated', summaryOf(rec), { now }));
+              emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
           }
           resolve({ approvalId: record.approvalId, decision, resolution });
         },
@@ -355,7 +398,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     });
   });
 
-  function summaryOf(rec: SessionRecord): SessionSummary {
+  function summaryOf(rec: SessionRecord, displayName?: string): SessionSummary {
     return {
       sessionId: rec.sessionId,
       projectId: rec.projectId,
@@ -364,9 +407,10 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       activeTurn: rec.status === 'waiting_for_approval',
       startedAt: rec.startedAt,
       updatedAt: rec.updatedAt,
-      displayName: 'Interactive session',
+      ...(displayName ? { displayName } : {}),
     };
   }
+  const interactive = (rec: SessionRecord) => summaryOf(rec, 'Interactive session');
   ipc.registerMethod('agent.event', (params) => {
     const p = AgentEventParams.parse(params);
     emit(
@@ -396,8 +440,16 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   // Additive and flag-gated: without PAGR_CLAUDE_CHANNEL=1 these methods are never registered
   // and the daemon behaves exactly as before. See integrations/claude-channel/README.md.
   const channelEnv = o.env ?? process.env;
-  if (channelEnv.PAGR_CLAUDE_CHANNEL === '1') {
-    registerChannelMethods(ipc, {
+  const channelEnabled = channelEnv.PAGR_CLAUDE_CHANNEL === '1';
+  let channelBridge: ChannelBridge | null = null;
+  const channelStatus = (): ChannelStatus => {
+    const attachedProjects = channelBridge?.attachedProjects() ?? [];
+    return { enabled: channelEnabled, attachedProjects, canSteerLive: attachedProjects.length > 0 };
+  };
+  // Always answerable, so `pagr doctor` can say "the channel is off" instead of "unknown".
+  ipc.registerMethod('channel.status', () => channelStatus());
+  if (channelEnabled) {
+    channelBridge = registerChannelMethods(ipc, {
       resolveProject: (cwd) => {
         const rec = registry.findByPath(cwd);
         return rec ? { projectId: rec.projectId, path: rec.path } : null;
@@ -419,12 +471,16 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
           provider: 'claude',
           projectId,
           providerSessionId: existing?.providerSessionId ?? id,
-          status: existing?.status ?? 'working',
+          // `idle`, not `working`: nothing ever moves this synthetic session off a live status,
+          // and a permanently "live" record would hold the project's working tree against every
+          // future cloud session (see concurrency.ts). The same choice the approval-hook path
+          // makes once a decision comes back.
+          status: existing?.status ?? 'idle',
           startedAt: existing?.startedAt ?? ts,
           updatedAt: ts,
         });
         if (!existing)
-          emit(makeEvent(dispatcherDeviceId(), 'session.updated', summaryOf(rec), { now }));
+          emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
         return id;
       },
       emitAgentMessage: ({ sessionId, projectId, text }) => {
@@ -476,10 +532,21 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         throw err;
       }
       cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now);
+      // Bound the file before anything else reads it, so a store that grew while the daemon was
+      // down does not stay oversized until the first hourly tick.
+      sessions.prune({
+        retentionMs: o.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION_MS,
+        maxEntries: o.maxSessionRecords ?? DEFAULT_MAX_SESSION_RECORDS,
+      });
+      // No process outlived the daemon, so nothing in the store may still claim to be working.
+      await daemon.reconcile();
       cleanupTimer = setInterval(() => {
         cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now);
         // Completed sessions must stay resumable well past 24h; only very old terminal ones go.
-        sessions.pruneTerminal(SESSION_RETENTION_MS);
+        sessions.prune({
+          retentionMs: o.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION_MS,
+          maxEntries: o.maxSessionRecords ?? DEFAULT_MAX_SESSION_RECORDS,
+        });
       }, 3600_000);
       cleanupTimer.unref();
       if (transport) transport.start();
@@ -500,7 +567,34 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       logger.info('daemon stopped');
     },
     status,
+    channelStatus,
     handleEnvelope,
+    async reconcile() {
+      const changed = await reconcileSessions({
+        sessions,
+        adapters: o.adapters,
+        logger: logger.child({ mod: 'reconcile' }),
+        onChange: (c) => {
+          emit(makeEvent(dispatcherDeviceId(), 'session.updated', summaryOf(c.record), { now }));
+          emit(
+            makeEvent(
+              dispatcherDeviceId(),
+              'session.event',
+              {
+                sessionId: c.record.sessionId,
+                projectId: c.record.projectId,
+                provider: c.record.provider,
+                kind: c.outcome === 'failed' ? 'failed' : 'stopped',
+                summary: c.reason,
+                at: now().toISOString(),
+              },
+              { now },
+            ),
+          );
+        },
+      });
+      return changed;
+    },
   };
   return daemon;
 }

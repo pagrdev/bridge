@@ -169,3 +169,64 @@ describe('refusals', () => {
     ).toBe(EXIT.precondition);
   });
 });
+
+describe('pagr claude channel-setup · explaining before writing', () => {
+  it('explains what a channel is and what the preview flag means', async () => {
+    expect(await setup()).toBe(EXIT.ok);
+    const out = plain(h.stdout);
+    expect(out).toContain('What a channel is');
+    expect(out).toContain('QUEUED');
+    expect(out).toContain('INTERRUPTS');
+    expect(out).toContain('What the preview flag means');
+    expect(out).toContain('full-screen warning');
+    expect(out).toContain('What Pagr does without it');
+  });
+
+  it('prints the exact JSON it will add to .mcp.json', async () => {
+    expect(await setup()).toBe(EXIT.ok);
+    const out = plain(h.stdout);
+    expect(out).toContain('"mcpServers"');
+    expect(out).toContain('"pagr"');
+    expect(out).toContain(serverPath);
+    expect(out).toContain('no other key in that file is touched');
+  });
+
+  it('names the other MCP servers it will leave alone', async () => {
+    writeFileSync(
+      mcpFile(),
+      JSON.stringify({ mcpServers: { linear: { command: 'npx', args: ['linear'] } } }),
+    );
+    expect(await setup()).toBe(EXIT.ok);
+    expect(plain(h.stdout)).toContain('linear');
+  });
+
+  it('--dry-run shows the change and writes nothing', async () => {
+    expect(await setup(['--dry-run'])).toBe(EXIT.ok);
+    const out = plain(h.stdout);
+    expect(out).toContain('Would add to');
+    expect(out).toContain('nothing was written');
+    expect(() => readMcp()).toThrow();
+  });
+
+  it('--dry-run --json carries the explanation and the exact entry', async () => {
+    expect(await setup(['--dry-run', '--json'])).toBe(EXIT.ok);
+    const doc = lastJson(h) as {
+      dryRun: boolean;
+      written: boolean;
+      mcpEntry: Record<string, unknown>;
+      explanation: string;
+      launchCommand: string;
+    };
+    expect(doc.dryRun).toBe(true);
+    expect(doc.written).toBe(false);
+    expect(doc.mcpEntry).toEqual({ pagr: { command: 'node', args: [serverPath] } });
+    expect(doc.explanation).toContain('What a channel is');
+    expect(doc.launchCommand).toContain('--dangerously-load-development-channels');
+    expect(() => readMcp()).toThrow();
+  });
+
+  it('points at pagr doctor for whether steering is actually reachable', async () => {
+    expect(await setup()).toBe(EXIT.ok);
+    expect(plain(h.stdout)).toContain('pagr doctor');
+  });
+});

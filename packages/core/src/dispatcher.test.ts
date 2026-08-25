@@ -90,6 +90,225 @@ describe('Dispatcher', () => {
     expect(JSON.stringify(p.result)).not.toContain(t.home);
   });
 
+  describe('concurrent sessions', () => {
+    const start = (over: {
+      provider?: Provider;
+      projectId?: string;
+      sessionId?: string;
+      readOnly?: boolean;
+    }) =>
+      d.handle(
+        body('agent.start_session', {
+          provider: over.provider ?? 'codex',
+          projectId: over.projectId ?? projectId,
+          instruction: 'go',
+          sessionId: over.sessionId ?? ids.ses(),
+          attachments: [],
+          readOnly: over.readOnly ?? false,
+        }),
+      );
+
+    const extraProject = (name: string) => {
+      const p = join(t.home, 'home', name);
+      mkdirSync(join(p, '.git'), { recursive: true });
+      return registry.add(p).projectId;
+    };
+
+    it('allows two sessions in different projects', async () => {
+      const other = extraProject('repo2');
+      expect((await start({})).payload).toMatchObject({ status: 'completed' });
+      expect((await start({ projectId: other })).payload).toMatchObject({ status: 'completed' });
+    });
+
+    it('allows two Codex sessions in two different projects', async () => {
+      const other = extraProject('repo2');
+      await start({ provider: 'codex' });
+      expect((await start({ provider: 'codex', projectId: other })).payload).toMatchObject({
+        status: 'completed',
+      });
+    });
+
+    it('refuses a Claude session in a project a Codex session already holds', async () => {
+      const first = ids.ses();
+      await start({ provider: 'codex', sessionId: first });
+      const ack = await start({ provider: 'claude' });
+      expect(ack.payload).toMatchObject({ status: 'failed', errorCode: 'capability_unsupported' });
+      expect((ack.payload as { message: string }).message).toContain(first);
+      expect((ack.payload as { message: string }).message).toMatch(/working tree/);
+      expect(claude.calls.filter((c) => c.method === 'startSession')).toHaveLength(0);
+    });
+
+    it('refuses a second write-capable session of the same provider in one project', async () => {
+      await start({ provider: 'codex' });
+      expect((await start({ provider: 'codex' })).payload).toMatchObject({
+        status: 'failed',
+        errorCode: 'capability_unsupported',
+      });
+    });
+
+    it('allows a read-only session alongside a writer', async () => {
+      await start({ provider: 'codex' });
+      expect((await start({ provider: 'claude', readOnly: true })).payload).toMatchObject({
+        status: 'completed',
+      });
+    });
+
+    it('frees the working tree once the holder stops', async () => {
+      const first = ids.ses();
+      await start({ provider: 'codex', sessionId: first });
+      await d.handle(body('agent.stop_session', { sessionId: first }));
+      expect((await start({ provider: 'claude' })).payload).toMatchObject({ status: 'completed' });
+    });
+
+    it('enforces a per-provider process budget', async () => {
+      const roots = ['a', 'b', 'c', 'd', 'e'].map((n) => extraProject(`r-${n}`));
+      for (const pid of roots.slice(0, 4))
+        expect((await start({ provider: 'claude', projectId: pid })).payload).toMatchObject({
+          status: 'completed',
+        });
+      const ack = await start({ provider: 'claude', projectId: roots[4] as string });
+      expect(ack.payload).toMatchObject({ status: 'failed', errorCode: 'capability_unsupported' });
+      expect((ack.payload as { message: string }).message).toMatch(/limit of 4/);
+      // the other provider still has room
+      expect(
+        (await start({ provider: 'codex', projectId: roots[4] as string })).payload,
+      ).toMatchObject({ status: 'completed' });
+    });
+
+    it('does not hold a working tree it can no longer name', async () => {
+      const other = extraProject('repo2');
+      await start({ provider: 'codex', projectId: other });
+      registry.remove(other);
+      // The tree rule cannot apply to an unnameable path…
+      expect((await start({ provider: 'codex' })).payload).toMatchObject({ status: 'completed' });
+    });
+
+    it('still counts an unregistered project’s session against the budget', async () => {
+      const roots = ['a', 'b', 'c', 'd'].map((n) => extraProject(`b-${n}`));
+      for (const pid of roots)
+        expect((await start({ provider: 'claude', projectId: pid })).payload).toMatchObject({
+          status: 'completed',
+        });
+      for (const pid of roots) registry.remove(pid);
+      const ack = await start({ provider: 'claude' });
+      expect(ack.payload).toMatchObject({ status: 'failed', errorCode: 'capability_unsupported' });
+      expect((ack.payload as { message: string }).message).toMatch(/limit of 4/);
+    });
+
+    it('refuses the second of two starts issued in the same tick', async () => {
+      // Commands are dispatched fire-and-forget, so the guard must claim the tree before its
+      // first await — otherwise both of these see an empty set of live sessions.
+      codex.startSession = async (input) => {
+        await new Promise((r) => setTimeout(r, 20));
+        const ts = now.toISOString();
+        return {
+          sessionId: input.sessionId,
+          projectId: input.project.projectId,
+          provider: 'codex' as const,
+          status: 'working' as const,
+          activeTurn: true,
+          startedAt: ts,
+          updatedAt: ts,
+        };
+      };
+      const [first, second] = await Promise.all([
+        start({ provider: 'codex' }),
+        start({ provider: 'codex' }),
+      ]);
+      const statuses = [first, second].map((a) => (a.payload as { status: string }).status).sort();
+      expect(statuses).toEqual(['completed', 'failed']);
+      const failed = [first, second].find(
+        (a) => (a.payload as { status: string }).status === 'failed',
+      );
+      expect(failed?.payload).toMatchObject({ errorCode: 'capability_unsupported' });
+      expect(sessions.list().filter((s) => s.status !== 'stopped')).toHaveLength(1);
+    });
+
+    it('drops the reservation when the provider fails to start', async () => {
+      const sessionId = ids.ses();
+      codex.failNext = new Error('codex exploded');
+      const ack = await start({ provider: 'codex', sessionId });
+      expect(ack.payload).toMatchObject({ status: 'failed' });
+      // A record left at `starting` would hold this tree — and a slot in the budget — forever.
+      expect(sessions.get(sessionId)).toBeNull();
+      expect(d.activeSessionCount()).toBe(0);
+      expect((await start({ provider: 'claude' })).payload).toMatchObject({ status: 'completed' });
+    });
+
+    it('keeps holding the tree of a session whose project was re-registered', async () => {
+      const repo = join(t.home, 'home', 'repo');
+      await start({ provider: 'codex' });
+      registry.remove(projectId);
+      const readded = registry.add(repo).projectId;
+      const ack = await start({ provider: 'claude', projectId: readded });
+      expect(ack.payload).toMatchObject({
+        status: 'failed',
+        errorCode: 'capability_unsupported',
+      });
+    });
+
+    it('remembers that a session is read-only across status updates', async () => {
+      const sessionId = ids.ses();
+      await start({ provider: 'codex', sessionId, readOnly: true });
+      codex.push({
+        kind: 'session',
+        session: {
+          sessionId,
+          projectId,
+          provider: 'codex',
+          status: 'working',
+          activeTurn: true,
+          startedAt: now.toISOString(),
+          updatedAt: now.toISOString(),
+        },
+      });
+      expect(sessions.get(sessionId)?.readOnly).toBe(true);
+    });
+  });
+
+  it('never resurrects a turn that finished while send_instruction was in flight', async () => {
+    const sessionId = ids.ses();
+    await d.handle(
+      body('agent.start_session', {
+        provider: 'codex',
+        projectId,
+        instruction: 'go',
+        sessionId,
+        attachments: [],
+        readOnly: false,
+      }),
+    );
+    // A provider fast enough to finish the whole turn before `sendInstruction` resolves: the
+    // adapter reports `completed`, so the store must not be stamped back to `working`.
+    const finished = {
+      sessionId,
+      projectId,
+      provider: 'codex' as const,
+      status: 'completed' as const,
+      activeTurn: false,
+      startedAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    };
+    codex.sendInstruction = async () => {
+      codex.sessions.set(sessionId, finished);
+      codex.push({ kind: 'session', session: finished });
+      return { delivered: 'new_turn' as const };
+    };
+    const ack = await d.handle(
+      body('agent.send_instruction', {
+        sessionId,
+        instruction: 'more',
+        mode: 'queue',
+        attachments: [],
+      }),
+    );
+    expect((ack.payload as { result: unknown }).result).toMatchObject({ delivered: 'new_turn' });
+    expect(sessions.get(sessionId)?.status).toBe('completed');
+    expect(d.activeSessionCount()).toBe(0);
+    const last = ofType('session.updated').at(-1)?.payload as { status: string };
+    expect(last.status).toBe('completed');
+  });
+
   it('project.list / project.remove', async () => {
     const list = await d.handle(body('project.list', {}));
     expect((list.payload as { result: { projects: unknown[] } }).result.projects).toHaveLength(1);
@@ -183,6 +402,10 @@ describe('Dispatcher', () => {
   it('agent.send_instruction auto → steer when capable+active, queue otherwise (emits queued_followup)', async () => {
     const s1 = ids.ses();
     const s2 = ids.ses();
+    // Two writers need two working trees; sharing one is refused (see "concurrent sessions").
+    const otherRepo = join(t.home, 'home', 'repo-claude');
+    mkdirSync(join(otherRepo, '.git'), { recursive: true });
+    const otherProject = registry.add(otherRepo).projectId;
     await d.handle(body('device.probe', {}));
     await d.handle(
       body('agent.start_session', {
@@ -197,7 +420,7 @@ describe('Dispatcher', () => {
     await d.handle(
       body('agent.start_session', {
         provider: 'claude',
-        projectId,
+        projectId: otherProject,
         instruction: 'b',
         sessionId: s2,
         attachments: [],

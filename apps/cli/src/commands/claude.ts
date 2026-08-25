@@ -28,6 +28,37 @@ export const PREVIEW_WARNING = [
   'use in that session. Use it for local development only; Pagr does not depend on it.',
 ].join('\n  ');
 
+/**
+ * The plain-language explanation. Users hit `--dangerously-…` and reasonably stop; this is the
+ * text that has to make the trade-off legible before they type it.
+ */
+export const CHANNEL_EXPLAINER = [
+  'What a channel is',
+  '  Normally Pagr talks to Claude Code by starting its own `claude` process. While that',
+  '  process is mid-answer there is no way in, so a follow-up you text is QUEUED and delivered',
+  '  when the current turn finishes.',
+  '',
+  '  A "channel" is a Claude Code extension point that lets an outside program push text into a',
+  '  session that is already running — including yours, the one in your own terminal. With a',
+  '  channel attached, a follow-up you text INTERRUPTS the turn instead of waiting for it.',
+  '',
+  'What the preview flag means',
+  '  Channels are a research preview and only Anthropic-approved channels load normally. Pagr’s',
+  '  is not on that list, so Claude Code will only load it when you start it with',
+  '  `--dangerously-load-development-channels` and accept a full-screen warning. That warning is',
+  '  real: while the channel is attached, anyone who can text your Pagr number can inject',
+  '  instructions into that session and answer its permission prompts.',
+  '',
+  'What Pagr does without it',
+  '  Everything else works exactly the same. The only difference is that follow-ups queue',
+  '  instead of steering, and `pagr doctor` says which of the two you are getting.',
+].join('\n');
+
+/** Exactly what `channel-setup` adds under `mcpServers` — printed before anything is written. */
+export const mcpEntryFor = (serverPath: string) => ({
+  [MCP_SERVER_KEY]: { command: 'node', args: [serverPath] },
+});
+
 interface McpConfig {
   mcpServers?: Record<string, unknown>;
   [k: string]: unknown;
@@ -104,6 +135,8 @@ export interface ChannelSetupOptions {
   project?: string;
   remove?: boolean;
   server?: string;
+  dryRun?: boolean;
+  explain?: boolean;
 }
 
 export async function runChannelSetup(ctx: CliContext, opts: ChannelSetupOptions): Promise<void> {
@@ -130,25 +163,50 @@ export async function runChannelSetup(ctx: CliContext, opts: ChannelSetupOptions
   }
 
   const serverPath = resolveChannelServer(ctx, opts.server);
+  const entry = mcpEntryFor(serverPath);
   const next = mergeMcpConfig(config, serverPath);
-  writeMcpConfig(file, next);
+  const existed = Boolean(config.mcpServers && MCP_SERVER_KEY in config.mcpServers);
+  if (!opts.dryRun) writeMcpConfig(file, next);
 
   if (ctx.json) {
     printJson(ctx, {
       project: projectDir,
       file,
+      written: !opts.dryRun,
+      dryRun: Boolean(opts.dryRun),
+      alreadyPresent: existed,
       serverPath,
       serverKey: MCP_SERVER_KEY,
+      mcpEntry: entry,
+      otherServers: Object.keys(config.mcpServers ?? {}).filter((k) => k !== MCP_SERVER_KEY),
       launchCommand: LAUNCH_COMMAND,
       env: { PAGR_CLAUDE_CHANNEL: '1' },
       researchPreview: true,
+      explanation: CHANNEL_EXPLAINER,
       warning: PREVIEW_WARNING.replace(/\n\s+/g, ' '),
     });
     return;
   }
 
+  ctx.out(CHANNEL_EXPLAINER);
+  ctx.out('');
+  ctx.out(bold(opts.dryRun ? `Would add to ${file}:` : `Added to ${file}:`));
+  for (const line of JSON.stringify({ mcpServers: entry }, null, 2).split('\n'))
+    ctx.out(dim(`  ${line}`));
+  const others = Object.keys(config.mcpServers ?? {}).filter((k) => k !== MCP_SERVER_KEY);
+  ctx.out(
+    dim(
+      others.length
+        ? `  every other key is preserved (${others.join(', ')} stay as they are)`
+        : '  no other key in that file is touched',
+    ),
+  );
+  ctx.out('');
+  if (opts.dryRun) {
+    ctx.out(warn('--dry-run: nothing was written'));
+    return;
+  }
   ctx.out(ok(`wrote \`${MCP_SERVER_KEY}\` into ${file}`));
-  ctx.out(dim(`  node ${serverPath}`));
   ctx.out('');
   ctx.out(warn(bold('research preview')));
   ctx.out(dim(`  ${PREVIEW_WARNING}`));
@@ -159,6 +217,7 @@ export async function runChannelSetup(ctx: CliContext, opts: ChannelSetupOptions
   ctx.out(dim('  Being in .mcp.json is not enough — the server must also be named on the'));
   ctx.out(dim('  command line. Restart the daemon with PAGR_CLAUDE_CHANNEL=1 so it accepts'));
   ctx.out(dim('  the channel and steers this project live instead of queueing follow-ups.'));
+  ctx.out(dim('  `pagr doctor` will then say whether steering is actually reachable.'));
 }
 
 export function registerClaude(program: Command, getCtx: () => CliContext): void {
@@ -170,5 +229,6 @@ export function registerClaude(program: Command, getCtx: () => CliContext): void
     .option('--project <path>', 'project directory (default: cwd)')
     .option('--server <path>', 'path to the built channel server.mjs')
     .option('--remove', 'remove the pagr entry instead of adding it')
+    .option('--dry-run', 'explain and show the exact .mcp.json change without writing it')
     .action((opts: ChannelSetupOptions) => runChannelSetup(getCtx(), opts));
 }

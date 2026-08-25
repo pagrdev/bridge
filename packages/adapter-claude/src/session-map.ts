@@ -55,6 +55,12 @@ export class SessionMap {
     this.data[sessionId] = { ...cur, ...patch };
     this.save();
   }
+  /** Forget a session that never got a process, so it cannot show up as a phantom. */
+  remove(sessionId: string): void {
+    if (!(sessionId in this.data)) return;
+    delete this.data[sessionId];
+    this.save();
+  }
   entries(): Array<[string, PersistedSession]> {
     return Object.entries(this.data);
   }

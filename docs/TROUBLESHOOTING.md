@@ -130,6 +130,77 @@ Use `pagr logout --purge` to also forget the project registry, or `pagr uninstal
 - **Already loaded** — the job is kickstarted with the freshly written plist instead of failing.
 - **A stale plist** from an older install (a binary that no longer exists, or a different `PAGR_HOME`) is flagged by `pagr doctor`; `pagr daemon install` rewrites it.
 
+## Many projects, many sessions
+
+**"a codex session is already running in the same working tree"** — a second write-capable
+session was refused because the first one holds that checkout. Codex (`workspace-write`) and
+Claude Code both edit files in place with no locking, so two of them in one checkout silently
+overwrite each other. Your options, in order of preference:
+
+1. wait for (or stop) the session that holds it — the refusal names its `ses_…`, `pagr sessions`
+   shows it;
+2. start the second one **read-only**; read-only sessions may share a tree with a writer;
+3. work in a separate `git worktree` and register it as its own project — different path,
+   different tree, no conflict;
+4. as a last resort, run the daemon with `PAGR_ALLOW_CONCURRENT_WRITERS=1` and accept the race.
+
+Nesting counts: registering both `~/code/app` and `~/code/app/packages/api` makes them one tree.
+
+**"N claude sessions are already running, which is this device's limit"** — the process pool is
+full. Defaults: 4 live sessions per provider, 8 in total, and at most 6 live `claude` children.
+Raise the first two on the daemon with `PAGR_MAX_SESSIONS_PER_PROVIDER` and `PAGR_MAX_SESSIONS`.
+"Live" means starting / working / waiting for approval / waiting for you; finished sessions never
+count. Idle `claude` processes are ended (and resumed later with `--resume`) before the pool is
+allowed to grow.
+
+**A session says it is working but nothing is running** — the daemon reconciles every session
+against its provider at startup, so this should not survive a restart. Force the same pass with
+`pagr sessions --reconcile`: each session is either re-attached (Codex `thread/resume`, Claude
+`--resume`, reported `resumable` and moved to `idle`) or reported terminated. A session whose
+provider says its turn is genuinely still running is left alone — reconciling is safe to run at
+any time and never stops work in progress. A provider that dies mid-turn surfaces as a **failed**
+session with the exit code in its `session.event`, never as a session that hangs.
+
+**`sessions.json` growing** — terminal sessions are kept for a week (well past the cloud's 24h
+follow-up window) and the file is capped at 500 records, oldest terminal first. Both the retention
+sweep and the cap run at startup and hourly.
+
+## Registering lots of projects
+
+`pagr project scan [roots...]` finds git repositories under a few conventional folders (`~/code`,
+`~/src`, `~/Developer`, `~/Projects`, `~/dev`, `~/repos`, `~/git`, `~/work`, `~/Sites`, `~/Desktop`,
+plus the parent of your current directory) — only the ones that exist.
+
+- It refuses to walk your home directory or `/` outright, never descends into `~/Library`,
+  `node_modules`, caches, vendor directories or anything hidden, never follows symlinks, stops at
+  each `.git`, and walks at most 3 levels (`--depth`) and 500 repositories (`--limit`).
+- Already-registered repos are skipped, so running it twice changes nothing.
+- Names come from the folder, plus the GitHub repo name as an alias when it differs — text either.
+- Two folders that would get the same name are qualified with their parent (`two/app`), and an
+  alias already claimed by another project is dropped rather than making a word ambiguous.
+  `pagr project add --name X` refuses outright if `X` is taken, instead of quietly renaming.
+- `--dry-run` previews, `--all` takes everything without asking, `--json` prints the plan.
+  Without a TTY and without `--all` it prints the plan and stops rather than guessing.
+
+`pagr projects` lists name, aliases, live sessions, path and id; `pagr project remove` accepts any
+of name, alias or id and refuses an ambiguous reference instead of picking one.
+
+## Live steering vs queued follow-ups
+
+By default a follow-up you text while Claude Code is mid-turn is **queued** and delivered when the
+turn ends. Live steering exists only through a Claude Code *channel*, which is an Anthropic
+research preview.
+
+- `pagr claude channel-setup --dry-run` explains what a channel is, what
+  `--dangerously-load-development-channels` means, and prints the exact `.mcp.json` change without
+  writing anything.
+- `pagr doctor` reports two separate things: **claude channel** (is the server in this project's
+  `.mcp.json`?) and **live steering** (can the daemon steer *right now*?).
+- The capability the cloud sees follows the second one. `PAGR_CLAUDE_CHANNEL=1` alone reports
+  `canSteerActiveTurn: false` and says follow-ups will be QUEUED; it flips to `true` only while a
+  channel server is actually polling, and back to `false` within ~50 s of it stopping. Pagr never
+  says it interrupted your agent when it merely queued a message.
+
 ## Exit codes
 
 | Code | Meaning |
