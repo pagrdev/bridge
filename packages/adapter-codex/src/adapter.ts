@@ -10,7 +10,7 @@ import type {
   StartSessionInput,
 } from '@pagr/bridge-core';
 import { AppServerClient } from './app-server.js';
-import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
+import { clip, type Hints, hintsForCommand, hintsForFiles, relativizePaths } from './heuristics.js';
 import { FileLogger } from './logger.js';
 import {
   type AgentMessageDeltaNotification,
@@ -57,6 +57,7 @@ interface LiveSession {
   summary: SessionSummary;
   threadId: string;
   projectPath: string;
+  readOnly: boolean;
   activeTurnId: string | null;
   /** Thread has been started/resumed in the CURRENT app-server process. */
   loaded: boolean;
@@ -220,6 +221,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       summary,
       threadId,
       projectPath: input.project.path,
+      readOnly: input.readOnly,
       activeTurnId: null,
       loaded: true,
       agentBuffers: new Map(),
@@ -232,6 +234,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       threadId,
       projectId: input.project.projectId,
       projectPath: input.project.path,
+      readOnly: input.readOnly,
       startedAt: ts,
       updatedAt: ts,
       lastStatus: 'starting',
@@ -447,6 +450,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       },
       threadId: p.threadId,
       projectPath: p.projectPath,
+      readOnly: p.readOnly === true,
       activeTurnId: null,
       loaded: false,
       agentBuffers: new Map(),
@@ -465,6 +469,9 @@ export class CodexAdapter implements CodingAgentAdapter {
       threadId: live.threadId,
       cwd: live.projectPath,
       approvalPolicy: 'on-request',
+      // Re-assert the sandbox on every resume: thread/resume accepts `sandbox` (generated/v2/
+      // ThreadResumeParams.ts) and a read-only session must never widen after a restart.
+      sandbox: live.readOnly ? 'read-only' : 'workspace-write',
     };
     await client.request(METHODS.threadResume, params);
     live.loaded = true;
@@ -512,7 +519,7 @@ export class CodexAdapter implements CodingAgentAdapter {
           this.sessionEvent(
             live,
             'progress',
-            `Running: ${clip(String(item.command), 300)}`,
+            `Running: ${clip(relativizePaths(String(item.command), live.projectPath), 300)}`,
             item.id,
           );
         }
@@ -533,7 +540,9 @@ export class CodexAdapter implements CodingAgentAdapter {
             this.sessionEvent(live, 'agent_message', clip(text, 500), item.id);
           }
         } else if (item.type === 'fileChange' && 'changes' in item) {
-          const files = (item.changes as Array<{ path: string }>).map((c) => c.path);
+          const files = (item.changes as Array<{ path: string }>).map((c) =>
+            relativizePaths(c.path, live.projectPath),
+          );
           this.sessionEvent(
             live,
             'progress',
@@ -704,7 +713,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       projectId: live.summary.projectId,
       providerRequestId: pending.providerRequestId,
       actionType,
-      preview: clip(preview, 1500),
+      preview: clip(relativizePaths(preview, live.projectPath), 1500),
       hints,
       expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
     });

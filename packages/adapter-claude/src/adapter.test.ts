@@ -150,8 +150,9 @@ describe('ClaudeAdapter against fake claude', () => {
       actionType: 'file_change',
       providerRequestId: expect.stringMatching(/^toolu_/),
     });
-    expect(req.preview).toContain('Write ');
+    expect(req.preview).toBe('Write hello.txt'); // project-relative, never absolute (item 15)
     expect(req.preview).not.toContain('hi\n');
+    expect(req.hints.touchesOutsideProject).toBeFalsy();
     expect((await adapter.getStatus(SES))?.status).toBe('waiting_for_approval');
     await adapter.respondToApproval({
       approvalId: req.approvalId,
@@ -311,6 +312,44 @@ describe('ClaudeAdapter against fake claude', () => {
     const args = JSON.parse(fs.readFileSync(path.join(home, 'args2.json'), 'utf8'));
     const persisted = JSON.parse(fs.readFileSync(path.join(home, 'claude-sessions.json'), 'utf8'));
     expect(args.argv[args.argv.indexOf('--resume') + 1]).toBe(persisted[SES].claudeSessionId);
+    await again.shutdown();
+  });
+
+  it('keeps a read-only session read-only across resume in a fresh adapter (finding 5)', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    await adapter.startSession({
+      sessionId: SES,
+      project: proj(),
+      instruction: 'one',
+      localImagePaths: [],
+      readOnly: true,
+    });
+    await c.waitFor(sessionEvent('completed'));
+    await adapter.shutdown();
+    const persisted = JSON.parse(fs.readFileSync(path.join(home, 'claude-sessions.json'), 'utf8'));
+    expect(persisted[SES].readOnly).toBe(true);
+
+    const again = new ClaudeAdapter({
+      home,
+      claudeCommand: ['node', FIXTURE],
+      env: { FAKE_CLAUDE_ARGS_FILE: path.join(home, 'args2.json') },
+      log: false,
+    });
+    const c2 = collector();
+    again.subscribe(c2.emit);
+    await again.sendInstruction({
+      sessionId: SES,
+      instruction: 'two',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    await c2.waitFor(
+      (e) => e.kind === 'session_event' && e.type === 'completed' && e.summary === 'Echo: two',
+    );
+    const args = JSON.parse(fs.readFileSync(path.join(home, 'args2.json'), 'utf8'));
+    expect(args.argv).toContain('--resume');
+    expect(args.argv).toContain('--disallowedTools');
     await again.shutdown();
   });
 });

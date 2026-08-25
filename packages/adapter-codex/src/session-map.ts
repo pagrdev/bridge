@@ -6,6 +6,8 @@ export interface PersistedSession {
   projectId: string;
   projectPath: string;
   displayName?: string;
+  /** Read-only sessions must be resumed with the read-only sandbox (finding 5). */
+  readOnly?: boolean;
   startedAt: string;
   updatedAt: string;
   lastStatus: string;

@@ -11,6 +11,7 @@ import type {
   SessionSummary,
   StartSessionInput,
 } from '@pagr/bridge-core';
+import { resolveSocketPath } from '@pagr/bridge-core';
 import { ClaudeProcess } from './claude-process.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 import { FileLogger } from './logger.js';
@@ -31,6 +32,7 @@ interface LiveSession {
   summary: SessionSummary;
   claudeSessionId: string;
   projectPath: string;
+  readOnly: boolean;
   proc: ClaudeProcess | null;
   activeTurn: boolean;
   lastText: string;
@@ -189,6 +191,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       },
       claudeSessionId,
       projectPath: input.project.path,
+      readOnly: input.readOnly,
       proc: null,
       activeTurn: false,
       lastText: '',
@@ -199,13 +202,14 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       claudeSessionId,
       projectId: input.project.projectId,
       projectPath: input.project.path,
+      readOnly: input.readOnly,
       startedAt: ts,
       updatedAt: ts,
       lastStatus: 'starting',
       ...(input.displayName ? { displayName: input.displayName } : {}),
     });
     this.emit({ kind: 'session', session: live.summary });
-    this.spawn(live, { kind: 'new', id: claudeSessionId }, input.readOnly);
+    this.spawn(live, { kind: 'new', id: claudeSessionId });
     this.sendTurn(live, input.instruction, input.localImagePaths);
     return live.summary;
   }
@@ -220,7 +224,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       this.sessionEvent(live, 'queued_followup', clip(input.instruction, 500));
       return { delivered: 'queued' };
     }
-    if (!live.proc?.alive) this.spawn(live, { kind: 'resume', id: live.claudeSessionId }, false);
+    if (!live.proc?.alive) this.spawn(live, { kind: 'resume', id: live.claudeSessionId });
     this.sendTurn(live, input.instruction, input.localImagePaths);
     return { delivered: 'new_turn' };
   }
@@ -338,6 +342,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       },
       claudeSessionId: p.claudeSessionId,
       projectPath: p.projectPath,
+      readOnly: p.readOnly === true,
       proc: null,
       activeTurn: false,
       lastText: '',
@@ -350,18 +355,16 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private spawn(
     live: LiveSession,
     session: { kind: 'new'; id: string } | { kind: 'resume'; id: string },
-    readOnly: boolean,
   ): void {
     const proc = new ClaudeProcess({
       command: this.opts.claudeCommand ?? ['claude'],
       cwd: live.projectPath,
       env: this.env({
         PAGR_SESSION_ID: live.summary.sessionId,
-        PAGR_DAEMON_SOCK:
-          process.env.PAGR_DAEMON_SOCK ?? path.join(this.opts.home, 'run', 'daemon.sock'),
+        PAGR_DAEMON_SOCK: process.env.PAGR_DAEMON_SOCK ?? resolveSocketPath(this.opts.home),
       }),
       session,
-      readOnly,
+      readOnly: live.readOnly,
       logger: this.logger,
     });
     live.proc = proc;
@@ -412,7 +415,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
         this.sessionEvent(
           live,
           'progress',
-          clip(previewForTool(ev.name, ev.input), 300),
+          clip(previewForTool(ev.name, ev.input, live.projectPath), 300),
           ev.toolUseId,
         );
         return;
@@ -473,7 +476,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       input: ev.input,
       timer,
     });
-    const preview = previewForTool(ev.toolName, ev.input);
+    const preview = previewForTool(ev.toolName, ev.input, live.projectPath);
     let hints: Hints;
     if (ev.toolName === 'Bash') {
       const cmd = typeof ev.input.command === 'string' ? ev.input.command : '';
@@ -529,7 +532,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     const next = live.queued.shift();
     if (!next) return;
     try {
-      if (!live.proc?.alive) this.spawn(live, { kind: 'resume', id: live.claudeSessionId }, false);
+      if (!live.proc?.alive) this.spawn(live, { kind: 'resume', id: live.claudeSessionId });
       this.sendTurn(live, next.instruction, next.images);
       this.sessionEvent(live, 'followup_delivered', clip(next.instruction, 500));
     } catch (err) {

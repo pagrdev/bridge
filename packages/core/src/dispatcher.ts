@@ -290,7 +290,27 @@ export class Dispatcher {
           at: this.now().toISOString(),
         });
       }
-      this.o.sessions.upsert({ ...rec, updatedAt: this.now().toISOString() });
+      if (res.delivered === 'queued') {
+        this.o.sessions.upsert({ ...rec, updatedAt: this.now().toISOString() });
+      } else {
+        // A new turn (or steer) means the session is working again — even if the local record
+        // said `completed`. Adapters also emit their own `session` event; this keeps the local
+        // store and the cloud consistent regardless of adapter timing.
+        const at = this.now().toISOString();
+        const updated = this.o.sessions.upsert({ ...rec, status: 'working', updatedAt: at });
+        const live = await adapter.getStatus(p.sessionId);
+        this.send('session.updated', {
+          ...(live ?? {
+            sessionId: updated.sessionId,
+            projectId: updated.projectId,
+            provider: updated.provider,
+            startedAt: updated.startedAt,
+          }),
+          status: 'working',
+          activeTurn: true,
+          updatedAt: at,
+        });
+      }
       return { sessionId: p.sessionId, mode, delivered: res.delivered };
     });
   }

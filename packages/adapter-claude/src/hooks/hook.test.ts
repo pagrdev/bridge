@@ -99,6 +99,18 @@ describe('permission.mjs hook', () => {
       actionType: 'command_execution',
       preview: '$ git push origin main',
       hints: { gitPush: true },
+      cwd: '/p',
+    });
+  });
+
+  it('sends sessionId=null with cwd when not spawned by the bridge (finding 12)', async () => {
+    const d = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+    await runHook(stdinPayload, { PAGR_DAEMON_SOCK: sock, PAGR_SESSION_ID: '' });
+    await d.close();
+    expect(d.seen[0]?.params).toMatchObject({
+      sessionId: null,
+      cwd: '/p',
+      claudeSessionId: stdinPayload.session_id,
     });
   });
 

@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 export interface Hints {
@@ -55,9 +56,46 @@ function absolutePathsIn(command: string): string[] {
   );
 }
 
-function isInside(p: string, root: string): boolean {
-  const rel = path.relative(path.resolve(root), path.resolve(p));
+/**
+ * Resolve symlinks for containment checks. For not-yet-existing paths the nearest existing
+ * ancestor is resolved, so `/tmp/x/new.ts` and `/private/tmp/x/new.ts` compare equal on macOS.
+ */
+function realpathNearest(p: string): string {
+  let cur = path.resolve(p);
+  const tail: string[] = [];
+  while (!fs.existsSync(cur)) {
+    tail.unshift(path.basename(cur));
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  try {
+    return path.join(fs.realpathSync(cur), ...tail);
+  } catch {
+    return path.join(cur, ...tail);
+  }
+}
+
+/** True when `p` is `root` or lives under it, after realpath resolution of both sides. */
+export function isInside(p: string, root: string): boolean {
+  const rel = path.relative(realpathNearest(root), realpathNearest(p));
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Rewrite absolute paths that live inside the project root (in any alias form: symlinked or
+ * realpath, e.g. `/tmp/x` vs `/private/tmp/x`) as project-relative so previews never carry
+ * the user's local directory layout to the cloud. The root itself becomes `.`; paths that merely
+ * share a prefix (`/root-other`) or lie outside are left untouched.
+ */
+export function relativizePaths(text: string, projectPath?: string): string {
+  if (!projectPath) return text;
+  const root = realpathNearest(projectPath);
+  return text.replace(/(^|[\s="'(:,])(\/[^\s"'():,]+)/g, (m, lead: string, p: string) => {
+    if (!isInside(p, projectPath)) return m;
+    const rel = path.relative(root, realpathNearest(p));
+    return `${lead}${rel === '' ? '.' : rel}`;
+  });
 }
 
 /** Truncate for user-facing previews/summaries. */

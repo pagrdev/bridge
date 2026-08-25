@@ -10,6 +10,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { makeEvent } from './events.js';
 import { loadOrCreateIdentity, verifyRaw } from './identity.js';
 import { MemorySecretStore } from './keychain.js';
+import { type Logger, silentLogger } from './logging.js';
 import { ids } from './testFixtures.js';
 import { GatewayClient } from './transport.js';
 
@@ -104,8 +105,52 @@ describe('GatewayClient', () => {
       heartbeatMs: 50,
       backoff: { baseMs: 20, maxMs: 100 },
       activeSessions: () => 2,
+      env: { PAGR_ENV: 'local' },
       ...over,
     });
+
+  it('requires wss:// unless PAGR_ENV=local or PAGR_ALLOW_INSECURE_WS=1 (finding 9a)', () => {
+    expect(() => make({ env: {} })).toThrow(/wss:\/\//);
+    expect(() => make({ env: { PAGR_ENV: 'production' } })).toThrow(/wss:\/\//);
+    expect(() => make({ env: { PAGR_ALLOW_INSECURE_WS: '1' } })).not.toThrow();
+    expect(() => make({ env: { PAGR_ENV: 'local' } })).not.toThrow();
+    expect(() => make({ url: 'wss://gateway.example.com/bridge', env: {} })).not.toThrow();
+    expect(() => make({ url: 'https://gateway.example.com', env: {} })).toThrow(/wss:\/\//);
+    expect(() => make({ url: 'not a url', env: {} })).toThrow(/gateway url/i);
+  });
+
+  it('rejects a server key set that does not overlap the pinned set (finding 9b)', async () => {
+    const warnings: string[] = [];
+    const logger: Logger = {
+      ...silentLogger,
+      warn: (m) => {
+        warnings.push(m);
+      },
+      child: () => logger,
+    };
+    client = make({ serverKeys: { k9: 'ZZZZ' }, logger });
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.serverKeys).toEqual({ k9: 'ZZZZ' });
+    expect(keys).toEqual([]);
+    expect(warnings.some((w) => /server key/i.test(w))).toBe(true);
+  });
+
+  it('accepts a rotated server key set when at least one pinned key overlaps (finding 9b)', async () => {
+    client = make({ serverKeys: { k1: 'AAAA', k0: 'OLD' } });
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.serverKeys).toEqual({ k1: 'AAAA' });
+    expect(keys).toEqual([{ k1: 'AAAA' }]);
+    // same key id but a different public key is NOT an overlap
+    await client.stop();
+    keys.length = 0;
+    client = make({ serverKeys: { k1: 'BBBB' } });
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.serverKeys).toEqual({ k1: 'BBBB' });
+    expect(keys).toEqual([]);
+  });
 
   it('authenticates with a signed challenge, stores server keys, heartbeats and answers pings', async () => {
     client = make();

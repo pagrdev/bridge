@@ -30,6 +30,45 @@ export interface GatewayClientOptions {
   now?: () => Date;
   /** Injectable for tests. */
   WebSocketCtor?: typeof WebSocket;
+  /**
+   * Server keys pinned from pairing / a previous `auth.result`. A new set from `auth.result`
+   * is only accepted when nothing is pinned yet or at least one pinned key is in the new set.
+   */
+  serverKeys?: Record<string, string>;
+  /** Environment used for the transport-security checks (defaults to `process.env`). */
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * The gateway URL must be `wss://`. Plain `ws://` is only allowed for local development
+ * (`PAGR_ENV=local`) or with the explicit `PAGR_ALLOW_INSECURE_WS=1` escape hatch.
+ */
+export function assertSecureGatewayUrl(url: string, env: NodeJS.ProcessEnv = process.env): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`invalid gateway url: ${url}`);
+  }
+  if (parsed.protocol === 'wss:') return;
+  const insecureOk = env.PAGR_ENV === 'local' || env.PAGR_ALLOW_INSECURE_WS === '1';
+  if (parsed.protocol === 'ws:' && insecureOk) return;
+  throw new Error(
+    `gateway url must use wss:// (got ${parsed.protocol}//); set PAGR_ENV=local or PAGR_ALLOW_INSECURE_WS=1 to allow ws:// for local development`,
+  );
+}
+
+/**
+ * Key-rotation rule: accept `incoming` when nothing is pinned yet (first connect after pairing)
+ * or when at least one pinned (keyId, key) pair is still present in `incoming`.
+ */
+export function acceptServerKeys(
+  pinned: Record<string, string>,
+  incoming: Record<string, string>,
+): boolean {
+  const pinnedIds = Object.keys(pinned);
+  if (pinnedIds.length === 0) return true;
+  return pinnedIds.some((id) => id in incoming && incoming[id] === pinned[id]);
 }
 
 export interface GatewayClientEvents {
@@ -63,6 +102,8 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
 
   constructor(private readonly opts: GatewayClientOptions) {
     super();
+    assertSecureGatewayUrl(opts.url, opts.env);
+    this.serverKeys = { ...(opts.serverKeys ?? {}) };
     this.logger = opts.logger ?? silentLogger;
     this.heartbeatMs = opts.heartbeatMs ?? 20_000;
     this.baseMs = opts.backoff?.baseMs ?? 1000;
@@ -189,8 +230,15 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
           return;
         }
         if (frame.serverKeys) {
-          this.serverKeys = frame.serverKeys;
-          this.opts.onServerKeys?.(frame.serverKeys);
+          if (acceptServerKeys(this.serverKeys, frame.serverKeys)) {
+            this.serverKeys = frame.serverKeys;
+            this.opts.onServerKeys?.(frame.serverKeys);
+          } else {
+            this.logger.warn(
+              'gateway sent a server key set with no overlap with the pinned keys; keeping pinned set',
+              { pinned: Object.keys(this.serverKeys), offered: Object.keys(frame.serverKeys) },
+            );
+          }
         }
         this.state_ = 'connected';
         this.attempt = 0;

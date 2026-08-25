@@ -77,7 +77,13 @@ export class FakeAdapter implements CodingAgentAdapter {
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
     this.record('sendInstruction', input);
-    return { delivered: input.mode === 'steer' ? 'steered' : 'queued' };
+    const s = this.sessions.get(input.sessionId);
+    if (input.mode === 'steer') return { delivered: 'steered' };
+    if (s && !s.activeTurn) {
+      this.sessions.set(input.sessionId, { ...s, status: 'working', activeTurn: true });
+      return { delivered: 'new_turn' };
+    }
+    return { delivered: 'queued' };
   }
   async stopSession(sessionId: string): Promise<void> {
     this.record('stopSession', sessionId);

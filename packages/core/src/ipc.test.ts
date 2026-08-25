@@ -42,4 +42,11 @@ describe('ipc', () => {
     await server.listen(); // second listen after clean close works
     expect(await new IpcClient(socketPath).call('echo', 1)).toBe(1);
   });
+
+  it('refuses a socket path longer than the sun_path limit with a clear error (item 14)', async () => {
+    await server.close();
+    const long = new IpcServer({ socketPath: join(t.home, 'z'.repeat(110), 'daemon.sock') });
+    await expect(long.listen()).rejects.toThrow(/too long/);
+    await server.listen();
+  });
 });

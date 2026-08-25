@@ -12,6 +12,8 @@ export interface SessionRecord {
   updatedAt: string;
 }
 
+const TERMINAL = new Set<SessionStatus>(['completed', 'failed', 'stopped']);
+
 /** Persistent map `sessionId → SessionRecord` at `~/.pagr/sessions.json`. */
 export class SessionStore {
   private map = new Map<string, SessionRecord>();
@@ -44,6 +46,24 @@ export class SessionStore {
     const cur = this.map.get(sessionId);
     if (!cur) return null;
     return this.upsert({ ...cur, status, updatedAt: this.now().toISOString() });
+  }
+  /**
+   * Drop terminal sessions (completed / failed / stopped) whose `updatedAt` is older than
+   * `retentionMs`. Live sessions are never pruned; completed ones stay resumable until then.
+   */
+  pruneTerminal(retentionMs: number): number {
+    const cutoff = this.now().getTime() - retentionMs;
+    let n = 0;
+    for (const [id, rec] of this.map) {
+      if (!TERMINAL.has(rec.status)) continue;
+      const t = Date.parse(rec.updatedAt);
+      if (!Number.isNaN(t) && t < cutoff) {
+        this.map.delete(id);
+        n++;
+      }
+    }
+    if (n) this.persist();
+    return n;
   }
   remove(sessionId: string): void {
     this.map.delete(sessionId);

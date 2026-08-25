@@ -5,7 +5,14 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import type { AttachmentRef } from '@pagr/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { cleanupTmp, deleteAttachment, fetchAttachment, sniffImageMime } from './attachments.js';
+import {
+  assertSafeDownloadUrl,
+  cleanupTmp,
+  deleteAttachment,
+  fetchAttachment,
+  fetchAttachment as fetchAttachmentRaw,
+  sniffImageMime,
+} from './attachments.js';
 import { ids } from './testFixtures.js';
 import { useTempHome } from './testUtil.js';
 
@@ -15,6 +22,7 @@ const PNG = Buffer.concat([
 ]);
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(50, 2)]);
 const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+const LOCAL = { PAGR_ENV: 'local' };
 
 describe('attachments', () => {
   const t = useTempHome('pagr-att-');
@@ -55,7 +63,7 @@ describe('attachments', () => {
 
   it('downloads, verifies, writes 0600 and deletes', async () => {
     const r = ref('/png', PNG);
-    const p = await fetchAttachment(r, { tmpDir: join(t.home, 'tmp') });
+    const p = await fetchAttachment(r, { tmpDir: join(t.home, 'tmp'), env: LOCAL });
     expect(p).toBe(join(t.home, 'tmp', `${r.attachmentId}.png`));
     expect(statSync(p).mode & 0o777).toBe(0o600);
     deleteAttachment(p);
@@ -65,6 +73,8 @@ describe('attachments', () => {
 
   it('rejects hash mismatch, mime mismatch, oversize, http error, expired, timeout', async () => {
     const tmpDir = join(t.home, 'tmp');
+    const fetchAttachment = (r: AttachmentRef, o: { tmpDir: string; timeoutMs?: number }) =>
+      fetchAttachmentRaw(r, { ...o, env: LOCAL });
     await expect(
       fetchAttachment(ref('/png', PNG, { sha256: 'a'.repeat(64) }), { tmpDir }),
     ).rejects.toMatchObject({ code: 'hash_mismatch' });
@@ -111,5 +121,55 @@ describe('attachments', () => {
     expect(existsSync(fresh)).toBe(true);
     expect(existsSync(other)).toBe(true);
     expect(cleanupTmp(join(t.home, 'missing'), 1)).toBe(0);
+  });
+
+  it('refuses non-https and private/literal-IP download URLs before fetching (finding 10)', async () => {
+    const tmpDir = join(t.home, 'tmp');
+    let fetched = 0;
+    const fetch = async () => {
+      fetched++;
+      return new Response(PNG);
+    };
+    const attempt = (downloadUrl: string, env: Record<string, string> = {}) =>
+      fetchAttachment(ref('/png', PNG, { downloadUrl }), { tmpDir, fetch, env });
+    const bad = [
+      'http://example.com/a.png',
+      'ftp://example.com/a.png',
+      'https://10.0.0.5/a.png',
+      'https://172.16.3.4/a.png',
+      'https://172.31.255.255/a.png',
+      'https://192.168.1.1/a.png',
+      'https://169.254.169.254/latest/meta-data',
+      'https://127.0.0.1/a.png',
+      'https://0.0.0.0/a.png',
+      'https://[::1]/a.png',
+      'https://[fe80::1]/a.png',
+      'https://[fc00::1]/a.png',
+      'https://[fd12::1]/a.png',
+      'https://8.8.8.8/a.png',
+      'https://[2001:db8::1]/a.png',
+      'https://localhost/a.png',
+      'http://localhost/a.png',
+      'not a url',
+    ];
+    for (const u of bad) {
+      await expect(attempt(u), u).rejects.toMatchObject({ code: 'unsafe_url' });
+    }
+    expect(fetched).toBe(0);
+    await expect(attempt('https://cdn.example.com/a.png')).resolves.toMatch(/\.png$/);
+    expect(fetched).toBe(1);
+    // PAGR_ENV=local additionally allows plain-http loopback, but nothing else.
+    await expect(attempt('http://localhost:3000/a.png', LOCAL)).resolves.toMatch(/\.png$/);
+    await expect(attempt('http://127.0.0.1:3000/a.png', LOCAL)).resolves.toMatch(/\.png$/);
+    await expect(attempt('http://10.0.0.5/a.png', LOCAL)).rejects.toMatchObject({
+      code: 'unsafe_url',
+    });
+    await expect(attempt('http://example.com/a.png', LOCAL)).rejects.toMatchObject({
+      code: 'unsafe_url',
+    });
+    expect(() => assertSafeDownloadUrl('https://[::ffff:10.0.0.1]/x')).toThrow(
+      /unsafe_url|private/i,
+    );
+    expect(() => assertSafeDownloadUrl('https://cdn.example.com/x')).not.toThrow();
   });
 });

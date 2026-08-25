@@ -197,6 +197,30 @@ describe('CodexAdapter against fake app-server', () => {
     expect(done).toMatchObject({ summary: 'Network denied.' });
   });
 
+  it('file-change previews are project-relative and containment uses realpath (item 15)', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    await adapter.startSession({
+      sessionId: SES,
+      project: proj(),
+      instruction: 'filechange please',
+      localImagePaths: [],
+      readOnly: false,
+    });
+    const req = await c.waitFor((e) => e.kind === 'approval_requested');
+    if (req.kind !== 'approval_requested') throw new Error('unreachable');
+    expect(req.actionType).toBe('file_change');
+    expect(req.preview).toBe('Write access requested under src');
+    expect(req.preview).not.toContain(project);
+    expect(req.hints.touchesOutsideProject).toBeFalsy();
+    await adapter.respondToApproval({
+      approvalId: req.approvalId,
+      providerRequestId: req.providerRequestId,
+      decision: 'allow',
+    });
+    await c.waitFor(sessionEvent('completed'));
+  });
+
   it('steers an active turn, queues when asked, stops via interrupt', async () => {
     const c = collector();
     adapter.subscribe(c.emit);
@@ -324,5 +348,61 @@ describe('CodexAdapter against fake app-server', () => {
     expect(r).toEqual({ delivered: 'new_turn' });
     await c2.waitFor(sessionEvent('completed'));
     await again.shutdown();
+  });
+});
+
+describe('CodexAdapter read-only persistence (finding 5)', () => {
+  let home: string;
+  let project: string;
+  let rpcLog: string;
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-ro-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-'));
+    rpcLog = path.join(home, 'rpc.jsonl');
+    process.env.FAKE_CODEX_RPC_LOG = rpcLog;
+  });
+  afterEach(() => {
+    delete process.env.FAKE_CODEX_RPC_LOG;
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  });
+
+  it('re-sends sandbox=read-only on thread/resume after a restart', async () => {
+    const first = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+    const c = collector();
+    first.subscribe(c.emit);
+    await first.startSession({
+      sessionId: SES,
+      project: { projectId: PROJ, path: project, displayName: 'demo' },
+      instruction: 'run tests',
+      localImagePaths: [],
+      readOnly: true,
+    });
+    await c.waitFor(sessionEvent('completed'));
+    await first.shutdown();
+    const persisted = JSON.parse(fs.readFileSync(path.join(home, 'codex-sessions.json'), 'utf8'));
+    expect(persisted[SES].readOnly).toBe(true);
+
+    const again = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+    const c2 = collector();
+    again.subscribe(c2.emit);
+    await again.sendInstruction({
+      sessionId: SES,
+      instruction: 'again',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    await c2.waitFor(sessionEvent('completed'));
+    await again.shutdown();
+
+    const calls = fs
+      .readFileSync(rpcLog, 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as { method: string; params: Record<string, unknown> });
+    const start = calls.find((c) => c.method === 'thread/start');
+    const resume = calls.find((c) => c.method === 'thread/resume');
+    expect(start?.params.sandbox).toBe('read-only');
+    expect(resume?.params).toMatchObject({ sandbox: 'read-only', approvalPolicy: 'on-request' });
   });
 });

@@ -82,6 +82,7 @@ describe('daemon', () => {
       secretStore: store,
       heartbeatMs: 60_000,
       backoff: { baseMs: 20, maxMs: 50 },
+      env: { PAGR_ENV: 'local' },
     });
     await daemon.start();
   });
@@ -226,6 +227,150 @@ describe('daemon', () => {
     expect(acks()[0]?.payload).toMatchObject({ status: 'completed' });
     await c.call('projects.remove', { projectId: proj.projectId });
     expect(await c.call('projects.list')).toEqual([]);
+  });
+
+  it('IPC approval.request with sessionId=null + cwd maps to a project and a synthetic session (finding 12)', async () => {
+    await until(() => daemon.transport?.state === 'connected');
+    const c = new IpcClient(daemon.paths.socketPath);
+    const repo = join(t.home, 'repo');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    const proj = await c.call<{ projectId: string }>('projects.add', { path: repo });
+    // unregistered cwd → unknown_project, nothing emitted
+    await expect(
+      c.call('approval.request', {
+        sessionId: null,
+        cwd: join(t.home, 'elsewhere'),
+        provider: 'claude',
+        providerRequestId: 'hook-1',
+        actionType: 'tool_use',
+        preview: 'Bash(ls)',
+      }),
+    ).rejects.toMatchObject({ code: 'unknown_project' });
+    // missing both sessionId/projectId and cwd → invalid
+    await expect(
+      c.call('approval.request', {
+        sessionId: null,
+        provider: 'claude',
+        providerRequestId: 'hook-1',
+        actionType: 'tool_use',
+        preview: 'Bash(ls)',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_params' });
+
+    const claudeSessionId = 'abc81286-92f3-4c72-b6a8-72e216749504';
+    const pending = c.call<{ approvalId: string; decision: string; resolution: string }>(
+      'approval.request',
+      {
+        sessionId: null,
+        claudeSessionId,
+        cwd: join(repo, 'src'),
+        provider: 'claude',
+        providerRequestId: 'hook-2',
+        actionType: 'command_execution',
+        preview: '$ git push',
+        hints: { gitPush: true },
+      },
+      5000,
+    );
+    await until(() =>
+      received.some((f) => f.kind === 'event' && f.event.type === 'approval.requested'),
+    );
+    const req = received.find((f) => f.kind === 'event' && f.event.type === 'approval.requested');
+    const payload = (req && req.kind === 'event' ? req.event.payload : null) as unknown as {
+      approvalId: string;
+      sessionId: string;
+      projectId: string;
+      previewHash: string;
+    };
+    expect(payload.projectId).toBe(proj.projectId);
+    expect(payload.sessionId).toMatch(/^ses_[0-9a-f]{32}$/);
+    // a synthetic local session record exists so respond_to_approval passes the command guard,
+    // and the cloud was told about it via session.updated before approval.requested
+    const rec = daemon.sessions.get(payload.sessionId);
+    expect(rec).toMatchObject({
+      provider: 'claude',
+      projectId: proj.projectId,
+      providerSessionId: claudeSessionId,
+      status: 'waiting_for_approval',
+    });
+    const idx = (type: string) =>
+      received.findIndex((f) => f.kind === 'event' && f.event.type === type);
+    expect(idx('session.updated')).toBeGreaterThanOrEqual(0);
+    expect(idx('session.updated')).toBeLessThan(idx('approval.requested'));
+    sendCommand(
+      signer.sign(
+        makeBody(
+          'agent.respond_to_approval',
+          {
+            approvalId: payload.approvalId,
+            sessionId: payload.sessionId,
+            providerRequestId: 'hook-2',
+            previewHash: payload.previewHash,
+            decision: 'allow',
+          },
+          { deviceId },
+        ),
+      ),
+    );
+    expect(await pending).toEqual({
+      approvalId: payload.approvalId,
+      decision: 'allow',
+      resolution: 'allowed',
+    });
+    await until(() => acks().length === 1);
+    expect(acks()[0]?.payload).toMatchObject({ status: 'completed' });
+    // the same interactive claude session maps to the same synthetic id next time
+    const again = c.call<{ approvalId: string }>(
+      'approval.request',
+      {
+        sessionId: null,
+        claudeSessionId,
+        cwd: repo,
+        provider: 'claude',
+        providerRequestId: 'hook-3',
+        actionType: 'tool_use',
+        preview: 'Read x',
+      },
+      5000,
+    );
+    await until(
+      () =>
+        received.filter((f) => f.kind === 'event' && f.event.type === 'approval.requested')
+          .length === 2,
+    );
+    const second = received.filter(
+      (f) => f.kind === 'event' && f.event.type === 'approval.requested',
+    )[1];
+    expect(
+      (second && second.kind === 'event' ? second.event.payload : null) as unknown as {
+        sessionId: string;
+      },
+    ).toMatchObject({ sessionId: payload.sessionId });
+    expect(daemon.dispatcher.approvals.list()).toHaveLength(1);
+    await daemon.dispatcher.approvals.cancelAll();
+    await again;
+  });
+
+  it('starts with a very long PAGR_HOME by using the short runtime socket (item 14)', async () => {
+    const home2 = join(t.home, 'l'.repeat(110), 'pagr');
+    const d2 = await createDaemon({
+      home: home2,
+      adapters: new Map(),
+      secretStore: new MemorySecretStore(),
+    });
+    await d2.start();
+    try {
+      expect(Buffer.byteLength(d2.paths.socketPath)).toBeLessThanOrEqual(100);
+      expect(await new IpcClient(d2.paths.socketPath).call('status')).toMatchObject({
+        socketPath: d2.paths.socketPath,
+      });
+      expect(readFileSync(join(home2, 'run', 'daemon.sock.path'), 'utf8').trim()).toBe(
+        d2.paths.socketPath,
+      );
+    } finally {
+      await d2.stop();
+    }
   });
 
   it('runs unpaired: IPC works, no transport', async () => {

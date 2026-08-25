@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { ProjectSummary } from '@pagr/protocol';
 import type { LocalProject } from './adapters/types.js';
 import { readJson, writeJson } from './jsonFile.js';
@@ -174,6 +174,26 @@ export class ProjectRegistry {
     if (!isUnder(real, project.path))
       throw new ProjectError('outside_project', `${candidatePath} resolves outside project root`);
     return real;
+  }
+
+  /**
+   * Find the registered project whose root contains `candidatePath` (after realpath resolution,
+   * nearest existing ancestor for not-yet-existing paths). Symlinks that escape a root do not
+   * match. When roots nest, the deepest matching root wins. Relative paths never match.
+   */
+  findByPath(candidatePath: string): ProjectRecord | undefined {
+    if (!isAbsolute(candidatePath)) return undefined;
+    let real: string;
+    try {
+      real = realpathNearest(resolve(candidatePath));
+    } catch {
+      return undefined;
+    }
+    let best: ProjectRecord | undefined;
+    for (const rec of this.map.values()) {
+      if (isUnder(real, rec.path) && (!best || rec.path.length > best.path.length)) best = rec;
+    }
+    return best;
   }
 
   /** Shallow (depth ≤ 3) search for git repositories under the given roots. */

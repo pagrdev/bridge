@@ -258,6 +258,42 @@ describe('Dispatcher', () => {
     expect(bad.payload).toMatchObject({ status: 'failed', errorCode: 'unknown_session' });
   });
 
+  it('agent.send_instruction resumes a completed session and emits session.updated → working (item 17)', async () => {
+    const s1 = ids.ses();
+    await d.handle(
+      body('agent.start_session', {
+        provider: 'claude',
+        projectId,
+        instruction: 'a',
+        sessionId: s1,
+        attachments: [],
+        readOnly: false,
+      }),
+    );
+    // the turn finished: local record and provider both say completed
+    sessions.setStatus(s1, 'completed');
+    claude.sessions.set(s1, {
+      ...(claude.sessions.get(s1) as NonNullable<ReturnType<typeof claude.sessions.get>>),
+      status: 'completed',
+      activeTurn: false,
+    });
+    events.length = 0;
+    const ack = await d.handle(
+      body('agent.send_instruction', {
+        sessionId: s1,
+        instruction: 'more please',
+        mode: 'auto',
+        attachments: [],
+      }),
+    );
+    expect(ack.payload).toMatchObject({ status: 'completed' });
+    expect((ack.payload as { result: unknown }).result).toMatchObject({ delivered: 'new_turn' });
+    expect(sessions.get(s1)?.status).toBe('working');
+    const upd = ofType('session.updated');
+    expect(upd).toHaveLength(1);
+    expect(upd[0]?.payload).toMatchObject({ sessionId: s1, status: 'working', activeTurn: true });
+  });
+
   it('agent.stop_session and agent.get_status', async () => {
     const s1 = ids.ses();
     await d.handle(

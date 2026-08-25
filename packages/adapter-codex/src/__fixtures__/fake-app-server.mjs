@@ -16,6 +16,7 @@
 //  - turn/steer: acknowledges and emits an agentMessage echoing the steer text.
 //  - turn/interrupt: emits turn/completed with status interrupted.
 
+import { appendFileSync } from 'node:fs';
 import readline from 'node:readline';
 
 if (process.argv.includes('--version')) {
@@ -144,6 +145,20 @@ async function runTurn(threadId, turnId, input) {
     complete(threadId, turnId, 'completed');
     return;
   }
+  if (/filechange/i.test(text)) {
+    const itemId = `item_${n++}`;
+    const cwd = threads.get(threadId)?.cwd ?? '/';
+    const res = await requestFromServer('item/fileChange/requestApproval', {
+      threadId,
+      turnId,
+      itemId,
+      reason: 'apply patch',
+      grantRoot: `${cwd}/src`,
+    });
+    agentMessage(threadId, turnId, res?.decision === 'accept' ? 'Patched.' : 'Not patched.');
+    complete(threadId, turnId, 'completed');
+    return;
+  }
   if (/permission/i.test(text)) {
     const itemId = `item_${n++}`;
     const res = await requestFromServer('item/permissions/requestApproval', {
@@ -194,6 +209,9 @@ rl.on('line', (line) => {
     return;
   }
   const { id, method, params = {} } = m;
+  if (process.env.FAKE_CODEX_RPC_LOG) {
+    appendFileSync(process.env.FAKE_CODEX_RPC_LOG, `${JSON.stringify({ method, params })}\n`);
+  }
   switch (method) {
     case 'initialize':
       out({

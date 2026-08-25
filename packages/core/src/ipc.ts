@@ -1,8 +1,9 @@
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
-import { z } from 'zod';
+import { ZodError, z } from 'zod';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
+import { MAX_SOCKET_PATH_BYTES } from './paths.js';
 
 /**
  * Local IPC over a Unix-domain socket (`~/.pagr/run/daemon.sock`, mode 0600).
@@ -65,6 +66,11 @@ export class IpcServer {
   }
 
   async listen(): Promise<void> {
+    if (Buffer.byteLength(this.socketPath) > MAX_SOCKET_PATH_BYTES) {
+      throw new Error(
+        `IPC socket path is too long (${Buffer.byteLength(this.socketPath)} bytes > ${MAX_SOCKET_PATH_BYTES}): ${this.socketPath}. Use a shorter PAGR_HOME.`,
+      );
+    }
     if (existsSync(this.socketPath)) {
       // Stale socket from a previous run (or something squatting). Only unlink sockets we own.
       const st = statSync(this.socketPath);
@@ -143,7 +149,12 @@ export class IpcServer {
       const result = await handler(req.params);
       this.send(sock, { id: req.id, result: result ?? null });
     } catch (err) {
-      const code = err instanceof IpcMethodError ? err.code : 'internal';
+      const code =
+        err instanceof IpcMethodError
+          ? err.code
+          : err instanceof ZodError
+            ? 'invalid_params'
+            : 'internal';
       const message = err instanceof Error ? err.message : String(err);
       this.logger.warn('ipc method failed', { method: req.method, code, message });
       this.send(sock, { id: req.id, error: { code, message } });

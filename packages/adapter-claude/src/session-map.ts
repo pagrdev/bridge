@@ -6,6 +6,8 @@ export interface PersistedSession {
   projectId: string;
   projectPath: string;
   displayName?: string;
+  /** Read-only sessions must stay read-only across resume/respawn (finding 5). */
+  readOnly?: boolean;
   startedAt: string;
   updatedAt: string;
   lastStatus: string;

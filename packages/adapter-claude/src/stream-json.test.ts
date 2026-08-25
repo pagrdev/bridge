@@ -117,6 +117,12 @@ describe('previews', () => {
       'Write /p/a.ts',
     );
     expect(previewForTool('Read', { file_path: '/p/a.ts' })).toBe('Read /p/a.ts');
+    // project-relative when the project path is known (item 15)
+    expect(previewForTool('Write', { file_path: '/p/a.ts', content: 'x' }, '/p')).toBe(
+      'Write a.ts',
+    );
+    expect(previewForTool('Edit', { file_path: '/p/src/b.ts' }, '/p')).toBe('Edit src/b.ts');
+    expect(previewForTool('Bash', { command: 'cat /p/x /q/y' }, '/p')).toBe('$ cat x /q/y');
     expect(previewForTool('mcp__x__y', { q: 'z' })).toBe('mcp__x__y q="z"');
     expect(actionTypeForTool('Bash')).toBe('command_execution');
     expect(actionTypeForTool('Edit')).toBe('file_change');

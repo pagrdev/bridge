@@ -22,14 +22,28 @@
 // Never auto-allows.
 
 import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
 const TIMEOUT_MS = Number(process.env.PAGR_HOOK_TIMEOUT_MS) || 540_000; // < Claude's 600 s hook cap
+const PAGR_HOME = process.env.PAGR_HOME || path.join(os.homedir(), '.pagr');
+// The daemon records the socket it actually listens on in run/daemon.sock.path (it moves to a
+// short per-user runtime dir when PAGR_HOME would exceed the sun_path limit).
+function recordedSocketPath() {
+  try {
+    const p = fs.readFileSync(path.join(PAGR_HOME, 'run', 'daemon.sock.path'), 'utf8').trim();
+    if (p && path.isAbsolute(p)) return p;
+  } catch {
+    /* not written */
+  }
+  return null;
+}
 const SOCK =
   process.env.PAGR_DAEMON_SOCK ||
-  path.join(process.env.PAGR_HOME || path.join(os.homedir(), '.pagr'), 'run', 'daemon.sock');
+  recordedSocketPath() ||
+  path.join(PAGR_HOME, 'run', 'daemon.sock');
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -88,7 +102,9 @@ export function buildRequest(hook) {
 
   return {
     provider: 'claude',
-    sessionId: process.env.PAGR_SESSION_ID ?? null,
+    // Bridge-spawned sessions carry PAGR_SESSION_ID; the user's own interactive `claude` does
+    // not, so the daemon maps `cwd` → registered project and mints a local session (finding 12).
+    sessionId: process.env.PAGR_SESSION_ID || null,
     claudeSessionId: str(hook.session_id) ?? null,
     providerRequestId: providerRequestId.slice(0, 200),
     actionType,

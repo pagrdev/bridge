@@ -25,4 +25,35 @@ describe('SessionStore', () => {
     s2.remove('ses_1');
     expect(new SessionStore(file).list()).toEqual([]);
   });
+
+  it('keeps completed sessions for at least 24h; pruneTerminal only drops old terminal ones (item 17)', () => {
+    const file = join(t.home, 'sessions.json');
+    const base = new Date('2026-01-02T00:00:00Z');
+    let clock = base;
+    const s = new SessionStore(file, () => clock);
+    const rec = (id: string, status: 'completed' | 'working' | 'stopped', ageH: number) =>
+      s.upsert({
+        sessionId: id,
+        provider: 'claude',
+        projectId: 'proj_1',
+        providerSessionId: id,
+        status,
+        startedAt: base.toISOString(),
+        updatedAt: new Date(base.getTime() - ageH * 3600_000).toISOString(),
+      });
+    rec('ses_done_fresh', 'completed', 23);
+    rec('ses_done_old', 'completed', 25);
+    rec('ses_stopped_old', 'stopped', 200);
+    rec('ses_working_old', 'working', 200);
+    clock = base;
+    expect(s.pruneTerminal(24 * 3600_000)).toBe(2);
+    expect(
+      new SessionStore(file)
+        .list()
+        .map((r) => r.sessionId)
+        .sort(),
+    ).toEqual(['ses_done_fresh', 'ses_working_old']);
+    // a completed session is still usable (resumable) after reload
+    expect(new SessionStore(file).get('ses_done_fresh')?.status).toBe('completed');
+  });
 });

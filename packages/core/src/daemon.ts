@@ -1,4 +1,5 @@
-import type { DeviceEvent, Provider } from '@pagr/protocol';
+import { createHash, randomUUID } from 'node:crypto';
+import type { DeviceEvent, Provider, SessionSummary } from '@pagr/protocol';
 import { z } from 'zod';
 import type { CodingAgentAdapter } from './adapters/types.js';
 import type { FetchLike } from './attachments.js';
@@ -14,7 +15,7 @@ import { type Logger, silentLogger } from './logging.js';
 import { ensurePaths, type PagrPaths } from './paths.js';
 import { ProjectError, ProjectRegistry } from './projects.js';
 import { ReplayCache } from './replay.js';
-import { SessionStore } from './sessions.js';
+import { type SessionRecord, SessionStore } from './sessions.js';
 import { GatewayClient } from './transport.js';
 
 export interface CreateDaemonOptions {
@@ -32,6 +33,8 @@ export interface CreateDaemonOptions {
   heartbeatMs?: number;
   backoff?: { baseMs?: number; maxMs?: number };
   tmpCleanupOlderThanMs?: number;
+  /** Environment for security checks (`PAGR_ENV`, `PAGR_ALLOW_INSECURE_WS`); defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface DaemonStatus {
@@ -68,8 +71,15 @@ export interface Daemon {
 }
 
 const ApprovalRequestParams = z.object({
-  sessionId: z.string(),
-  projectId: z.string(),
+  /**
+   * Bridge-spawned sessions send their `ses_…` id. The Claude PermissionRequest hook, running
+   * inside the user's OWN interactive `claude`, sends `null` plus `cwd` (+ `claudeSessionId`);
+   * the daemon then maps `cwd` to a registered project and mints a synthetic local session.
+   */
+  sessionId: z.string().nullable(),
+  projectId: z.string().optional(),
+  cwd: z.string().nullable().optional(),
+  claudeSessionId: z.string().nullable().optional(),
   provider: z.enum(['claude', 'codex']),
   providerRequestId: z.string().min(1).max(200),
   actionType: z.enum(['command_execution', 'file_change', 'permission', 'tool_use', 'other']),
@@ -103,6 +113,14 @@ const ProjectAddParams = z.object({
   aliases: z.array(z.string()).optional(),
   allowNonGit: z.boolean().optional(),
 });
+
+const SESSION_RETENTION_MS = 7 * 24 * 3600_000;
+
+/** Stable `ses_…` id for a provider session the bridge did not spawn (hook path). */
+export function syntheticSessionId(provider: Provider, providerSessionId?: string): string {
+  const seed = providerSessionId ?? randomUUID();
+  return `ses_${createHash('sha256').update(`${provider}:${seed}`).digest('hex').slice(0, 32)}`;
+}
 
 /**
  * Wire identity → transport → command guard → dispatcher → IPC. The daemon holds no cloud
@@ -196,10 +214,12 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       identity: { ...identity, deviceId, sign: identity.sign },
       bridgeVersion,
       onCommand: (envelope) => void handleEnvelope(envelope),
+      serverKeys,
       onServerKeys: (keys) => {
         serverKeys = keys;
         updateConfig(paths.configFile, { serverKeys: keys });
       },
+      ...(o.env ? { env: o.env } : {}),
       activeSessions: () => dispatcher.activeSessionCount(),
       logger: logger.child({ mod: 'transport' }),
       now,
@@ -275,15 +295,45 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   ipc.registerMethod('approvals.list', () => dispatcher.approvals.list());
   ipc.registerMethod('approval.request', (params) => {
     const p = ApprovalRequestParams.parse(params);
-    if (!registry.has(p.projectId)) throw new IpcMethodError('unknown_project', p.projectId);
+    let projectId: string;
+    if (p.projectId) {
+      if (!registry.has(p.projectId)) throw new IpcMethodError('unknown_project', p.projectId);
+      projectId = p.projectId;
+    } else if (p.cwd) {
+      const rec = registry.findByPath(p.cwd);
+      if (!rec)
+        throw new IpcMethodError('unknown_project', 'cwd is not inside a registered project');
+      projectId = rec.projectId;
+    } else {
+      throw new IpcMethodError('invalid_params', 'projectId or cwd is required');
+    }
+    let sessionId: string;
+    if (p.sessionId) sessionId = p.sessionId;
+    else {
+      // Interactive (hook) path: mint a stable local session so cloud approvals can be bound
+      // and routed. Deterministic per provider session id so repeated prompts share it.
+      sessionId = syntheticSessionId(p.provider, p.claudeSessionId ?? undefined);
+      const existing = sessions.get(sessionId);
+      const ts = now().toISOString();
+      const rec = sessions.upsert({
+        sessionId,
+        provider: p.provider,
+        projectId,
+        providerSessionId: p.claudeSessionId ?? sessionId,
+        status: 'waiting_for_approval',
+        startedAt: existing?.startedAt ?? ts,
+        updatedAt: ts,
+      });
+      emit(makeEvent(dispatcherDeviceId(), 'session.updated', summaryOf(rec), { now }));
+    }
     return new Promise<{
       approvalId: string;
       decision: 'allow' | 'deny' | null;
       resolution: string;
     }>((resolve) => {
       const record = dispatcher.requestApproval({
-        sessionId: p.sessionId,
-        projectId: p.projectId,
+        sessionId,
+        projectId,
         provider: p.provider,
         providerRequestId: p.providerRequestId,
         actionType: p.actionType,
@@ -292,11 +342,30 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         ...(p.timeoutMs
           ? { expiresAt: new Date(now().getTime() + p.timeoutMs).toISOString() }
           : {}),
-        onDecision: (decision, resolution) =>
-          resolve({ approvalId: record.approvalId, decision, resolution }),
+        onDecision: (decision, resolution) => {
+          if (!p.sessionId) {
+            const rec = sessions.setStatus(sessionId, 'idle');
+            if (rec)
+              emit(makeEvent(dispatcherDeviceId(), 'session.updated', summaryOf(rec), { now }));
+          }
+          resolve({ approvalId: record.approvalId, decision, resolution });
+        },
       });
     });
   });
+
+  function summaryOf(rec: SessionRecord): SessionSummary {
+    return {
+      sessionId: rec.sessionId,
+      projectId: rec.projectId,
+      provider: rec.provider,
+      status: rec.status,
+      activeTurn: rec.status === 'waiting_for_approval',
+      startedAt: rec.startedAt,
+      updatedAt: rec.updatedAt,
+      displayName: 'Interactive session',
+    };
+  }
   ipc.registerMethod('agent.event', (params) => {
     const p = AgentEventParams.parse(params);
     emit(
@@ -337,10 +406,11 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     async start() {
       await ipc.listen();
       cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now);
-      cleanupTimer = setInterval(
-        () => cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now),
-        3600_000,
-      );
+      cleanupTimer = setInterval(() => {
+        cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now);
+        // Completed sessions must stay resumable well past 24h; only very old terminal ones go.
+        sessions.pruneTerminal(SESSION_RETENTION_MS);
+      }, 3600_000);
       cleanupTimer.unref();
       if (transport) transport.start();
       else logger.warn('not paired: run `pagr connect`; IPC available, gateway idle');
@@ -365,8 +435,19 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
 
 /** Convenience for the CLI: create + start, and stop on SIGINT/SIGTERM. */
 export async function startDaemon(o: CreateDaemonOptions): Promise<Daemon> {
-  const d = await createDaemon(o);
-  await d.start();
+  const logger = o.logger ?? silentLogger;
+  let d: Daemon;
+  try {
+    d = await createDaemon(o);
+    await d.start();
+  } catch (err) {
+    // Fail loudly: a daemon that cannot listen on its IPC socket is useless, and launchd would
+    // otherwise keep restarting a silently broken process.
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error('daemon failed to start', { message });
+    process.stderr.write(`pagr daemon: failed to start: ${message}\n`);
+    process.exit(1);
+  }
   const onSignal = () => {
     void d.stop().finally(() => process.exit(0));
   };

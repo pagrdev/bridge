@@ -1,3 +1,4 @@
+import { relativizePaths } from './heuristics.js';
 /**
  * Parser for Claude Code `--output-format stream-json` lines (Claude Code 2.1.220, verified
  * 2026-08-24 against real output + https://code.claude.com/docs/en/headless).
@@ -139,7 +140,15 @@ export function controlResponseLine(
 }
 
 /** Human preview of a tool invocation for approval cards. Never full file contents. */
-export function previewForTool(toolName: string, input: Record<string, unknown>): string {
+export function previewForTool(
+  toolName: string,
+  input: Record<string, unknown>,
+  projectPath?: string,
+): string {
+  return relativizePaths(rawPreview(toolName, input), projectPath);
+}
+
+function rawPreview(toolName: string, input: Record<string, unknown>): string {
   const s = (k: string) => (typeof input[k] === 'string' ? (input[k] as string) : undefined);
   switch (toolName) {
     case 'Bash':

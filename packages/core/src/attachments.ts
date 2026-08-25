@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { join } from 'node:path';
 import type { AttachmentRef } from '@pagr/protocol';
 
@@ -12,7 +13,8 @@ export class AttachmentError extends Error {
       | 'too_large'
       | 'hash_mismatch'
       | 'mime_mismatch'
-      | 'network',
+      | 'network'
+      | 'unsafe_url',
     message: string,
   ) {
     super(message);
@@ -27,6 +29,77 @@ export interface FetchAttachmentOptions {
   fetch?: FetchLike;
   timeoutMs?: number;
   now?: () => Date;
+  /** Environment for the URL policy (`PAGR_ENV=local` allows plain-http loopback). */
+  env?: NodeJS.ProcessEnv;
+}
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+
+function ipv4Private(host: string): boolean {
+  const o = host.split('.').map(Number);
+  const [a, b] = o as [number, number];
+  if (o.length !== 4 || o.some((n) => Number.isNaN(n))) return true;
+  return (
+    a === 0 || // 0.0.0.0/8 incl. 0.0.0.0
+    a === 10 ||
+    a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254)
+  );
+}
+
+function ipv6Private(host: string): boolean {
+  const h = host.toLowerCase();
+  if (h === '::1' || h === '::') return true;
+  // fc00::/7 (fc.. / fd..), fe80::/10 (fe8.. .. feb..)
+  if (/^f[cd][0-9a-f]{2}:/.test(h)) return true;
+  if (/^fe[89ab][0-9a-f]:/.test(h)) return true;
+  // IPv4-mapped (::ffff:a.b.c.d, or the normalized ::ffff:a0b:c0d) — defer to the v4 rules
+  const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
+  if (dotted?.[1]) return ipv4Private(dotted[1]);
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+  if (hex?.[1] && hex[2]) {
+    const hi = Number.parseInt(hex[1], 16);
+    const lo = Number.parseInt(hex[2], 16);
+    return ipv4Private(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
+  }
+  return false;
+}
+
+/**
+ * Attachment downloads must go to a public `https:` host. Literal IP hosts are refused
+ * outright (and private / link-local / loopback ranges are named explicitly so the reason is
+ * clear). With `PAGR_ENV=local`, plain `http://localhost` / `http://127.0.0.1` is also allowed.
+ * Never call this with anything but the URL the cloud handed us; it never performs DNS.
+ */
+export function assertSafeDownloadUrl(url: string, env: NodeJS.ProcessEnv = process.env): void {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new AttachmentError('unsafe_url', 'downloadUrl is not a valid URL');
+  }
+  const local = env.PAGR_ENV === 'local';
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (u.protocol === 'http:' && local && LOOPBACK_HOSTS.has(u.hostname)) return;
+  if (u.protocol !== 'https:')
+    throw new AttachmentError('unsafe_url', `downloadUrl must be https:// (got ${u.protocol}//)`);
+  if (u.hostname === 'localhost' || u.hostname.endsWith('.localhost'))
+    throw new AttachmentError('unsafe_url', 'downloadUrl must not point at localhost');
+  const v = isIP(host);
+  if (v === 4 && ipv4Private(host))
+    throw new AttachmentError(
+      'unsafe_url',
+      `downloadUrl host ${host} is a private/loopback/link-local address`,
+    );
+  if (v === 6 && ipv6Private(host))
+    throw new AttachmentError(
+      'unsafe_url',
+      `downloadUrl host ${host} is a private/loopback/link-local address`,
+    );
+  if (v !== 0)
+    throw new AttachmentError('unsafe_url', 'downloadUrl must use a hostname, not a literal IP');
 }
 
 const EXT: Record<AttachmentRef['mimeType'], string> = {
@@ -70,6 +143,7 @@ export async function fetchAttachment(
   const now = (opts.now ?? (() => new Date()))();
   if (Date.parse(ref.expiresAt) <= now.getTime())
     throw new AttachmentError('expired', 'attachment download authorization expired');
+  assertSafeDownloadUrl(ref.downloadUrl, opts.env);
   const doFetch: FetchLike = opts.fetch ?? ((u, i) => fetch(u, i));
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? 15_000);

@@ -93,6 +93,29 @@ describe('ProjectRegistry', () => {
     expect(() => reg.assertContained('proj_missing', 'x')).toThrow(/unknown project/);
   });
 
+  it('findByPath maps a cwd to the registered project containing it (finding 12)', () => {
+    const repo = join(home, 'repo');
+    makeRepo(repo);
+    const nested = join(home, 'repo-nested');
+    makeRepo(nested);
+    mkdirSync(join(repo, 'src', 'deep'), { recursive: true });
+    const outside = join(home, 'outside');
+    mkdirSync(outside);
+    symlinkSync(outside, join(repo, 'link'));
+    const p = reg.add(repo);
+    reg.add(nested);
+    expect(reg.findByPath(repo)?.projectId).toBe(p.projectId);
+    expect(reg.findByPath(join(repo, 'src', 'deep'))?.projectId).toBe(p.projectId);
+    // not-yet-existing subdir still resolves via nearest existing ancestor
+    expect(reg.findByPath(join(repo, 'src', 'nope'))?.projectId).toBe(p.projectId);
+    // sibling with a shared prefix is NOT inside
+    expect(reg.findByPath(`${repo}-nested`)?.projectId).not.toBe(p.projectId);
+    expect(reg.findByPath(outside)).toBeUndefined();
+    expect(reg.findByPath(join(repo, 'link'))).toBeUndefined(); // symlink escapes the root
+    expect(reg.findByPath(home)).toBeUndefined();
+    expect(reg.findByPath('relative/path')).toBeUndefined();
+  });
+
   it('discover finds repos shallowly and skips node_modules', () => {
     makeRepo(join(home, 'a'));
     makeRepo(join(home, 'x', 'b'));
