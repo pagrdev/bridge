@@ -5,12 +5,24 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src/hooks",
+    "src/generated"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/hooks && cp src/hooks/permission.mjs dist/hooks/permission.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
+    "@pagr/bridge-core": "workspace:*",
     "@pagr/protocol": "workspace:*",
     "zod": "^3.25.0"
   }

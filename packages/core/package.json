@@ -11,7 +11,12 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@napi-rs/keyring": "^1.3.0",
     "@pagr/protocol": "workspace:*",
+    "ws": "^8.21.3",
     "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
   }
 }
