@@ -9,7 +9,7 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` permissions, the secret stor
 | `pairing failed: pairing code expired` | more than a few minutes passed before approving in the browser | run `pagr connect` again for a fresh code |
 | macOS asks for your login password / "pagr wants to use the keychain" | the device key lives in the login Keychain | click **Always Allow**; see below |
 | Codex sessions fail immediately | Codex CLI not logged in | `codex login` |
-| Claude approvals never reach your phone | permission hook not installed / not firing | see below |
+| Claude approvals never reach your phone | session not started by Pagr, or the daemon lost the gateway | see below |
 | daemon logs `auth failed` or `device revoked` | this device was revoked from the dashboard | `pagr logout && pagr connect` |
 
 ## Daemon not connecting
@@ -54,15 +54,23 @@ pagr status          # codex line should show installed
 
 If `codex` is installed but `pagr doctor` says *not found on PATH*, it lives somewhere the launch agent cannot see (e.g. a shell-only `PATH` entry). Symlink it into `/usr/local/bin` or re-run `pagr daemon install` from a shell where `which codex` works.
 
-## Claude hook not firing
+## Claude approvals not reaching your phone
 
-Claude Code approvals reach your phone through a project-scoped `PermissionRequest` hook (`~/.pagr/hooks/permission.mjs`) that talks to the daemon socket. If Claude runs but you never see approval requests:
+Approvals only work for Claude Code sessions **Pagr itself started or resumed** — i.e. ones you asked for from your phone or the dashboard ("start claude on tonight"). No Claude settings file is touched and no hook is installed: the daemon spawns the `claude` binary with `--permission-prompt-tool stdio` and reads each permission request off the process's stdout as a control message, answering it on stdin once you reply (`packages/adapter-claude/src/{adapter,claude-process}.ts`). A request that gets no decision within the approval timeout (10 minutes by default) is **denied** locally, and Pagr reports it as `timed_out`.
 
-1. `pagr daemon status` — the socket `~/.pagr/run/daemon.sock` must exist; the hook returns *no decision* (Claude falls back to its own prompt) when it cannot connect.
-2. Check the project's `.claude/settings.local.json` contains the hook entry. The adapter installs it when the first session starts; if you edited settings by hand, restart the session.
-3. `claude --version` must be ≥ the version that supports `PermissionRequest` hooks. Update with `npm i -g @anthropic-ai/claude-code`.
-4. Sessions started **outside** Pagr (a plain `claude` in a terminal) are not steered by the bridge; only sessions the daemon started or resumed carry the hook.
-5. `PAGR_LOG_LEVEL=debug pagr daemon run` prints each hook call and its decision.
+If a Pagr-started Claude session runs but you never see approval requests:
+
+1. `pagr status` / `pagr sessions` — the session must be listed and owned by the daemon. If it is not there, Pagr did not spawn it; see *Sessions you started yourself* below.
+2. `pagr status` — the gateway line must read `connected`. Approval requests travel over that one WebSocket; if it is down they queue on this Mac and nothing reaches your phone. See *Daemon not connecting*.
+3. `pagr daemon logs -n 100` — a spawn failure (`claude spawn error`, `claude exited`) means the session died before it could ask for anything. `claude --version` must be recent enough to support `-p --input-format stream-json --output-format stream-json --permission-prompt-tool stdio`; update with `npm i -g @anthropic-ai/claude-code`.
+4. Nothing is auto-allowed on this side, so a missing request is never "Pagr approved it for you". Tier A auto-approval, when you have enabled it, happens in the cloud and is recorded in the audit log.
+5. `PAGR_LOG_LEVEL=debug pagr daemon run` prints each permission request and the decision written back.
+
+### Sessions you started yourself
+
+Answering approvals from a `claude` **you** launched in a terminal is not wired up today. The pieces exist but nothing connects them: `@pagr/bridge-adapter-claude` ships a `PermissionRequest` hook script (`src/hooks/permission.mjs`) and the daemon accepts hook-shaped approval requests (it maps the session's `cwd` onto a registered project and mints a local session for it), but `installHooks()` is never called by the bridge, and neither it nor anything else writes an entry into `~/.claude/settings.json` or a project's `.claude/settings.local.json` — `installHooks()` only copies the script, and `hookSettings()` only returns a JSON fragment. Until that is wired up, your own interactive sessions keep using Claude Code's native prompt.
+
+(The one command that does write into a project is `pagr claude channel-setup`, which adds a `pagr` entry to `.mcp.json` for the research-preview channel mode. It is opt-in, unrelated to permission hooks, and not needed for normal use.)
 
 Note that Claude Code cannot be steered mid-turn: instructions sent while a turn is active are queued and delivered when it ends (`queued_followup` → `followup_delivered` in `pagr sessions`).
 
