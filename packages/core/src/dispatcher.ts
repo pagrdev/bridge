@@ -25,9 +25,16 @@ import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFl
 import { makeEvent } from './events.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
-import { type PublicPolicy, readPolicy, writePolicy } from './policy.js';
+import { PublicPolicy, readPolicy, writePolicy } from './policy.js';
 import { ProjectError, type ProjectRegistry } from './projects.js';
-import type { SessionStore } from './sessions.js';
+import { isAdopted, isReportable, type SessionStore } from './sessions.js';
+
+/**
+ * How an adopted session is labelled for the person looking at their phone. It has to be
+ * distinguishable from a session Pagr started, because the two differ in what can be done with
+ * them: this one's approvals can be answered, but it cannot be sent an instruction or stopped.
+ */
+export const ADOPTED_SESSION_NAME = 'Your own session';
 
 type AckPayload = EventPayload<'command.ack'>;
 
@@ -226,8 +233,10 @@ export class Dispatcher {
       case 'agent.start_session':
         return this.startSession(body.payload);
       case 'agent.send_instruction':
+        this.assertOurSession(body.payload.sessionId, 'send an instruction to');
         return this.sendInstruction(body.payload);
       case 'agent.stop_session': {
+        this.assertOurSession(body.payload.sessionId, 'stop');
         const { adapter } = this.sessionAdapter(body.payload.sessionId);
         await adapter.stopSession(body.payload.sessionId);
         this.o.sessions.setStatus(body.payload.sessionId, 'stopped');
@@ -238,7 +247,9 @@ export class Dispatcher {
       case 'agent.respond_to_approval':
         return this.respondToApproval(body.payload);
       case 'settings.sync_public_policy': {
-        this.policy = { ...body.payload };
+        // Re-parsed rather than spread: a key the cloud sends that this bridge no longer honours
+        // (`smartApprovalsTierA`) must not survive into `policy.json` looking like a live setting.
+        this.policy = PublicPolicy.parse(body.payload);
         writePolicy(this.o.policyFile, this.policy);
         return this.policy;
       }
@@ -257,12 +268,35 @@ export class Dispatcher {
       }
     }
     const sessions: SessionSummary[] = [];
+    const seen = new Set<string>();
     for (const adapter of this.o.adapters.values()) {
       try {
-        for (const s of await adapter.listSessions()) sessions.push(this.authoritative(s));
+        for (const s of await adapter.listSessions()) {
+          if (seen.has(s.sessionId)) continue;
+          seen.add(s.sessionId);
+          sessions.push(this.authoritative(s));
+        }
       } catch {
         // adapter may not support listing
       }
+    }
+    // Sessions the bridge did not start are not in any adapter's list — the adapter only knows
+    // what it spawned — but they are real, and the phone has to be able to see one to answer its
+    // prompts. Only those inside a registered project can be described: a `SessionSummary` names
+    // a `proj_…` id. The `device.hello` ceiling below still applies to all of them together.
+    for (const rec of this.o.sessions.list()) {
+      if (!isAdopted(rec) || !isReportable(rec) || seen.has(rec.sessionId)) continue;
+      seen.add(rec.sessionId);
+      sessions.push({
+        sessionId: rec.sessionId,
+        projectId: rec.projectId,
+        provider: rec.provider,
+        status: rec.status,
+        displayName: ADOPTED_SESSION_NAME,
+        activeTurn: rec.status === 'waiting_for_approval',
+        startedAt: rec.startedAt,
+        updatedAt: rec.updatedAt,
+      });
     }
     const hello: EventPayload<'device.hello'> = {
       bridgeVersion: this.o.bridgeVersion,
@@ -338,6 +372,25 @@ export class Dispatcher {
     const rec = this.o.sessions.get(sessionId);
     if (!rec) throw new DispatchError('unknown_session', 'unknown session');
     return { rec, adapter: this.adapterFor(rec.provider) };
+  }
+
+  /**
+   * Taking the turn in a session the bridge did not start.
+   *
+   * It cannot: the adapter only holds the sessions it spawned, so the instruction would reach an
+   * adapter that has never heard of this one. Refusing here turns that into one sentence the
+   * person can act on, and keeps the limit true on this side rather than only in the cloud.
+   *
+   * Only the *turn* is refused. Answering a prompt this session raised is the entire point of
+   * adopting it and goes through `respondToApproval`, which does not come through here.
+   */
+  private assertOurSession(sessionId: string, what: string): void {
+    const rec = this.o.sessions.get(sessionId);
+    if (rec && isAdopted(rec))
+      throw new DispatchError(
+        'capability_unsupported',
+        `this is one of your own ${rec.provider} sessions — Pagr did not start it, so it cannot ${what} it. Pagr can relay the prompts it raises; everything else belongs to the terminal it is running in.`,
+      );
   }
 
   /**
@@ -723,23 +776,9 @@ export class Dispatcher {
       hints: record.hints,
       expiresAt: record.expiresAt,
     });
-    // `smartApprovalsTierA` (synced from the dashboard, persisted in `policy.json`) means "answer
-    // the obviously-safe ones for me". Which ones are obvious is decided here, not by the cloud:
-    // only an action this Mac classified as carrying no risk class at all, and which is not a
-    // shell command. A shell line always waits for a person. The device policy can pin this off
-    // locally regardless of what the dashboard says.
-    if (this.policy.smartApprovalsTierA && this.floor.tierAAutoApprove && assessment.tierA) {
-      this.logger.info('tier-A auto-approval', {
-        approvalId: record.approvalId,
-        actionType: record.actionType,
-      });
-      void this.approvals.decideLocally(record.approvalId, 'allow').catch((err) =>
-        this.logger.warn('tier-A auto-approval failed', {
-          approvalId: record.approvalId,
-          error: String(err),
-        }),
-      );
-    }
+    // Nothing decides it here. The prompt now waits for the person — on their phone, or in the
+    // terminal the agent is running in, whichever answers first. The bridge used to auto-approve
+    // what it classified as zero-risk; that is deliberately gone (see `policy.ts`).
     return record;
   }
 

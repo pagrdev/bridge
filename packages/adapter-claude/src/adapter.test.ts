@@ -220,16 +220,15 @@ describe('ClaudeAdapter against fake claude', () => {
         '--permission-prompt-tool',
         'stdio',
         '--setting-sources',
-        '--strict-mcp-config',
         '--session-id',
         '--disallowedTools',
       ]),
     );
     expect(args.argv[args.argv.indexOf('--session-id') + 1]).toMatch(/^[0-9a-f-]{36}$/);
-    // SEC-3: the cloned repo's own .claude/settings.json and .mcp.json must not be able to grant
-    // this session permissions, or no approval is ever raised and the phone is never asked.
-    expect(args.argv[args.argv.indexOf('--setting-sources') + 1]).toBe('user,local');
-    expect(args.argv[args.argv.indexOf('--setting-sources') + 1]).not.toContain('project');
+    // The person's own configuration, whole: a bridge session reads the same settings their own
+    // `claude` reads in this checkout, and keeps the MCP servers they configured.
+    expect(args.argv[args.argv.indexOf('--setting-sources') + 1]).toBe('user,project,local');
+    expect(args.argv).not.toContain('--strict-mcp-config');
     // SEC-6: read-only must actually mean read-only; Bash alone is a write path (`sed -i`).
     expect(args.argv[args.argv.indexOf('--disallowedTools') + 1].split(',')).toEqual(
       expect.arrayContaining(['Bash', 'Edit', 'Write', 'NotebookEdit', 'Task']),

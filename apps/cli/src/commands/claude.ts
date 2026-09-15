@@ -2,9 +2,10 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { isAbsolute, join, resolve } from 'node:path';
 import type { Command } from 'commander';
+import { hookState, installHookForUser, removeHookForUser } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
-import { bold, dim, ok, printJson, warn } from '../output.js';
+import { bad, bold, dim, ok, printJson, warn } from '../output.js';
 
 /**
  * `pagr claude channel-setup` — wire the Pagr channel server into a project's `.mcp.json`.
@@ -220,8 +221,74 @@ export async function runChannelSetup(ctx: CliContext, opts: ChannelSetupOptions
   ctx.out(dim('  `pagr doctor` will then say whether steering is actually reachable.'));
 }
 
+/**
+ * `pagr claude hook-install` / `hook-remove` — the manual half of the `PermissionRequest` hook.
+ *
+ * `pagr connect` and `pagr daemon install` do this for you. These exist for the two cases they
+ * cannot: you already have a PermissionRequest hook of your own and want Pagr's alongside it
+ * (`--force`), or you want Pagr's out without logging out.
+ */
+export function runHookInstall(ctx: CliContext, opts: { force?: boolean }): void {
+  const { action, report } = installHookForUser(ctx, (l) => ctx.out(l), {
+    ...(opts.force ? { force: true } : {}),
+  });
+  if (ctx.json) {
+    printJson(ctx, { action, ...(report ?? {}) });
+    return;
+  }
+  if (action === 'already-installed')
+    ctx.out(ok(`already installed ${dim(report?.settingsPath ?? '')}`));
+  if (action === 'failed')
+    throw new CliError('the Claude Code settings file could not be read', EXIT.state, {
+      code: 'claude_settings_unreadable',
+      hint: 'fix the JSON in that file, then run `pagr claude hook-install` again',
+    });
+}
+
+export function runHookRemove(ctx: CliContext): void {
+  const report = removeHookForUser(ctx, (l) => ctx.out(l));
+  if (ctx.json) {
+    printJson(ctx, report);
+    return;
+  }
+  ctx.out(
+    report.removed.length > 0
+      ? ok('the Pagr hook is out of your Claude Code settings')
+      : warn('there was no Pagr hook in your Claude Code settings'),
+  );
+}
+
+export function runHookStatus(ctx: CliContext): void {
+  const state = hookState(ctx);
+  if (ctx.json) {
+    printJson(ctx, state);
+    return;
+  }
+  ctx.out(
+    state.entryInstalled
+      ? ok(`installed ${dim(state.settingsPath)}`)
+      : state.problem
+        ? bad(state.problem)
+        : warn(`not installed ${dim(state.settingsPath)}`),
+  );
+  if (state.conflict.length > 0)
+    ctx.out(
+      warn(`you also have PermissionRequest hooks of your own: ${state.conflict.join(', ')}`),
+    );
+}
+
 export function registerClaude(program: Command, getCtx: () => CliContext): void {
   const c = program.command('claude').description('Claude Code integration helpers');
+  c.command('hook-install')
+    .description('register the Pagr PermissionRequest hook in ~/.claude/settings.json')
+    .option('--force', 'install even when you already have a PermissionRequest hook of your own')
+    .action((opts: { force?: boolean }) => runHookInstall(getCtx(), opts));
+  c.command('hook-remove')
+    .description('remove the Pagr PermissionRequest hook, leaving the rest of the file alone')
+    .action(() => runHookRemove(getCtx()));
+  c.command('hook-status')
+    .description('report whether the Pagr PermissionRequest hook is installed')
+    .action(() => runHookStatus(getCtx()));
   c.command('channel-setup')
     .description(
       'wire the Pagr channel server into a project .mcp.json (research preview, dev flag only)',

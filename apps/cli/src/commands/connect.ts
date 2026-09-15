@@ -19,6 +19,7 @@ import {
   startPairing,
 } from '@pagr/bridge-core';
 import type { Command } from 'commander';
+import { installHookForUser } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { isRemoteSession } from '../context.js';
 import { CliError, EXIT, interruptedError, toCliError } from '../errors.js';
@@ -81,6 +82,8 @@ export async function verifyGatewayConnected(
 }
 
 interface ConnectResult {
+  /** What happened to `~/.claude/settings.json`: installed / already-installed / conflict / failed. */
+  claudeHook: string;
   deviceId: string;
   userId: string;
   gatewayUrl: string;
@@ -281,6 +284,21 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
       noteAgentEnvGaps(ctx, note);
     }
 
+    // Register the Claude Code PermissionRequest hook for this user. At user scope it covers
+    // every session they start, and it only fires when Claude Code actually needs a decision —
+    // so a repo they have already auto-approved never reaches Pagr at all. A settings file we
+    // could not parse, or a PermissionRequest hook of their own, is a note, never a failed
+    // pairing: `installHookForUser` reports and moves on.
+    const hook = installHookForUser(ctx, (line) => say(ctx, line));
+    if (hook.action === 'conflict' || hook.action === 'failed')
+      warnings.push(
+        stripMarkup(
+          hook.action === 'conflict'
+            ? 'a PermissionRequest hook of your own is already installed; Pagr did not touch it'
+            : 'your Claude Code settings file could not be read, so the hook was not installed',
+        ),
+      );
+
     // --- 6. prove the gateway handshake ------------------------------------
     say(ctx, step(6, STEPS, 'Verifying the connection'));
     const gateway = plist
@@ -288,6 +306,7 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
       : ({ kind: 'skipped', reason: 'the daemon was not installed' } as const);
 
     const result: ConnectResult = {
+      claudeHook: hook.action,
       deviceId: done.deviceId,
       userId: done.userId,
       gatewayUrl: opts.gatewayUrl ?? done.gatewayUrl,

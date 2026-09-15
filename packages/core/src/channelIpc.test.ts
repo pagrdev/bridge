@@ -181,4 +181,25 @@ describe('daemon flag gate', () => {
       expect.arrayContaining(['channel.poll', 'channel.outbound']),
     );
   });
+
+  /**
+   * `adopted` means one specific thing — "Pagr can relay this session's approvals and nothing
+   * else" — and the cloud refuses to steer or stop on the strength of it. A channel-attached
+   * session is also one the bridge did not spawn, but it IS steerable: that is what the channel
+   * is for. Marking it adopted would ship a limit that is not true.
+   */
+  it('does not mark a channel-attached session adopted, because that one can be steered', async () => {
+    const daemon = await make({ PAGR_CLAUDE_CHANNEL: '1' });
+    const repo = join(t.home, 'chan-repo');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    const project = daemon.registry.add(repo);
+    const handler = (
+      daemon.ipc as unknown as { methods: Map<string, (p: unknown) => unknown> }
+    ).methods.get('channel.outbound');
+    if (!handler) throw new Error('channel.outbound not registered');
+    const res = (await handler({ cwd: repo, text: 'hello' })) as { sessionId: string };
+    const rec = daemon.sessions.get(res.sessionId);
+    expect(rec?.projectId).toBe(project.projectId);
+    expect(rec?.adopted).toBeUndefined();
+  });
 });

@@ -3,6 +3,8 @@ import {
   ClaudeProcess,
   DEFAULT_SETTING_SOURCES,
   READ_ONLY_DISALLOWED_TOOLS,
+  SEALED_SETTING_SOURCES,
+  sealedModeEnabled,
 } from './claude-process.js';
 import { FileLogger } from './logger.js';
 
@@ -14,7 +16,7 @@ import { FileLogger } from './logger.js';
  * Spawns `/bin/echo` and reads `spawnargs` back off the child, so this asserts what would really
  * be executed rather than re-deriving it.
  */
-function argvFor(readOnly: boolean, settingSources?: string): string[] {
+function argvFor(readOnly: boolean, settingSources?: string, sealed?: boolean): string[] {
   const p = new ClaudeProcess({
     command: ['/bin/echo'],
     cwd: '/tmp',
@@ -22,6 +24,7 @@ function argvFor(readOnly: boolean, settingSources?: string): string[] {
     session: { kind: 'new', id: 'abc' },
     readOnly,
     ...(settingSources ? { settingSources } : {}),
+    ...(sealed === undefined ? {} : { sealed }),
     logger: new FileLogger(null),
   });
   p.start();
@@ -31,19 +34,43 @@ function argvFor(readOnly: boolean, settingSources?: string): string[] {
 }
 
 describe('claude argv', () => {
-  it('never lets the project grant its own permissions (SEC-3)', () => {
+  it("honours the whole of the person's own configuration by default", () => {
     const argv = argvFor(false);
-    // Without these, `claude -p` reads the cloned repo's `.claude/settings.json` and `.mcp.json`,
-    // so a repo shipping `permissions.allow: ["Bash(*)"]` or a PreToolUse hook that returns allow
-    // means no approval is ever raised and the user is never asked.
-    expect(argv).toContain('--strict-mcp-config');
-    expect(argv[argv.indexOf('--setting-sources') + 1]).toBe(DEFAULT_SETTING_SOURCES);
-    expect(DEFAULT_SETTING_SOURCES.split(',')).not.toContain('project');
+    // Pagr does not get to decide which of someone's Claude Code settings count. A session the
+    // bridge starts reads the same user, project and local settings their own `claude` reads, so
+    // the repo's `.claude/settings.json` — the file their team wrote and they chose to clone —
+    // applies here too.
+    expect(DEFAULT_SETTING_SOURCES.split(',')).toEqual(['user', 'project', 'local']);
+    expect(argv[argv.indexOf('--setting-sources') + 1]).toBe('user,project,local');
+    // …and their MCP servers come with it: `--strict-mcp-config` would drop every server they
+    // configured, which is part of the same configuration.
+    expect(argv).not.toContain('--strict-mcp-config');
   });
 
-  it('lets the operator tighten setting sources further', () => {
-    const argv = argvFor(false, 'user');
+  it("sealed mode drops the project's settings and MCP servers together", () => {
+    const argv = argvFor(false, undefined, true);
+    expect(SEALED_SETTING_SOURCES.split(',')).not.toContain('project');
+    expect(argv[argv.indexOf('--setting-sources') + 1]).toBe(SEALED_SETTING_SOURCES);
+    // Both flags are one switch: a repo that cannot grant itself a permission must not be able to
+    // hand itself a tool through `.mcp.json` either.
+    expect(argv).toContain('--strict-mcp-config');
+  });
+
+  it('reads sealed mode from PAGR_CLAUDE_SEALED, off unless it is explicitly on', () => {
+    expect(sealedModeEnabled({})).toBe(false);
+    expect(sealedModeEnabled({ PAGR_CLAUDE_SEALED: '' })).toBe(false);
+    expect(sealedModeEnabled({ PAGR_CLAUDE_SEALED: '0' })).toBe(false);
+    expect(sealedModeEnabled({ PAGR_CLAUDE_SEALED: '1' })).toBe(true);
+  });
+
+  it('lets the operator name setting sources explicitly, sealed or not', () => {
+    expect(argvFor(false, 'user')[argvFor(false, 'user').indexOf('--setting-sources') + 1]).toBe(
+      'user',
+    );
+    // An explicit list wins over sealed mode's default list, but not over its MCP rule.
+    const argv = argvFor(false, 'user', true);
     expect(argv[argv.indexOf('--setting-sources') + 1]).toBe('user');
+    expect(argv).toContain('--strict-mcp-config');
   });
 
   it('a read-only session has no tool that can write, Bash included (SEC-6/BR-9)', () => {

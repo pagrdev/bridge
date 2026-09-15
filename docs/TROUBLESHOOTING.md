@@ -92,21 +92,57 @@ The `codex app-server` process is started **only when a session needs it**, is s
 
 ## Claude approvals not reaching your phone
 
-Approvals only work for Claude Code sessions **Pagr itself started or resumed** — i.e. ones you asked for from your phone or the dashboard ("start claude on tonight"). No Claude settings file is touched and no hook is installed: the daemon spawns the `claude` binary with `--permission-prompt-tool stdio` and reads each permission request off the process's stdout as a control message, answering it on stdin once you reply (`packages/adapter-claude/src/{adapter,claude-process}.ts`). A request that gets no decision within the approval timeout (10 minutes by default) is **denied** locally, and Pagr reports it as `timed_out`.
+There are two paths, and they fail differently.
+
+**Sessions Pagr started** — the ones you asked for from your phone or the dashboard ("start claude on tonight"). The daemon spawns the `claude` binary with `--permission-prompt-tool stdio` and reads each permission request off the process's stdout as a control message, answering it on stdin once you reply (`packages/adapter-claude/src/{adapter,claude-process}.ts`). No hook is involved. A request that gets no decision within the approval timeout (10 minutes by default) is **denied** locally, and Pagr reports it as `timed_out`.
+
+**Sessions you started yourself** — see *Sessions you started yourself* below. Those go through a `PermissionRequest` hook in `~/.claude/settings.json`, and a request that gets no answer falls back to the prompt in your terminal.
 
 If a Pagr-started Claude session runs but you never see approval requests:
 
 1. `pagr status` / `pagr sessions` — the session must be listed and owned by the daemon. If it is not there, Pagr did not spawn it; see *Sessions you started yourself* below.
 2. `pagr status` — the gateway line must read `connected`. Approval requests travel over that one WebSocket; if it is down they queue on this Mac and nothing reaches your phone. See *Daemon not connecting*.
 3. `pagr daemon logs -n 100` — a spawn failure (`claude spawn error`, `claude exited`) means the session died before it could ask for anything. `claude --version` must be recent enough to support `-p --input-format stream-json --output-format stream-json --permission-prompt-tool stdio`; update with `npm i -g @anthropic-ai/claude-code`.
-4. Nothing is auto-allowed on this side, so a missing request is never "Pagr approved it for you". Tier A auto-approval, when you have enabled it, happens in the cloud and is recorded in the audit log.
+4. Nothing is auto-allowed on this side, ever. The bridge has no path by which it answers a prompt for you, so a missing request is never "Pagr approved it for you" — look at Claude Code's own permission settings (`~/.claude/settings.json`, `.claude/settings.json`, `--permission-mode`), which is where an action that needed no decision was decided.
 5. `PAGR_LOG_LEVEL=debug pagr daemon run` prints each permission request and the decision written back.
 
 ### Sessions you started yourself
 
-Answering approvals from a `claude` **you** launched in a terminal is not wired up today. The pieces exist but nothing connects them: `@pagr/bridge-adapter-claude` ships a `PermissionRequest` hook script (`src/hooks/permission.mjs`) and the daemon accepts hook-shaped approval requests (it maps the session's `cwd` onto a registered project and mints a local session for it), but `installHooks()` is never called by the bridge, and neither it nor anything else writes an entry into `~/.claude/settings.json` or a project's `.claude/settings.local.json` — `installHooks()` only copies the script, and `hookSettings()` only returns a JSON fragment. Until that is wired up, your own interactive sessions keep using Claude Code's native prompt.
+`pagr connect` and `pagr daemon install` register a Claude Code `PermissionRequest` hook in
+`~/.claude/settings.json`. That is **user scope**, so it applies to every Claude Code session you
+start — terminal, IDE extension, desktop app — and it fires **only when Claude Code actually needs
+a permission decision**. Anything your own settings auto-approve never reaches Pagr at all, which
+is the point: Pagr does not add a second layer of approval on top of the one you already
+configured. It notices that Claude asked, texts you, and carries your answer back.
 
-(The one command that does write into a project is `pagr claude channel-setup`, which adds a `pagr` entry to `.mcp.json` for the research-preview channel mode. It is opt-in, unrelated to permission hooks, and not needed for normal use.)
+Check it with `pagr doctor` (the `claude hook` line) or `pagr claude hook-status`.
+
+If a prompt from your own `claude` does not reach your phone:
+
+1. **The hook is not installed.** `pagr claude hook-install`, or `pagr daemon install`.
+2. **You already have a `PermissionRequest` hook of your own.** Pagr refuses to install beside it:
+   Claude Code runs all matching hooks in parallel and documents no winner between two decisions,
+   so two of them would race. `pagr claude hook-install --force` adds Pagr's anyway.
+3. **The directory is in no registered project.** Pagr has no project id to route the prompt to,
+   so it stays in your terminal. `pagr sessions` lists the session and names the directory;
+   `pagr projects add <dir>` fixes it.
+4. **You have not accepted the workspace-trust dialog for that folder.** Claude Code holds back
+   hooks from every settings file, including your own `~/.claude/settings.json`, until you do.
+5. **The daemon is down, or your phone never answers.** Then nothing happens, on purpose: the hook
+   prints nothing, which Claude Code reads as "no decision", and the prompt in your terminal
+   behaves exactly as it would with Pagr uninstalled. It never auto-allows and never auto-denies.
+
+What Pagr can do with a session it did not start is narrower than one it started: approvals only.
+No instructions, no stop, no resume — that terminal owns the session. `pagr sessions` marks them
+under `STARTED BY`.
+
+Removing it: `pagr logout` and `pagr uninstall` take the entry back out, as does
+`pagr claude hook-remove`. Only Pagr's own entry is touched; a copy of the file as it was is left
+next to it as `settings.json.pagr.bak`.
+
+(The other command that writes into a project is `pagr claude channel-setup`, which adds a `pagr`
+entry to `.mcp.json` for the research-preview channel mode. It is opt-in, unrelated to permission
+hooks, and not needed for normal use.)
 
 Note that Claude Code cannot be steered mid-turn: instructions sent while a turn is active are queued and delivered when it ends (`queued_followup` → `followup_delivered` in `pagr sessions`).
 

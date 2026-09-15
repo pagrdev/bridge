@@ -3,7 +3,7 @@ import type { CodingAgentAdapter } from './adapters/types.js';
 import { isLiveStatus } from './concurrency.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
-import type { SessionRecord, SessionStore } from './sessions.js';
+import { isAdopted, type SessionRecord, type SessionStore } from './sessions.js';
 
 /**
  * Startup reconciliation.
@@ -21,6 +21,9 @@ import type { SessionRecord, SessionStore } from './sessions.js';
  *  - the adapter has never heard of it → the session is **terminated** (`stopped`).
  *  - the adapter throws → we could not verify it, so it is reported `failed` rather than left
  *    claiming to work.
+ *
+ * Adopted sessions are skipped entirely: the bridge did not spawn them, so nothing about them
+ * died with the daemon and no adapter can speak for them.
  */
 
 export type ReconcileOutcome = 'resumable' | 'terminated' | 'failed';
@@ -51,6 +54,10 @@ export async function reconcileSessions(o: ReconcileOptions): Promise<Reconciled
 
   for (const rec of o.sessions.list()) {
     if (!isLiveStatus(rec.status)) continue;
+    // An adopted session is somebody's own terminal. It outlived the daemon restart, the adapter
+    // never spawned it and has never heard of it, and "the adapter does not know it" is the test
+    // this pass uses for "terminated" — so asking about one only produces a wrong answer.
+    if (isAdopted(rec)) continue;
     const adapter = o.adapters.get(rec.provider);
     if (!adapter) {
       changed.push(record(o, rec, 'terminated', REASONS.no_adapter));

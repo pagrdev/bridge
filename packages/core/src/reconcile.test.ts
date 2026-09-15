@@ -28,6 +28,33 @@ const adapters = (...a: CodingAgentAdapter[]) =>
   new Map<Provider, CodingAgentAdapter>(a.map((x) => [x.provider, x]));
 
 describe('reconcileSessions', () => {
+  /**
+   * Reconciliation exists because the `claude` children and the `codex app-server` die with the
+   * daemon. An adopted session's process does not: it is somebody's own terminal, which outlives
+   * a `launchctl kickstart` and knows nothing about it. Asking the adapter about one gets "never
+   * heard of it" — the adapter only knows what it spawned — and marking it `stopped` on that
+   * basis tells the person their live session is dead.
+   */
+  it('does not report a live adopted session as stopped just because no adapter spawned it', async () => {
+    const sessions = new SessionStore();
+    sessions.upsert({
+      sessionId: 'ses_theirs',
+      provider: 'claude',
+      projectId: 'proj_a',
+      providerSessionId: 'their-claude-session',
+      status: 'waiting_for_approval',
+      adopted: true,
+      cwd: '/Users/jane/repo',
+      startedAt: at,
+      updatedAt: at,
+    });
+    const fake = new FakeAdapter('claude');
+    const changed = await reconcileSessions({ sessions, adapters: adapters(fake) });
+    expect(changed).toEqual([]);
+    expect(sessions.get('ses_theirs')?.status).toBe('waiting_for_approval');
+    expect(fake.calls.map((c) => c.method)).not.toContain('getStatus');
+  });
+
   it('leaves terminal sessions alone', async () => {
     const sessions = store({ sessionId: 'ses_done', status: 'completed' });
     const changed = await reconcileSessions({ sessions, adapters: adapters(new FakeAdapter()) });

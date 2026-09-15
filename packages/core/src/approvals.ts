@@ -6,10 +6,14 @@ import { newApprovalId } from './events.js';
 export type ApprovalDecision = 'allow' | 'deny';
 export type ApprovalResolution = 'allowed' | 'denied' | 'timed_out' | 'canceled';
 /**
- * Who ended the approval: the cloud's decision, this device deciding on its own (tier-A
- * auto-approval or a device-floor refusal), the local timer, the provider itself, or shutdown.
+ * Who ended the approval: the cloud's decision (which is the person answering on their phone),
+ * the local timer, the provider itself (they answered in the terminal), or shutdown.
+ *
+ * There is deliberately no "the bridge decided" source. A device-floor refusal is not one either:
+ * it turns a cloud `allow` into a `deny` on the `cloud` path, because the floor never decides
+ * what to ask — it only refuses to carry one particular answer.
  */
-export type ApprovalSource = 'cloud' | 'device' | 'timeout' | 'provider' | 'shutdown';
+export type ApprovalSource = 'cloud' | 'timeout' | 'provider' | 'shutdown';
 
 export interface PendingApprovalInput {
   approvalId?: string;
@@ -65,6 +69,10 @@ export type ApprovalRespondError =
  * Single-use registry of pending provider approvals. Each entry is bound to the session,
  * provider request id and a hash of the exact preview the user was shown. Times out
  * locally (→ `timed_out`, provider told `deny`).
+ *
+ * Note what this class cannot do: there is no method by which the bridge answers a pending
+ * approval itself. An entry is consumed by `respond` (the person, via the cloud), by the timeout,
+ * by the provider resolving it in the terminal, or by shutdown — never by a local judgement.
  */
 export class PendingApprovalRegistry {
   private readonly pending = new Map<
@@ -161,16 +169,6 @@ export class PendingApprovalRegistry {
       'cloud',
     );
     return { ok: true };
-  }
-
-  /**
-   * This device decided by itself: tier-A auto-approval. Returns false when the entry is already
-   * gone, so a race with a cloud decision can never answer the same prompt twice.
-   */
-  async decideLocally(approvalId: string, decision: ApprovalDecision): Promise<boolean> {
-    if (!this.pending.has(approvalId)) return false;
-    await this.finish(approvalId, decision === 'allow' ? 'allowed' : 'denied', decision, 'device');
-    return true;
   }
 
   /** Provider resolved it on its own (user answered in the terminal, turn interrupted…). */

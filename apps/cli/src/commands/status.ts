@@ -57,6 +57,9 @@ export async function runStatus(ctx: CliContext): Promise<void> {
     agents,
     projects,
     sessions: status?.sessions ?? null,
+    // Older daemons do not report these; `null` says "not known", never "none".
+    adoptedSessions: status?.adoptedSessions ?? null,
+    unregisteredSessions: status?.unregisteredSessions ?? null,
     pendingApprovals: status?.pendingApprovals ?? null,
   };
   if (ctx.json) {
@@ -90,11 +93,24 @@ export async function runStatus(ctx: CliContext): Promise<void> {
       [
         'sessions',
         status
-          ? `${status.sessions} ${dim(`(${status.pendingApprovals} pending approvals)`)}`
+          ? `${status.sessions} ${dim(
+              [
+                `${status.pendingApprovals} pending approvals`,
+                ...(data.adoptedSessions === null
+                  ? []
+                  : [`${data.adoptedSessions} your own, not started by Pagr`]),
+              ].join(', '),
+            )}`
           : '—',
       ],
     ]),
   );
+  if (data.unregisteredSessions !== null && data.unregisteredSessions > 0)
+    ctx.out(
+      warn(
+        `${data.unregisteredSessions} of your own session(s) run outside every registered project, so their prompts stay in the terminal — see \`pagr sessions\``,
+      ),
+    );
   ctx.out('');
   ctx.out(bold('Agents'));
   ctx.out(

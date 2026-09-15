@@ -1,6 +1,7 @@
 import { existsSync, rmSync } from 'node:fs';
 import { deleteIdentity, readConfig, uninstallLaunchAgent } from '@pagr/bridge-core';
 import type { Command } from 'commander';
+import { removeHookForUser } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, socketPath } from '../ipc.js';
@@ -13,6 +14,8 @@ export interface LogoutResult {
   storeKind: string;
   removed: string[];
   revokeUrl: string | null;
+  /** Hook entries taken back out of `~/.claude/settings.json`. */
+  claudeHookRemoved: string[];
 }
 
 /**
@@ -31,6 +34,11 @@ export async function runLogout(
   });
   const store = await ctx.secretStore();
   await deleteIdentity(store);
+  // Their Claude Code settings are not ours to leave edited. Only our own entry goes; a
+  // PermissionRequest hook they wrote themselves, and every other key, stays exactly as it is.
+  const hook = removeHookForUser(ctx, (l) => {
+    if (report && !ctx.json) ctx.out(l);
+  });
   const removed: string[] = [];
   const files = [ctx.paths.configFile, ctx.paths.sessionsFile, ctx.paths.replayFile];
   if (opts.purge) files.push(ctx.paths.projectsFile, ctx.paths.policyFile);
@@ -51,6 +59,7 @@ export async function runLogout(
     removed,
     // A courtesy link, not the job: a Mac that was never pointed at a deployment still logs out.
     revokeUrl: revokeBase && config.deviceId ? `${revokeBase}/app/devices` : null,
+    claudeHookRemoved: hook.removed,
   };
   if (!report) return result;
   if (ctx.json) {
@@ -61,6 +70,11 @@ export async function runLogout(
     ok(removedAgent ? 'daemon stopped and launch agent removed' : 'no launch agent to remove'),
   );
   ctx.out(ok(`device private key deleted from ${store.kind}`));
+  ctx.out(
+    hook.removed.length > 0
+      ? ok(`Pagr's Claude Code hook removed from ${hook.settingsPath}`)
+      : dim('no Pagr hook was in your Claude Code settings'),
+  );
   ctx.out(
     ok(
       opts.purge

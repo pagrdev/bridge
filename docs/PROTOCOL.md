@@ -91,7 +91,12 @@ Implementation: `packages/core/src/transport.ts`.
 | `agent.stop_session` | `{ sessionId }` | `{ sessionId }` |
 | `agent.get_status` | `{ sessionId? }` | `{ sessions: SessionSummary[] }` |
 | `agent.respond_to_approval` | `{ approvalId, sessionId, providerRequestId, previewHash, decision: allow\|deny }` | `{ approvalId, decision }` |
-| `settings.sync_public_policy` | `{ smartApprovalsTierA, approvalTimeoutSeconds }` | the stored policy |
+| `settings.sync_public_policy` | `{ approvalTimeoutSeconds }` | the stored policy |
+
+`settings.sync_public_policy` once also carried `smartApprovalsTierA`, which let the bridge answer
+"obviously safe" prompts itself. The bridge no longer decides approvals at all, so the field was
+removed. A cloud that still sends it is **not** rejected — unknown keys are dropped by the payload
+schema — it simply has no effect.
 
 `sessionId` for `agent.start_session` is pre-allocated by the cloud so both sides share one id.
 `mode: auto` resolves to `steer` when the adapter reports `canSteerActiveTurn` **and** the session has an

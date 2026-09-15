@@ -119,25 +119,20 @@ describe('classifyLocally', () => {
     expect(a.risks).toContain('remote_code');
   });
 
-  it('marks only zero-risk, non-shell actions tier A', () => {
-    expect(
-      classifyLocally({
-        actionType: 'file_change',
-        preview: 'Write src/a.ts',
-        hints: {},
-        detail: { toolName: 'Write', paths: ['/p/src/a.ts'], projectPath: '/p' },
-      }).tierA,
-    ).toBe(true);
-    // A shell line always waits for a person, however harmless it looks.
-    expect(shell('ls -la').tierA).toBe(false);
-    expect(
-      classifyLocally({
-        actionType: 'file_change',
-        preview: 'Write ../x',
-        hints: {},
-        detail: { toolName: 'Write', paths: ['/elsewhere/x'], projectPath: '/p' },
-      }).tierA,
-    ).toBe(false);
+  it('classifies without ever producing a verdict of its own', () => {
+    // The assessment is risk classes and hosts, and nothing else. It used to carry a `tierA`
+    // flag that marked an action safe enough for the bridge to approve by itself; there is no
+    // such flag any more, because there is no such decision any more.
+    const a = classifyLocally({
+      actionType: 'file_change',
+      preview: 'Write src/a.ts',
+      hints: {},
+      detail: { toolName: 'Write', paths: ['/p/src/a.ts'], projectPath: '/p' },
+    });
+    expect(Object.keys(a).sort()).toEqual(['hosts', 'risks']);
+    expect(a.risks).toEqual([]);
+    // A harmless shell line is still only "no risk classes" — never "go ahead".
+    expect(Object.keys(shell('ls -la')).sort()).toEqual(['hosts', 'risks']);
   });
 });
 
@@ -148,7 +143,6 @@ describe('readDevicePolicy', () => {
     const p = readDevicePolicy(undefined, {});
     expect(p.allow).toEqual([]);
     expect(p.allowedHosts).toEqual([]);
-    expect(p.tierAAutoApprove).toBe(true);
     expect(new DeviceFloor(p).lifted).toEqual([]);
   });
 
@@ -217,4 +211,4 @@ describe('DeviceFloor.check', () => {
   });
 });
 
-const base = { version: 1 as const, allow: [], allowedHosts: [], tierAAutoApprove: true };
+const base = { version: 1 as const, allow: [], allowedHosts: [] };
