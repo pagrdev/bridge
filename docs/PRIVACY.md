@@ -42,7 +42,7 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 | `policy.json` | the public approval policy synced from your dashboard settings. |
 | `device-policy.json` | your local approval floor. Written only by you; no command can change it, and it is never sent anywhere. See `docs/SECURITY.md`. |
 | `logs/daemon.log` | local JSON log. Home directory is rewritten to `~`. Never uploaded. |
-| `tmp/att_*.{png,jpg,heic,webp}` | downloaded screenshots (0600), deleted as soon as the agent has consumed them; anything older than 24 h is swept on start. |
+| `tmp/att_*.{png,jpg,heic,webp}` | downloaded screenshots (0600), held for the agent turn that referenced them and deleted when that turn ends, whether it finished, failed or was stopped; a 1 h sweep is the backstop, and everything goes on daemon shutdown. |
 | `run/daemon.sock` | Unix socket (0600) for the CLI and Claude hooks. Not reachable over the network. |
 | Keychain `dev.pagr.bridge / device.private_key` | Ed25519 private key. Never transmitted. |
 
