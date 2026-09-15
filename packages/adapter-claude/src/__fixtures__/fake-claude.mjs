@@ -28,25 +28,34 @@ if (argv[0] === 'auth' && argv[1] === 'status') {
   process.exit(loggedIn ? 0 : 1);
 }
 
-const flag = (name) => {
+const flagValue = (name) => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
 };
-const sessionId = flag('--session-id') ?? flag('--resume') ?? 'fake-session';
+const sessionId = flagValue('--session-id') ?? flagValue('--resume') ?? 'fake-session';
 const resumed = argv.includes('--resume');
 const out = (o) => process.stdout.write(`${JSON.stringify({ ...o, session_id: sessionId })}\n`);
-// Assert the flags the adapter must pass.
+// Assert the flags the adapter must pass. `--setting-sources` and `--strict-mcp-config` are load
+// bearing: without them `claude -p` reads the cloned repo's own .claude/settings.json and
+// .mcp.json, which can auto-allow tools so no approval is ever raised (SEC-3).
 for (const req of [
   '-p',
   '--input-format',
   '--output-format',
   '--permission-prompt-tool',
   '--permission-mode',
+  '--setting-sources',
+  '--strict-mcp-config',
 ]) {
   if (!argv.includes(req)) {
     process.stderr.write(`fake-claude: missing required flag ${req}\n`);
     process.exit(2);
   }
+}
+const settingSources = (flagValue('--setting-sources') ?? '').split(',').map((s) => s.trim());
+if (settingSources.includes('project')) {
+  process.stderr.write('fake-claude: --setting-sources must not include "project"\n');
+  process.exit(2);
 }
 if (process.env.FAKE_CLAUDE_ARGS_FILE) {
   const fs = await import('node:fs');

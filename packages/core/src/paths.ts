@@ -18,6 +18,8 @@ import { isAbsolute, join } from 'node:path';
  *   projects.json   local project registry (the ONLY place local paths live)
  *   sessions.json   sessionId → provider session mapping
  *   replay.json     best-effort persisted nonce cache
+ *   policy.json     public policy synced from the cloud (approval timeout, tier-A flag)
+ *   device-policy.json  LOCAL approval floor — only you can write it, the cloud never can
  *   run/daemon.lock pid of the running daemon (O_EXCL; single-instance guard)
  *   run/daemon.sock local IPC socket (0600). If that path would exceed the 104-byte
  *                   `sun_path` limit (long PAGR_HOME), the socket lives in a short per-user
@@ -32,6 +34,8 @@ export interface PagrPaths {
   sessionsFile: string;
   replayFile: string;
   policyFile: string;
+  /** Local approval floor, owned by the user. No command can write it (see `deviceFloor.ts`). */
+  devicePolicyFile: string;
   runDir: string;
   /** Single-instance lock holding the daemon pid. */
   lockFile: string;
@@ -157,6 +161,7 @@ export function getPaths(home: string = resolvePagrHome()): PagrPaths {
     sessionsFile: join(home, 'sessions.json'),
     replayFile: join(home, 'replay.json'),
     policyFile: join(home, 'policy.json'),
+    devicePolicyFile: join(home, 'device-policy.json'),
     runDir: join(home, 'run'),
     lockFile: join(home, 'run', 'daemon.lock'),
     socketPath: chooseSocketPath(home),
@@ -280,6 +285,7 @@ export function auditPermissions(paths: PagrPaths): PermissionIssue[] {
     paths.sessionsFile,
     paths.replayFile,
     paths.policyFile,
+    paths.devicePolicyFile,
     paths.socketPathFile,
     join(paths.home, 'secrets.json'),
   ])

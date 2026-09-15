@@ -8,6 +8,7 @@ import { CommandTracker, verifyIncoming } from './commandGuard.js';
 import { SessionGuard } from './concurrency.js';
 import { type BridgeConfig, readConfig, updateConfig } from './config.js';
 import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
+import type { LocalActionDetail } from './deviceFloor.js';
 import { Dispatcher } from './dispatcher.js';
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, loadOrCreateIdentity } from './identity.js';
@@ -192,11 +193,17 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     tmpDir: paths.tmpDir,
     bridgeVersion,
     policyFile: paths.policyFile,
+    devicePolicyFile: paths.devicePolicyFile,
+    env: o.env ?? process.env,
     now,
     logger: logger.child({ mod: 'dispatcher' }),
     guard: SessionGuard.fromEnv(o.env ?? process.env),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
+  if (dispatcher.floor.lifted.length > 0)
+    logger.warn('device approval floor partially lifted by local policy', {
+      lifted: dispatcher.floor.lifted.join(','),
+    });
 
   const handleEnvelope = async (envelope: unknown): Promise<DeviceEvent> => {
     const deviceId = identity.deviceId;
@@ -412,6 +419,10 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         actionType: p.actionType,
         preview: p.preview,
         ...(p.hints ? { hints: p.hints } : {}),
+        // The hook sends a project-relative preview and its cwd; that plus the registered project
+        // root is what the device floor gets to classify on this path. It is less than the
+        // bridge-spawned path has (no raw argv), which is why the hook also computes hints.
+        local: localDetail(projectId, p.cwd ?? undefined),
         ...(p.timeoutMs
           ? { expiresAt: new Date(now().getTime() + p.timeoutMs).toISOString() }
           : {}),
@@ -440,8 +451,27 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     };
   }
   const interactive = (rec: SessionRecord) => summaryOf(rec, 'Interactive session');
+  /**
+   * Local helpers (the Claude hook, the channel server) push progress for sessions the daemon is
+   * already tracking. The socket is uid-checked, so this is a same-user boundary, not a trust
+   * boundary — but shape validation alone let any process running as you fabricate events on the
+   * user's phone about sessions that do not exist. An event must name a session this daemon owns,
+   * and must agree with that record about which provider and project it belongs to.
+   */
   ipc.registerMethod('agent.event', (params) => {
     const p = AgentEventParams.parse(params);
+    const rec = sessions.get(p.sessionId);
+    if (!rec) throw new IpcMethodError('unknown_session', p.sessionId);
+    if (rec.provider !== p.provider)
+      throw new IpcMethodError(
+        'invalid_params',
+        `session ${p.sessionId} is not a ${p.provider} session`,
+      );
+    if (rec.projectId !== p.projectId)
+      throw new IpcMethodError(
+        'invalid_params',
+        `session ${p.sessionId} belongs to another project`,
+      );
     emit(
       makeEvent(
         dispatcherDeviceId(),
@@ -463,6 +493,17 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
 
   function dispatcherDeviceId(): string {
     return identity.deviceId ?? `dev_${'0'.repeat(32)}`;
+  }
+
+  /** What the device floor gets to judge a hook-relayed approval on. Never leaves this Mac. */
+  function localDetail(projectId: string, cwd?: string): LocalActionDetail {
+    let projectPath: string | undefined;
+    try {
+      projectPath = registry.resolve(projectId).path;
+    } catch {
+      projectPath = undefined; // unregistered between the lookup above and here
+    }
+    return { ...(cwd ? { cwd } : {}), ...(projectPath ? { projectPath } : {}) };
   }
 
   // --- Claude Code Channel (ADR 0001 `approved-channel`, research preview) -------------------

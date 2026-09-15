@@ -676,8 +676,9 @@ describe('Dispatcher', () => {
       projectId,
       providerRequestId: 'req-1',
       actionType: 'command_execution',
-      preview: 'rm -rf build',
-      hints: { destructive: true },
+      preview: 'npm test',
+      hints: {},
+      local: { toolName: 'shell', command: 'npm test', projectPath: join(t.home, 'home', 'repo') },
       expiresAt: new Date(now.getTime() + 3600_000).toISOString(),
     });
     await vi.waitFor(() => expect(ofType('approval.requested')).toHaveLength(1));
@@ -686,8 +687,8 @@ describe('Dispatcher', () => {
       hints: Record<string, boolean>;
       expiresAt: string;
     };
-    expect(req.previewHash).toBe(sha256Hex('rm -rf build'));
-    expect(req.hints).toMatchObject({ destructive: true, gitPush: false });
+    expect(req.previewHash).toBe(sha256Hex('npm test'));
+    expect(req.hints).toMatchObject({ destructive: false, gitPush: false });
     expect(req.expiresAt).toBe(new Date(now.getTime() + 600_000).toISOString()); // policy default 600 s wins
     // wrong hash rejected
     const bad = await d.handle(
@@ -751,12 +752,13 @@ describe('Dispatcher', () => {
       projectId,
       providerRequestId: 'req-1',
       actionType: 'command_execution',
-      preview: 'rm -rf build',
+      preview: 'npm test',
       hints: {},
+      local: { toolName: 'shell', command: 'npm test', projectPath: join(t.home, 'home', 'repo') },
       expiresAt: new Date(now.getTime() + 3600_000).toISOString(),
     });
     await vi.waitFor(() => expect(ofType('approval.requested')).toHaveLength(1));
-    return sha256Hex('rm -rf build');
+    return sha256Hex('npm test');
   };
 
   it('answering an unknown or expired approval reports unknown_approval, not unknown_session', async () => {

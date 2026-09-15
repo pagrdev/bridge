@@ -8,13 +8,16 @@ This repository is the open-source half of Pagr: the daemon and CLI that run on 
 
 - A user-level macOS daemon (`pagr daemon`) that opens **one outbound TLS WebSocket** to Pagr's gateway. No inbound ports.
 - A device identity: an **Ed25519 keypair generated locally**, private key in **macOS Keychain**, public key registered with your account during pairing.
-- Typed adapters for **Codex** (local `codex app-server` over stdio) and **Claude Code** (the unmodified `claude` CLI plus a narrowly scoped permission hook). Your provider credentials never leave your Mac; the bridge does not read them.
+- Typed adapters for **Codex** (local `codex app-server` over stdio) and **Claude Code** (the unmodified `claude` CLI). Sessions the bridge starts relay their permission prompts over Claude Code's own stdio permission protocol; the `PermissionRequest` hook script that ships in that package is for answering prompts from **your own** interactive `claude` from your phone, is not wired up yet (see `docs/TROUBLESHOOTING.md`), and is never used by a session the bridge starts. Your provider credentials never leave your Mac; the bridge does not read them.
 - A local **project registry** mapping opaque `proj_…` IDs to folders you explicitly added. The cloud only ever sees the ID and a display name.
 - A **command guard** that rejects anything that isn't a schema-valid, server-signed, unexpired, non-replayed command bound to this device.
+- A **device-side approval floor**: every permission prompt is classified on your Mac, and a decision from the cloud is refused for remote scripts, network egress, paths outside the project, credential files, privilege escalation and destructive or history-rewriting git — unless *you* lift that class in `~/.pagr/device-policy.json` or `PAGR_DEVICE_FLOOR`. No command can lift it. `pagr doctor` shows what is in force.
 
 ## What the bridge is not
 
-There is no `shell.exec`, no arbitrary file read/write, no process spawn command. The complete list of commands the cloud can send is in [`packages/protocol/src/schemas.ts`](packages/protocol/src/schemas.ts) — it is short on purpose. See [`docs/SECURITY.md`](docs/SECURITY.md), [`docs/PRIVACY.md`](docs/PRIVACY.md), and [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+There is no `shell.exec`, no arbitrary file read/write, no process spawn command. The complete list of commands the cloud can send is in [`packages/protocol/src/schemas.ts`](packages/protocol/src/schemas.ts) — it is short on purpose.
+
+It is *not* a sandbox, and instruction text is a real capability: the cloud can ask an agent to try anything, and the agent runs as you. What the device floor guarantees is that the cloud cannot approve the dangerous half of that by itself. [`docs/SECURITY.md`](docs/SECURITY.md) states exactly what is and is not covered; see also [`docs/PRIVACY.md`](docs/PRIVACY.md) and [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Install
 
@@ -41,8 +44,9 @@ than races:
 - **One writer per working tree.** Codex (`workspace-write`) and Claude Code both edit files in
   place with no locking, so a second write-capable session in a checkout another session already
   holds is refused with an explanation naming the session that holds it. Read-only sessions may
-  share a tree, and a separate `git worktree` is a separate tree. Set
-  `PAGR_ALLOW_CONCURRENT_WRITERS=1` on the daemon to override.
+  share a tree — and really are read-only: Codex uses its own `read-only` sandbox, and Claude Code,
+  which has no sandbox, is started with `Bash` and every edit tool withheld. A separate
+  `git worktree` is a separate tree. Set `PAGR_ALLOW_CONCURRENT_WRITERS=1` on the daemon to override.
 - **A bounded pool.** At most 4 live sessions per provider and 8 in total
   (`PAGR_MAX_SESSIONS_PER_PROVIDER`, `PAGR_MAX_SESSIONS`), and at most 6 live `claude` children.
   Past the limit you get a clear refusal, not a Mac that swaps.

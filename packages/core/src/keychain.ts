@@ -170,10 +170,14 @@ export class KeyringSecretStore implements SecretStore {
 
 // ---------- /usr/bin/security fallback ----------
 
-export type ExecFn = (file: string, args: string[]) => string;
+export type ExecFn = (file: string, args: string[], opts?: { input?: string }) => string;
 
-const defaultExec: ExecFn = (file, args) =>
-  execFileSync(file, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+const defaultExec: ExecFn = (file, args, opts) =>
+  execFileSync(file, args, {
+    encoding: 'utf8',
+    stdio: [opts?.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    ...(opts?.input === undefined ? {} : { input: opts.input }),
+  });
 
 /**
  * `security find-generic-password` exits 44 for a genuine miss. Every other non-zero exit
@@ -224,18 +228,16 @@ export class SecurityCliSecretStore implements SecretStore {
     }
   }
   async set(key: string, value: string): Promise<void> {
-    // -U updates in place if present. Value passed as an argv element, never via a shell.
+    // `-w` with NO value makes `security` read the password from stdin (it prompts, then asks for
+    // a retype, so the value is sent twice). Passing it as an argv element instead would put the
+    // device private key in this process's command line, where `ps` shows it to every other user
+    // on the machine for as long as the call runs. -U updates in place if the item exists.
     try {
-      this.exec(SecurityCliSecretStore.BIN, [
-        'add-generic-password',
-        '-U',
-        '-s',
-        this.service,
-        '-a',
-        key,
-        '-w',
-        value,
-      ]);
+      this.exec(
+        SecurityCliSecretStore.BIN,
+        ['add-generic-password', '-U', '-s', this.service, '-a', key, '-w'],
+        { input: `${value}\n${value}\n` },
+      );
     } catch (err) {
       const raw = `${String((err as { stderr?: unknown }).stderr ?? '')} ${describe(err)}`.trim();
       const classified = classifyKeychainError(raw);

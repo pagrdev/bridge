@@ -40,6 +40,7 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 | `sessions.json` | session id → provider session id mapping. |
 | `replay.json` | recently seen command nonces (anti-replay). |
 | `policy.json` | the public approval policy synced from your dashboard settings. |
+| `device-policy.json` | your local approval floor. Written only by you; no command can change it, and it is never sent anywhere. See `docs/SECURITY.md`. |
 | `logs/daemon.log` | local JSON log. Home directory is rewritten to `~`. Never uploaded. |
 | `tmp/att_*.{png,jpg,heic,webp}` | downloaded screenshots (0600), deleted as soon as the agent has consumed them; anything older than 24 h is swept on start. |
 | `run/daemon.sock` | Unix socket (0600) for the CLI and Claude hooks. Not reachable over the network. |

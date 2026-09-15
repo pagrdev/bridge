@@ -16,8 +16,41 @@ export interface ClaudeProcessOptions {
   /** New session: `--session-id`; resumed: `--resume`. */
   session: { kind: 'new'; id: string } | { kind: 'resume'; id: string };
   readOnly: boolean;
+  /** Overrides `DEFAULT_SETTING_SOURCES`; see `PAGR_CLAUDE_SETTING_SOURCES`. */
+  settingSources?: string;
   logger: FileLogger;
 }
+
+/**
+ * Setting sources a bridge-spawned session loads (`--setting-sources`).
+ *
+ * `project` is deliberately absent. `claude -p` otherwise reads the *repository's own*
+ * `.claude/settings.json`, so a repo you cloned could ship `permissions.allow: ["Bash(*)"]`, or a
+ * PreToolUse hook that returns `allow`, and no permission prompt would ever be raised — the phone
+ * would never be asked, and the device floor would never see the action.
+ *
+ * `local` (`.claude/settings.local.json`) is kept because it is where a user puts their own
+ * per-checkout settings, and it is gitignored by convention. It still lives inside the project
+ * directory, so a repo that commits one anyway can grant itself permissions: set
+ * `PAGR_CLAUDE_SETTING_SOURCES=user` on the daemon to drop it too. See docs/SECURITY.md.
+ */
+export const DEFAULT_SETTING_SOURCES = 'user,local';
+
+/**
+ * Tools a read-only session may not use.
+ *
+ * `Bash` is the one that matters. Without it in this list a "read-only" session could still
+ * `sed -i`, `tee`, `> file` or `git checkout` its way to a write — while `concurrency.ts` recorded
+ * it as `writeCapable: false` and happily let a second write-capable session into the same
+ * checkout, which is the race the one-writer guard exists to prevent. `Task`/`Agent` go too,
+ * because a subagent is a fresh tool budget; `BashOutput`/`KillShell` are Bash's companions.
+ *
+ * `MultiEdit` is not a tool name Claude Code 2.1.220 knows (it warns, harmlessly, on stderr) but
+ * is kept for older installs where it is one: a stale deny entry costs nothing, a missing one
+ * costs a write.
+ */
+export const READ_ONLY_DISALLOWED_TOOLS =
+  'Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,Task,Agent';
 
 export interface ClaudeProcessEvents {
   event: [StreamEvent];
@@ -28,11 +61,18 @@ export interface ClaudeProcessEvents {
  * One long-lived `claude -p` child per session, driven over stdin/stdout with
  * `--input-format stream-json --output-format stream-json --permission-prompt-tool stdio`.
  *
- * Flags verified 2026-08-24 against Claude Code 2.1.220 (`claude --help`, /docs/en/cli-reference):
- *   -p/--print, --input-format stream-json, --output-format stream-json, --verbose,
- *   --session-id <uuid>, --resume <id>, --permission-mode default, --permission-prompt-tool stdio,
- *   --disallowedTools. The process keeps running after each `result` until stdin is closed, so
- *   follow-up user messages reuse the same process (no re-spawn needed while it is alive).
+ * Flags re-verified 2026-09-14 against Claude Code 2.1.220 (`claude --help`, plus running each
+ * one): -p/--print, --input-format stream-json, --output-format stream-json, --verbose,
+ * --session-id <uuid>, --resume <id>, --permission-mode default, --permission-prompt-tool stdio,
+ * --disallowedTools, --setting-sources <user,project,local>, --strict-mcp-config.
+ *
+ * Two of these are not in `--help` on 2.1.220 and were confirmed by invocation instead:
+ * `--permission-prompt-tool` is undocumented but accepted, and `--permission-mode default` is
+ * accepted even though `--help` lists only acceptEdits/auto/bypassPermissions/manual/dontAsk/plan
+ * (an unrecognised value is a hard argument error, so this is a real, still-supported alias).
+ *
+ * The process keeps running after each `result` until stdin is closed, so follow-up user messages
+ * reuse the same process (no re-spawn needed while it is alive).
  */
 export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
   private child: ChildProcess | null = null;
@@ -66,10 +106,18 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       'default',
       '--permission-prompt-tool',
       'stdio',
+      // The project's own `.claude/settings.json` must not be able to grant permissions to a
+      // session the cloud started (see DEFAULT_SETTING_SOURCES).
+      '--setting-sources',
+      this.opts.settingSources ?? DEFAULT_SETTING_SOURCES,
+      // …and the project's `.mcp.json` must not be able to add tools to it either. With no
+      // `--mcp-config`, this leaves a bridge-spawned session with no MCP servers at all.
+      '--strict-mcp-config',
     ];
     if (this.opts.session.kind === 'new') args.push('--session-id', this.opts.session.id);
     else args.push('--resume', this.opts.session.id);
-    if (this.opts.readOnly) args.push('--disallowedTools', 'Edit,Write,MultiEdit,NotebookEdit');
+    // `--disallowedTools` is variadic, so it stays last: anything after it would be swallowed.
+    if (this.opts.readOnly) args.push('--disallowedTools', READ_ONLY_DISALLOWED_TOOLS);
 
     const child = spawn(bin, args, {
       cwd: this.opts.cwd,

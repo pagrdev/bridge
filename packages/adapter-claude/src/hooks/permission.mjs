@@ -59,6 +59,53 @@ function readStdin() {
 
 const str = (v) => (typeof v === 'string' ? v : undefined);
 
+/**
+ * Resolve symlinks for containment checks, falling back to the nearest existing ancestor for a
+ * path that does not exist yet. On macOS `/tmp` IS `/private/tmp` and `/var` IS `/private/var`, so
+ * without this the hook called `/tmp/x` and `/private/tmp/x` two different places and reported a
+ * file inside the project as "outside the project".
+ *
+ * Deliberately duplicated from `@pagr/bridge-core`'s heuristics: this file is copied standalone to
+ * `~/.pagr/hooks/permission.mjs` and runs inside the user's own `claude`, with no node_modules.
+ */
+export function realpathNearest(p) {
+  let cur = path.resolve(p);
+  const tail = [];
+  while (!fs.existsSync(cur)) {
+    tail.unshift(path.basename(cur));
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  try {
+    return path.join(fs.realpathSync(cur), ...tail);
+  } catch {
+    return path.join(cur, ...tail);
+  }
+}
+
+/** True when `p` is `root` or lives under it, after resolving both sides. */
+export function isInside(p, root) {
+  const rel = path.relative(realpathNearest(root), realpathNearest(p));
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Rewrite absolute paths that live under `root` as root-relative. Absolute paths contain the
+ * user's account name (`/Users/jane/...`), and the preview is the one field of this request that
+ * is shown in the cloud, so it must not carry the local directory layout off the Mac. Paths
+ * outside the root are left alone: they are the ones worth seeing in full.
+ */
+export function relativizePaths(text, root) {
+  if (!root) return text;
+  const real = realpathNearest(root);
+  return text.replace(/(^|[\s="'(:,])(\/[^\s"'():,]+)/g, (m, lead, p) => {
+    if (!isInside(p, root)) return m;
+    const rel = path.relative(real, realpathNearest(p));
+    return `${lead}${rel === '' ? '.' : rel}`;
+  });
+}
+
 export function buildRequest(hook) {
   const toolName = str(hook.tool_name) ?? 'tool';
   const input = hook.tool_input && typeof hook.tool_input === 'object' ? hook.tool_input : {};
@@ -88,13 +135,25 @@ export function buildRequest(hook) {
   if (/\bgit\s+push\b/i.test(text)) hints.gitPush = true;
   if (/\b(npm|pnpm|yarn|pip3?|brew|cargo|gem)\s+(i|install|add)\b/i.test(text))
     hints.packageInstall = true;
-  if (/(\.env(\.|\b)|credentials|secret|token|\.pem\b|\.key\b|id_rsa|\.npmrc|\.netrc)/i.test(text))
+  // Kept in step with `SECRETS` in @pagr/bridge-core: anchored on path shapes, not on the bare
+  // words `secret`/`token`, because the device floor refuses on this hint and `src/token.ts` is an
+  // ordinary source file.
+  if (
+    /(^|[/\s"'=(])\.env(\.[\w-]+)?($|[/\s"')])|(^|\/)(\.aws|\.ssh|\.gnupg|\.npmrc|\.netrc|\.pgpass|\.authinfo|\.git-credentials|credentials|id_(rsa|dsa|ecdsa|ed25519))($|[/\s"':])|\.(pem|p12|pfx|jks|keystore)($|[/\s"':])|\bkeychain\b|\bsecurity\s+(find|add|delete|dump)-(generic|internet)-password\b|(?:^|[^A-Za-z])(access|api|secret|private|service)[_-]?(key|token|role)(?![A-Za-z])/i.test(
+      text,
+    )
+  )
     hints.secretsTouch = true;
   if (/\b(prod|production|deploy|migrate|release)\b/i.test(text)) hints.productionHint = true;
   const cwd = str(hook.cwd);
-  if (cwd && file && path.isAbsolute(file)) {
-    const rel = path.relative(cwd, file);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) hints.touchesOutsideProject = true;
+  if (cwd) {
+    const outside = [
+      ...(file && path.isAbsolute(file) ? [file] : []),
+      ...((command ?? '')
+        .match(/(?:^|\s|=|["'])(\/[^\s"']+)/g)
+        ?.map((m) => m.replace(/^[\s="']+/, '')) ?? []),
+    ].some((p) => !isInside(p, cwd));
+    if (outside) hints.touchesOutsideProject = true;
   }
 
   const providerRequestId =
@@ -109,7 +168,9 @@ export function buildRequest(hook) {
     providerRequestId: providerRequestId.slice(0, 200),
     actionType,
     toolName,
-    preview: preview.replace(/\s+/g, ' ').trim().slice(0, 1500),
+    // Paths under the session's cwd become relative before the preview leaves this Mac, the same
+    // way the bridge-spawned path does it in `@pagr/bridge-core`'s `relativizePaths`.
+    preview: relativizePaths(preview, cwd).replace(/\s+/g, ' ').trim().slice(0, 1500),
     hints,
     cwd: cwd ?? null,
   };

@@ -162,9 +162,47 @@ describe('daemon', () => {
       received.some((f) => f.kind === 'event' && f.event.type === 'project.registered'),
     );
     expect(await c.call('sessions.list')).toEqual([]);
+    // BR-20: an event must name a session this daemon owns, and agree with the record about
+    // provider and project. Anything else is a local process fabricating a phone notification.
+    const eventSession = ids.ses();
+    await expect(
+      c.call('agent.event', {
+        provider: 'claude',
+        sessionId: eventSession,
+        projectId: proj.projectId,
+        type: 'progress',
+        summary: 'hi',
+      }),
+    ).rejects.toMatchObject({ code: 'unknown_session' });
+    daemon.sessions.upsert({
+      sessionId: eventSession,
+      provider: 'claude',
+      projectId: proj.projectId,
+      providerSessionId: eventSession,
+      status: 'working',
+      startedAt: new Date().toISOString(),
+    });
+    await expect(
+      c.call('agent.event', {
+        provider: 'codex',
+        sessionId: eventSession,
+        projectId: proj.projectId,
+        type: 'progress',
+        summary: 'hi',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_params' });
+    await expect(
+      c.call('agent.event', {
+        provider: 'claude',
+        sessionId: eventSession,
+        projectId: `proj_${'b'.repeat(32)}`,
+        type: 'progress',
+        summary: 'hi',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_params' });
     await c.call('agent.event', {
       provider: 'claude',
-      sessionId: ids.ses(),
+      sessionId: eventSession,
       projectId: proj.projectId,
       type: 'progress',
       summary: 'hi',
@@ -270,8 +308,8 @@ describe('daemon', () => {
         provider: 'claude',
         providerRequestId: 'hook-2',
         actionType: 'command_execution',
-        preview: '$ git push',
-        hints: { gitPush: true },
+        preview: '$ git status',
+        hints: {},
       },
       5000,
     );

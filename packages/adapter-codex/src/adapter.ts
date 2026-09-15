@@ -5,6 +5,7 @@ import type {
   AdapterEvent,
   AgentConnectionStatus,
   CodingAgentAdapter,
+  LocalActionDetail,
   SendInstructionInput,
   SessionSummary,
   StartSessionInput,
@@ -765,6 +766,9 @@ export class CodexAdapter implements CodingAgentAdapter {
     let hints: Hints;
     let providerRequestId: string;
     let requested: PendingApproval['requested'] = null;
+    // Unredacted facts for the device floor (`@pagr/bridge-core`'s deviceFloor). Never emitted to
+    // the cloud — `preview` below is the relativized, clipped string that leaves the Mac.
+    const local: LocalActionDetail = { projectPath: live.projectPath };
     switch (r.method) {
       case SERVER_REQUESTS.commandApproval: {
         const c = params as unknown as CommandExecutionRequestApprovalParams;
@@ -773,6 +777,9 @@ export class CodexAdapter implements CodingAgentAdapter {
         preview = c.command ?? '(command)';
         if (c.reason) preview += `\n— ${c.reason}`;
         hints = hintsForCommand(c.command ?? '', c.cwd ?? undefined, live.projectPath);
+        local.toolName = 'shell';
+        if (c.command) local.command = c.command;
+        if (c.cwd) local.cwd = c.cwd;
         providerRequestId = c.approvalId ?? c.itemId;
         break;
       }
@@ -785,6 +792,8 @@ export class CodexAdapter implements CodingAgentAdapter {
           ? `Write access requested under ${f.grantRoot}`
           : `Apply file changes${f.reason ? ` — ${f.reason}` : ''}`;
         hints = hintsForFiles(files, live.projectPath);
+        local.toolName = 'apply_patch';
+        local.paths = files;
         providerRequestId = f.itemId;
         break;
       }
@@ -802,6 +811,11 @@ export class CodexAdapter implements CodingAgentAdapter {
           ...(pr.permissions.network ? { networkAccess: true } : {}),
           ...(pr.permissions.fileSystem ? { touchesOutsideProject: true } : {}),
         };
+        local.toolName = 'permissions';
+        // A blanket grant of network or extra file-system access is exactly what the floor is
+        // for: name it so `classifyLocally` sees it even though there is no command to read.
+        if (pr.permissions.network) local.url = 'codex:requested-network-access';
+        if (pr.permissions.fileSystem) local.paths = ['/'];
         providerRequestId = pr.itemId;
         requested = pr.permissions;
         break;
@@ -835,6 +849,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       actionType,
       preview: clip(relativizePaths(preview, live.projectPath), 1500),
       hints,
+      local,
       expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
     });
   }

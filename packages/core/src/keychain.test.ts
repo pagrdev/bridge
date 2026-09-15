@@ -53,10 +53,10 @@ describe('secret stores', () => {
     expect(calls[0]).toBe('dev.pagr.bridge/device.private_key');
   });
 
-  it('SecurityCliSecretStore shells to /usr/bin/security with argv arrays', async () => {
+  it('SecurityCliSecretStore shells to /usr/bin/security and never puts the secret in argv', async () => {
     const argv: string[][] = [];
     const db = new Map<string, string>();
-    const exec = (file: string, args: string[]) => {
+    const exec = (file: string, args: string[], opts?: { input?: string }) => {
       expect(file).toBe('/usr/bin/security');
       argv.push(args);
       const acct = args[args.indexOf('-a') + 1] ?? '';
@@ -66,7 +66,11 @@ describe('secret stores', () => {
         return `${v}\n`;
       }
       if (args[0] === 'add-generic-password') {
-        db.set(acct, args[args.indexOf('-w') + 1] ?? '');
+        // Real `security add-generic-password -w` with no value prompts on stdin and then asks
+        // for a retype, so it reads the secret twice.
+        const lines = (opts?.input ?? '').split('\n');
+        expect(lines[0]).toBe(lines[1]);
+        db.set(acct, lines[0] ?? '');
         return '';
       }
       db.delete(acct);
@@ -79,6 +83,9 @@ describe('secret stores', () => {
     expect(await s.get('k')).toBeNull();
     expect(argv[0]).toContain('-U');
     expect(argv[0]).toContain('dev.pagr.bridge');
+    // BR-21/SEC-17: argv is visible in `ps` to every user on the machine while the call runs.
+    expect(argv[0]).not.toContain('secret value');
+    expect(argv[0]?.[argv[0].indexOf('-w') + 1]).toBeUndefined();
   });
 
   it('FileSecretStore writes 0600 file', async () => {
