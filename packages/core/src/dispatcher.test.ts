@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AttachmentRef, DeviceEvent, Provider } from '@pagr/protocol';
 import { DeviceEvent as DeviceEventSchema } from '@pagr/protocol';
@@ -71,6 +71,28 @@ describe('Dispatcher', () => {
     type: T,
     payload: Parameters<typeof makeBody<T>>[1],
   ) => makeBody(type, payload, { deviceId, now });
+  const attachment = (): AttachmentRef => ({
+    attachmentId: ids.att(),
+    downloadUrl: 'https://cdn.example/att',
+    sha256: createHash('sha256').update(PNG).digest('hex'),
+    sizeBytes: PNG.length,
+    mimeType: 'image/png',
+    expiresAt: new Date(now.getTime() + 60_000).toISOString(),
+  });
+  const withShot = (sessionId: string) =>
+    ({
+      provider: 'codex',
+      projectId,
+      instruction: 'look at this',
+      sessionId,
+      attachments: [attachment()],
+      readOnly: false,
+    }) as Parameters<typeof makeBody<'agent.start_session'>>[1];
+  const startArgs = (sessionId: string) =>
+    codex.calls.find(
+      (c) =>
+        c.method === 'startSession' && (c.args as { sessionId: string }).sessionId === sessionId,
+    )?.args as { localImagePaths: string[] };
   const acks = () => events.filter((e) => e.type === 'command.ack');
   const ofType = (type: DeviceEvent['type']) => events.filter((e) => e.type === type);
 
@@ -347,7 +369,10 @@ describe('Dispatcher', () => {
     };
     expect(call.localImagePaths).toHaveLength(1);
     expect(call.project.path).toMatch(/repo$/);
-    expect(existsSync(call.localImagePaths[0] ?? '')).toBe(false); // cleaned up
+    // The adapter resolves when the turn is written to the agent, NOT when the agent has read the
+    // image — so the file must still be there (and still be the screenshot) for the whole turn.
+    const shot = call.localImagePaths[0] ?? '';
+    expect(existsSync(shot)).toBe(true);
     expect(fetched).toEqual(['https://cdn.example/att']);
     expect(sessions.get(sessionId)).toMatchObject({
       provider: 'codex',
@@ -356,7 +381,87 @@ describe('Dispatcher', () => {
     });
     expect(ofType('session.updated')).toHaveLength(1);
     expect(ofType('attachment.consumed')[0]?.payload).toMatchObject({ ok: true });
+    // ...and it is gone once the turn that referenced it finishes.
+    codex.push({
+      kind: 'session_event',
+      sessionId,
+      projectId,
+      type: 'completed',
+      summary: 'done',
+    });
+    await vi.waitFor(() => expect(existsSync(shot)).toBe(false));
     expect(readdirSync(join(t.home, 'home', '.pagr', 'tmp'))).toEqual([]);
+  });
+
+  it('an agent that reads the attachment mid-turn still finds it', async () => {
+    const sessionId = ids.ses();
+    const ack = await d.handle(body('agent.start_session', withShot(sessionId)));
+    expect(ack.payload).toMatchObject({ status: 'completed' });
+    const shot = startArgs(sessionId).localImagePaths[0] ?? '';
+    // Several ticks after the dispatch call resolved — this is the model finally running `Read`.
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+    expect(readFileSync(shot)).toEqual(PNG);
+    expect(d.leasedAttachments(sessionId)).toEqual([shot]);
+    codex.push({
+      kind: 'session',
+      session: {
+        sessionId,
+        projectId,
+        provider: 'codex',
+        status: 'completed',
+        activeTurn: false,
+        startedAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      },
+    });
+    await vi.waitFor(() => expect(existsSync(shot)).toBe(false));
+    expect(d.leasedAttachments(sessionId)).toEqual([]);
+  });
+
+  it('a follow-up queued behind a running turn keeps its own images until its own turn ends', async () => {
+    const sessionId = ids.ses();
+    await d.handle(body('agent.start_session', withShot(sessionId)));
+    const first = startArgs(sessionId).localImagePaths[0] ?? '';
+    // The session is mid-turn, so this instruction (with its own screenshot) is queued.
+    const ack = await d.handle(
+      body('agent.send_instruction', {
+        sessionId,
+        instruction: 'and this one',
+        mode: 'queue',
+        attachments: [attachment()],
+      }),
+    );
+    expect((ack.payload as { result: { delivered: string } }).result.delivered).toBe('queued');
+    const sent = codex.calls.find((c) => c.method === 'sendInstruction')?.args as {
+      localImagePaths: string[];
+    };
+    const second = sent.localImagePaths[0] as string;
+    expect(first).not.toBe(second);
+    const end = () =>
+      codex.push({ kind: 'session_event', sessionId, projectId, type: 'completed', summary: 'x' });
+    end();
+    await vi.waitFor(() => expect(existsSync(first)).toBe(false));
+    expect(existsSync(second)).toBe(true); // the queued turn has not run yet
+    codex.push({ kind: 'session_event', sessionId, projectId, type: 'started', summary: 'x' });
+    end();
+    await vi.waitFor(() => expect(existsSync(second)).toBe(false));
+  });
+
+  it('frees the attachment when the turn never starts, and sweeps one whose turn never ends', async () => {
+    const dead = ids.ses();
+    codex.failNext = new Error('codex exploded');
+    const ack = await d.handle(body('agent.start_session', withShot(dead)));
+    expect(ack.payload).toMatchObject({ status: 'failed' });
+    expect(readdirSync(join(t.home, 'home', '.pagr', 'tmp'))).toEqual([]);
+
+    const wedged = ids.ses();
+    await d.handle(body('agent.start_session', withShot(wedged)));
+    const shot = startArgs(wedged).localImagePaths[0] ?? '';
+    expect(existsSync(shot)).toBe(true);
+    expect(d.sweepAttachmentLeases()).toBe(0); // inside the TTL
+    now = new Date(now.getTime() + 2 * 3600_000);
+    expect(d.sweepAttachmentLeases()).toBe(1);
+    expect(existsSync(shot)).toBe(false);
   });
 
   it('agent.start_session fails cleanly on bad attachment and unknown adapter', async () => {
@@ -626,6 +731,89 @@ describe('Dispatcher', () => {
       }),
     );
     expect(again.payload).toMatchObject({ status: 'failed' });
+  });
+
+  const openApproval = async (approvalId: string, sessionId: string) => {
+    await d.handle(
+      body('agent.start_session', {
+        provider: 'codex',
+        projectId,
+        instruction: 'a',
+        sessionId,
+        attachments: [],
+        readOnly: false,
+      }),
+    );
+    codex.push({
+      kind: 'approval_requested',
+      approvalId,
+      sessionId,
+      projectId,
+      providerRequestId: 'req-1',
+      actionType: 'command_execution',
+      preview: 'rm -rf build',
+      hints: {},
+      expiresAt: new Date(now.getTime() + 3600_000).toISOString(),
+    });
+    await vi.waitFor(() => expect(ofType('approval.requested')).toHaveLength(1));
+    return sha256Hex('rm -rf build');
+  };
+
+  it('answering an unknown or expired approval reports unknown_approval, not unknown_session', async () => {
+    const sessionId = ids.ses();
+    const previewHash = await openApproval(ids.apr(), sessionId);
+    const ack = await d.handle(
+      body('agent.respond_to_approval', {
+        approvalId: ids.apr(), // never registered — or long since timed out
+        sessionId,
+        providerRequestId: 'req-1',
+        previewHash,
+        decision: 'allow',
+      }),
+    );
+    // The session is alive and well; only the approval is gone. Saying `unknown_session` sent the
+    // phone to "this session no longer exists".
+    expect(ack.payload).toMatchObject({ status: 'failed', errorCode: 'unknown_approval' });
+    expect(sessions.get(sessionId)?.status).toBe('working');
+  });
+
+  it('a relay that throws produces one coherent failure, never approved-and-failed', async () => {
+    const approvalId = ids.apr();
+    const sessionId = ids.ses();
+    const previewHash = await openApproval(approvalId, sessionId);
+    codex.failNext = new Error('app-server connection closed');
+    const ack = await d.handle(
+      body('agent.respond_to_approval', {
+        approvalId,
+        sessionId,
+        providerRequestId: 'req-1',
+        previewHash,
+        decision: 'allow',
+      }),
+    );
+    expect(ack.payload).toMatchObject({
+      status: 'failed',
+      message: 'app-server connection closed',
+    });
+    // The phone must NOT have been told the action was approved.
+    expect(ofType('approval.resolved_locally')).toHaveLength(0);
+    const failures = ofType('session.event').filter(
+      (e) => (e.payload as { kind: string }).kind === 'failed',
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.payload).toMatchObject({ sessionId, provider: 'codex' });
+    // Still single-use: the failed relay did not leave the approval answerable again.
+    const again = await d.handle(
+      body('agent.respond_to_approval', {
+        approvalId,
+        sessionId,
+        providerRequestId: 'req-1',
+        previewHash,
+        decision: 'allow',
+      }),
+    );
+    expect(again.payload).toMatchObject({ status: 'failed', errorCode: 'unknown_approval' });
+    expect(d.approvals.get(approvalId)).toBeNull();
   });
 
   it('approval timeout → timed_out event and adapter told deny', async () => {

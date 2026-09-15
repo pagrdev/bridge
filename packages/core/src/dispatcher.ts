@@ -6,6 +6,7 @@ import type {
   DeviceEvent,
   EventPayload,
   Provider,
+  SessionStatus,
   SessionSummary,
 } from '@pagr/protocol';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
@@ -17,6 +18,7 @@ import {
   type PendingApprovalInput,
   PendingApprovalRegistry,
 } from './approvals.js';
+import { AttachmentLeaseRegistry } from './attachmentLease.js';
 import { deleteAttachment, type FetchLike, fetchAttachment } from './attachments.js';
 import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.js';
 import { makeEvent } from './events.js';
@@ -64,6 +66,8 @@ export interface DispatcherOptions {
   attachmentTimeoutMs?: number;
   /** Workspace + resource rules for concurrent sessions. Defaults to `SessionGuard.fromEnv()`. */
   guard?: SessionGuard;
+  /** Backstop lifetime for a downloaded attachment whose turn never ends. Default one hour. */
+  attachmentLeaseTtlMs?: number;
 }
 
 /**
@@ -78,16 +82,33 @@ export class Dispatcher {
   private readonly now: () => Date;
   private readonly unsubscribes: Array<() => void> = [];
   private readonly capabilities = new Map<Provider, AgentConnectionStatus>();
+  private readonly leases: AttachmentLeaseRegistry;
 
   constructor(private readonly o: DispatcherOptions) {
     this.logger = o.logger ?? silentLogger;
     this.guard = o.guard ?? SessionGuard.fromEnv();
     this.now = o.now ?? (() => new Date());
+    this.leases = new AttachmentLeaseRegistry({
+      dir: o.tmpDir,
+      now: () => this.now(),
+      ...(o.attachmentLeaseTtlMs ? { ttlMs: o.attachmentLeaseTtlMs } : {}),
+    });
     this.policy = readPolicy(o.policyFile);
-    this.approvals = new PendingApprovalRegistry({ now: this.now });
+    this.approvals = new PendingApprovalRegistry({
+      now: this.now,
+      onResolveError: (approvalId, err) =>
+        this.logger.warn('approval resolution failed', { approvalId, error: String(err) }),
+    });
     for (const adapter of o.adapters.values()) {
       this.unsubscribes.push(
-        adapter.subscribe((e) => void this.onAdapterEvent(adapter.provider, e)),
+        adapter.subscribe((e) => {
+          void this.onAdapterEvent(adapter.provider, e).catch((err) =>
+            this.logger.warn('adapter event failed', {
+              provider: adapter.provider,
+              error: String(err),
+            }),
+          );
+        }),
       );
     }
   }
@@ -216,11 +237,19 @@ export class Dispatcher {
     return { rec, adapter: this.adapterFor(rec.provider) };
   }
 
+  /**
+   * Download the attachments, hand their paths to `fn`, and keep them on disk until the turn that
+   * received them ends (see `AttachmentLeaseRegistry`). `fn` resolving means "the agent has been
+   * given the turn", not "the agent has read the file", so the files must outlive this call.
+   */
   private async withAttachments<T>(
+    sessionId: string,
     refs: CommandPayload<'agent.start_session'>['attachments'],
     fn: (paths: string[]) => Promise<T>,
   ): Promise<T> {
+    this.leases.sweep();
     const paths: string[] = [];
+    let leaseId: string | undefined;
     try {
       for (const ref of refs) {
         try {
@@ -238,10 +267,38 @@ export class Dispatcher {
           throw new DispatchError('invalid_payload', `attachment ${ref.attachmentId}: ${error}`);
         }
       }
+      // Leased before the adapter call, so an adapter that reports the turn finished while `fn` is
+      // still unwinding frees these files rather than missing them.
+      if (paths.length > 0) leaseId = this.leases.acquire(sessionId, paths);
       return await fn(paths);
-    } finally {
-      for (const p of paths) deleteAttachment(p);
+    } catch (err) {
+      // No turn ever took these files, so nothing will ever end one: free them now.
+      if (leaseId !== undefined) this.leases.release(leaseId);
+      else for (const p of paths) deleteAttachment(p);
+      throw err;
     }
+  }
+
+  /** Backstop sweep for leases whose turn never reported an end. Called on the daemon's tick. */
+  sweepAttachmentLeases(): number {
+    return this.leases.sweep();
+  }
+
+  /** Files currently held for a session's turn. Exposed for tests and `pagr doctor`. */
+  leasedAttachments(sessionId: string): string[] {
+    return this.leases.pathsFor(sessionId);
+  }
+
+  /**
+   * Turn boundaries, as reported by an adapter, drive attachment lifetime. Both adapters report
+   * the end of a turn twice (status + session event); the registry ignores the second.
+   */
+  private noteTurnStatus(sessionId: string, status: SessionStatus, activeTurn?: boolean): void {
+    if (status === 'stopped') this.leases.releaseSession(sessionId);
+    else if (status === 'completed' || status === 'failed' || status === 'idle')
+      this.leases.noteTurnEnded(sessionId);
+    else if (activeTurn === true || status === 'working' || status === 'starting')
+      this.leases.noteTurnStarted(sessionId);
   }
 
   /**
@@ -313,7 +370,7 @@ export class Dispatcher {
       updatedAt: reservedAt,
     });
     try {
-      return await this.withAttachments(p.attachments, async (localImagePaths) => {
+      return await this.withAttachments(p.sessionId, p.attachments, async (localImagePaths) => {
         const summary = await adapter.startSession({
           sessionId: p.sessionId,
           project,
@@ -354,7 +411,7 @@ export class Dispatcher {
       const status = await adapter.getStatus(p.sessionId);
       mode = caps?.capabilities.canSteerActiveTurn && status?.activeTurn ? 'steer' : 'queue';
     }
-    return this.withAttachments(p.attachments, async (localImagePaths) => {
+    return this.withAttachments(p.sessionId, p.attachments, async (localImagePaths) => {
       const res = await adapter.sendInstruction({
         sessionId: p.sessionId,
         instruction: p.instruction,
@@ -447,7 +504,9 @@ export class Dispatcher {
         request_mismatch: 'provider request id mismatch',
         preview_mismatch: 'preview hash mismatch',
       }[r.error];
-      throw new DispatchError(r.error === 'unknown' ? 'unknown_session' : 'invalid_payload', msg);
+      // An approval that timed out is not a session that vanished: `unknown_session` sent the
+      // phone to "this session is gone" when the session was alive and only the prompt had lapsed.
+      throw new DispatchError(r.error === 'unknown' ? 'unknown_approval' : 'invalid_payload', msg);
     }
     return { approvalId: p.approvalId, decision: p.decision };
   }
@@ -461,6 +520,11 @@ export class Dispatcher {
   /**
    * Register a pending approval (from an adapter or a hook over IPC), emit
    * `approval.requested`, and resolve `onDecision` exactly once.
+   *
+   * The relay to the agent runs BEFORE `approval.resolved_locally` is emitted. Announcing the
+   * resolution first meant a relay that threw left the phone showing "approved" beside a `failed`
+   * ack for the same prompt. The single-use guarantee is unaffected: the registry has already
+   * consumed the entry by the time this runs, so a failed relay cannot be answered a second time.
    */
   requestApproval(input: ApprovalRequest): PendingApproval {
     const { onDecision, ...rest } = input;
@@ -468,8 +532,28 @@ export class Dispatcher {
       {
         ...rest,
         onResolve: async (resolution, decision, source) => {
+          try {
+            await onDecision(decision, resolution, source);
+          } catch (err) {
+            const message = (err instanceof Error ? err.message : String(err)).slice(0, 500);
+            this.logger.warn('approval relay failed', {
+              approvalId: record.approvalId,
+              sessionId: record.sessionId,
+              resolution,
+              message,
+            });
+            // One coherent failure, never an "approved" the agent never heard.
+            this.send('session.event', {
+              sessionId: record.sessionId,
+              projectId: record.projectId,
+              provider: record.provider,
+              kind: 'failed',
+              summary: `Could not deliver the approval decision to ${record.provider}: ${message}`,
+              at: this.now().toISOString(),
+            });
+            throw err;
+          }
           this.send('approval.resolved_locally', { approvalId: record.approvalId, resolution });
-          await onDecision(decision, resolution, source);
         },
       },
       this.approvalTimeoutMs,
@@ -495,6 +579,7 @@ export class Dispatcher {
     switch (e.kind) {
       case 'session': {
         const s = e.session;
+        this.noteTurnStatus(s.sessionId, s.status, s.activeTurn);
         const rec = this.o.sessions.get(s.sessionId);
         this.o.sessions.upsert({
           sessionId: s.sessionId,
@@ -512,6 +597,11 @@ export class Dispatcher {
         return;
       }
       case 'session_event':
+        if (e.type === 'started' || e.type === 'followup_delivered')
+          this.leases.noteTurnStarted(e.sessionId);
+        else if (e.type === 'stopped') this.leases.releaseSession(e.sessionId);
+        else if (e.type === 'completed' || e.type === 'failed')
+          this.leases.noteTurnEnded(e.sessionId);
         this.send('session.event', {
           sessionId: e.sessionId,
           projectId: e.projectId,
@@ -566,6 +656,8 @@ export class Dispatcher {
 
   async shutdown(): Promise<void> {
     for (const u of this.unsubscribes) u();
+    // Every session ends with the daemon, so no agent is going to read these files again.
+    this.leases.releaseAll();
     await this.approvals.cancelAll();
     for (const a of this.o.adapters.values()) {
       try {

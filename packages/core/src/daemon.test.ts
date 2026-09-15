@@ -120,10 +120,10 @@ describe('daemon', () => {
     sendCommand(signer.sign(probe));
     await until(() => acks().length === 1);
     expect(acks()[0]?.payload).toMatchObject({ commandId: probe.commandId, status: 'completed' });
-    // exact resend (same idempotency key) → duplicate ack; reused nonce with a NEW key → replayed
+    // exact resend → the cached terminal ack (not `replayed`); reused nonce with a NEW key → replayed
     sendCommand(signer.sign(probe));
     await until(() => acks().length === 2);
-    expect(acks()[1]?.payload).toMatchObject({ commandId: probe.commandId, status: 'duplicate' });
+    expect(acks()[1]?.payload).toMatchObject({ commandId: probe.commandId, status: 'completed' });
     sendCommand(signer.sign(makeBody('device.probe', {}, { deviceId, nonce: probe.nonce })));
     await until(() => acks().length === 3);
     expect(acks()[2]?.payload).toMatchObject({ status: 'rejected', errorCode: 'replayed' });
@@ -131,12 +131,12 @@ describe('daemon', () => {
     sendCommand(signer.sign(makeBody('device.probe', {}, { deviceId: ids.dev() })));
     await until(() => acks().length === 4);
     expect(acks()[3]?.payload).toMatchObject({ status: 'rejected', errorCode: 'wrong_device' });
-    // idempotent retry with new nonce → duplicate
+    // idempotent retry with new nonce → the original command's ack, not a second execution
     sendCommand(
       signer.sign(makeBody('device.probe', {}, { deviceId, idempotencyKey: probe.idempotencyKey })),
     );
     await until(() => acks().length === 5);
-    expect(acks()[4]?.payload).toMatchObject({ commandId: probe.commandId, status: 'duplicate' });
+    expect(acks()[4]?.payload).toMatchObject({ commandId: probe.commandId, status: 'completed' });
     expect(
       received
         .filter((f) => f.kind === 'event')

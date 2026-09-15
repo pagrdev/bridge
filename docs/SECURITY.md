@@ -40,11 +40,17 @@ Every command is checked, in this order, and the first failure rejects it with a
 3. **Ed25519 signature** over `canonicalize(body)` (sorted keys, no whitespace).
 4. **Device binding** — `body.deviceId` must equal this device's id.
 5. **Expiry** — `expiresAt` in the past, or `issuedAt` more than 2 minutes in the future, is rejected.
-   Commands are never valid for more than 15 minutes for replay-cache purposes.
+   A 15-minute ceiling is then enforced regardless of what the envelope claims: an `issuedAt` more than
+   15 minutes old, or an `expiresAt` more than 15 minutes after its `issuedAt`, is rejected. A command
+   therefore can never outlive the window its nonce is remembered for.
 6. **Replay** — nonce and command id are recorded in a bounded LRU (`replay.ts`, persisted best-effort
-   to `~/.pagr/replay.json`). A reused nonce is rejected.
-7. **Idempotency** — a retried command with the same `idempotencyKey` gets the original ack back
-   (`status: 'duplicate'`) and is not executed twice.
+   to `~/.pagr/replay.json`), for the full 15-minute ceiling plus a minute of slack. A *different*
+   command reusing a seen nonce is rejected, as is a command id arriving with a different nonce.
+7. **De-duplication** — a second copy of a command already accepted (the gateway resends an envelope it
+   has had no ack for after 30 s, or the cloud retries under the same `idempotencyKey`) is never
+   rejected and never executed twice: it is answered with the terminal ack of the single execution,
+   waiting for it if that execution is still running. The command is recorded as in flight at receipt,
+   before dispatch, so a command slower than the resend window is reported by its real outcome.
 8. **Local existence** — referenced project / session ids must exist locally.
 
 A compromised gateway that lacks the server signing key can therefore do nothing; a stolen signing key
@@ -89,7 +95,16 @@ a request on its own (you answered in the terminal), the bridge records that and
 
 Downloads use a 15 s timeout, are capped at the declared size (max 50 MiB by schema), must match the
 declared sha256, and must sniff as PNG/JPEG/HEIC/WebP by magic bytes — the URL's extension and
-`Content-Type` are ignored. Files are written `0600` and deleted in a `finally` after the agent call.
+`Content-Type` are ignored. The URL must be `https:` on a public hostname (never a literal IP,
+loopback, or link-local address), and **redirects are refused, not followed** (`redirect: 'error'`):
+the allow-list can only vet the URL the cloud handed us, so a permitted host must not be able to bounce
+the download somewhere else.
+
+Files are written `0600` into `~/.pagr/tmp/` and held by a lease (`attachmentLease.ts`) for the lifetime
+of the agent turn that referenced them — an adapter call returns when the turn reaches the agent, not
+when the agent has read the image, so deleting on return raced the model. A lease ends when its turn
+reports `completed` / `failed`, when the session stops, at daemon shutdown, or — as a backstop for a
+turn that never ends — after one hour, with `cleanupTmp` sweeping anything older than 24 h at startup.
 
 ## Supply chain
 

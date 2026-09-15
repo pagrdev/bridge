@@ -64,6 +64,11 @@ export class PendingApprovalRegistry {
       now?: () => Date;
       onTimeout?: (record: PendingApproval) => void;
       idGen?: () => string;
+      /**
+       * `onResolve` threw on a path with no caller to report to (a local timeout, shutdown).
+       * The entry is consumed either way — an approval is never answerable twice.
+       */
+      onResolveError?: (approvalId: string, err: unknown) => void;
     } = {},
   ) {}
 
@@ -103,7 +108,10 @@ export class PendingApprovalRegistry {
       expiresAt: new Date(deadline).toISOString(),
     };
     const timer = setTimeout(
-      () => void this.finish(approvalId, 'timed_out', null, 'timeout'),
+      () =>
+        void this.finish(approvalId, 'timed_out', null, 'timeout').catch((err) =>
+          this.opts.onResolveError?.(approvalId, err),
+        ),
       Math.max(0, deadline - created.getTime()),
     );
     timer.unref();
@@ -150,7 +158,14 @@ export class PendingApprovalRegistry {
   }
 
   async cancelAll(): Promise<void> {
-    for (const id of [...this.pending.keys()]) await this.finish(id, 'canceled', null, 'shutdown');
+    for (const id of [...this.pending.keys()]) {
+      // One entry whose relay throws must not leave the rest pending at shutdown.
+      try {
+        await this.finish(id, 'canceled', null, 'shutdown');
+      } catch (err) {
+        this.opts.onResolveError?.(id, err);
+      }
+    }
   }
 
   private async finish(

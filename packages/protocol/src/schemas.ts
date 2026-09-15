@@ -228,6 +228,8 @@ export const EventPayloads = {
         'wrong_device',
         'unknown_project',
         'unknown_session',
+        /** The approval id is not pending any more: it expired, or was already answered. */
+        'unknown_approval',
         'capability_unsupported',
         'provider_error',
         'invalid_payload',

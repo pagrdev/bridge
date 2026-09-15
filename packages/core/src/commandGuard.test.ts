@@ -1,6 +1,11 @@
 import type { DeviceEvent } from '@pagr/protocol';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { type GuardContext, IdempotencyCache, verifyIncoming } from './commandGuard.js';
+import {
+  CommandTracker,
+  type GuardContext,
+  MAX_LIFETIME_MS,
+  verifyIncoming,
+} from './commandGuard.js';
 import { ReplayCache } from './replay.js';
 import { FakeServerSigner, ids, makeBody } from './testFixtures.js';
 
@@ -20,7 +25,7 @@ describe('verifyIncoming authorization matrix', () => {
       trustedServerKeys: signer.trustedKeys,
       now: () => now,
       replay: new ReplayCache({ now: () => now.getTime() }),
-      idempotency: new IdempotencyCache(),
+      commands: new CommandTracker(),
       registry: { has: (id: string) => id === projectId },
       sessions: { has: (id: string) => id === sessionId },
     };
@@ -108,22 +113,102 @@ describe('verifyIncoming authorization matrix', () => {
     expect(verifyIncoming(signer.sign(slightlyFuture), ctx).ok).toBe(true);
   });
 
-  it('rejects replayed nonce / commandId, but returns cached ack for idempotent retry', () => {
+  const fakeAck = (status = 'completed'): DeviceEvent =>
+    ({ eventId: 'e', payload: { status } }) as unknown as DeviceEvent;
+
+  it("returns the finished command's ack for an idempotent retry, and still rejects a replay", async () => {
     const body = start();
     const env = signer.sign(body);
     expect(verifyIncoming(env, ctx).ok).toBe(true);
-    expect(verifyIncoming(env, ctx)).toMatchObject({ ok: false, errorCode: 'replayed' });
-    // same nonce, different commandId → still replayed
-    const env2 = signer.sign(start({ nonce: body.nonce }));
-    expect(verifyIncoming(env2, ctx)).toMatchObject({ ok: false, errorCode: 'replayed' });
-    // once an ack is cached under the idempotency key, the retry is a duplicate with that ack
-    const ack = { eventId: 'e' } as unknown as DeviceEvent;
-    ctx.idempotency.set(body.idempotencyKey, ack);
+    const ack = fakeAck();
+    ctx.commands.settle(body.commandId, ack);
+    // the exact envelope again → the terminal ack of the one execution, not `replayed`
     const r = verifyIncoming(env, ctx);
-    expect(r.ok && r.duplicate && r.cachedAck).toBe(ack);
+    expect(r).toMatchObject({ ok: true, duplicate: true, inFlight: false });
+    if (r.ok && r.duplicate) expect(await r.ack).toBe(ack);
     // a fresh nonce/commandId with the same idempotency key is also a duplicate
     const r2 = verifyIncoming(signer.sign(start({ idempotencyKey: body.idempotencyKey })), ctx);
-    expect(r2.ok && r2.duplicate).toBe(true);
+    expect(r2).toMatchObject({ ok: true, duplicate: true });
+    if (r2.ok && r2.duplicate) expect(await r2.ack).toBe(ack);
+  });
+
+  it('de-duplicates the gateway resend of a command that is STILL running', async () => {
+    const body = start();
+    const env = signer.sign(body);
+    const first = verifyIncoming(env, ctx);
+    expect(first).toMatchObject({ ok: true, duplicate: false });
+    // 30 s later the gateway resends the identical envelope; the first is still executing.
+    now = new Date(now.getTime() + 30_000);
+    const resend = verifyIncoming(env, ctx);
+    expect(resend).toMatchObject({ ok: true, duplicate: true, inFlight: true });
+    const ack = fakeAck();
+    ctx.commands.settle(body.commandId, ack);
+    if (resend.ok && resend.duplicate) expect(await resend.ack).toBe(ack);
+  });
+
+  it('still rejects a DIFFERENT command reusing a seen nonce, and a commandId reusing another nonce', () => {
+    const body = start();
+    expect(verifyIncoming(signer.sign(body), ctx).ok).toBe(true);
+    // same nonce, different commandId + idempotency key → genuine replay
+    expect(verifyIncoming(signer.sign(start({ nonce: body.nonce })), ctx)).toMatchObject({
+      ok: false,
+      errorCode: 'replayed',
+    });
+    // same commandId, different nonce → forged resend, not a de-duplicable retry
+    expect(verifyIncoming(signer.sign(start({ commandId: body.commandId })), ctx)).toMatchObject({
+      ok: false,
+      errorCode: 'replayed',
+    });
+  });
+
+  it('remembers a nonce for at least the whole accepted lifetime of a command', () => {
+    const body = start({ ttlMs: MAX_LIFETIME_MS });
+    expect(verifyIncoming(signer.sign(body), ctx).ok).toBe(true);
+    // the last instant that command could still have been accepted: its nonce must not be back
+    now = new Date(Date.parse(body.issuedAt) + MAX_LIFETIME_MS - 1);
+    expect(verifyIncoming(signer.sign(start({ nonce: body.nonce })), ctx)).toMatchObject({
+      ok: false,
+      errorCode: 'replayed',
+    });
+  });
+
+  it('enforces the 15 minute ceiling whatever the envelope claims', () => {
+    // an hour-long expiresAt is refused outright, so it can never outlive its nonce
+    expect(verifyIncoming(signer.sign(start({ ttlMs: 60 * 60_000 })), ctx)).toMatchObject({
+      ok: false,
+      errorCode: 'expired',
+    });
+    // exactly 15 minutes is still fine
+    expect(verifyIncoming(signer.sign(start({ ttlMs: MAX_LIFETIME_MS })), ctx).ok).toBe(true);
+    expect(verifyIncoming(signer.sign(start({ ttlMs: MAX_LIFETIME_MS + 1 })), ctx)).toMatchObject({
+      ok: false,
+      errorCode: 'expired',
+    });
+    // issued 15 minutes ago, still unexpired by its own claim → refused on age alone
+    const old = start({
+      now: new Date(now.getTime() - MAX_LIFETIME_MS - 1_000),
+      ttlMs: 60 * 60_000,
+    });
+    expect(verifyIncoming(signer.sign(old), ctx)).toMatchObject({
+      ok: false,
+      errorCode: 'expired',
+    });
+    // issued 14 minutes ago and still unexpired by its own (15 minute) claim → accepted
+    const justInside = start({
+      now: new Date(now.getTime() - MAX_LIFETIME_MS + 60_000),
+      ttlMs: MAX_LIFETIME_MS,
+    });
+    expect(verifyIncoming(signer.sign(justInside), ctx).ok).toBe(true);
+  });
+
+  it('a guard rejection is not cached against the idempotency key', async () => {
+    const body = start({}, ids.proj()); // project not registered here
+    const rejected = verifyIncoming(signer.sign(body), ctx);
+    expect(rejected).toMatchObject({ ok: false, errorCode: 'unknown_project' });
+    ctx.commands.settle(body.commandId, fakeAck('rejected'));
+    // the project is registered by the time the cloud retries under the same key: run it
+    const retry = verifyIncoming(signer.sign(start({ idempotencyKey: body.idempotencyKey })), ctx);
+    expect(retry).toMatchObject({ ok: true, duplicate: false });
   });
 
   it('rejects unknown project and unknown session', () => {
