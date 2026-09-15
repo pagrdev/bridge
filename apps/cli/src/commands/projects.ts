@@ -11,6 +11,7 @@ import {
   ProjectError,
   type ProjectRecord,
   ProjectRegistry,
+  projectContaining,
   resolveNameCollisions,
   ScanRootError,
   type SessionRecord,
@@ -23,7 +24,11 @@ import { daemonStatus, ipc } from '../ipc.js';
 import { bold, dim, ok, printJson, say, table, warn } from '../output.js';
 
 const registry = (ctx: CliContext) =>
-  new ProjectRegistry({ file: ctx.paths.projectsFile, pagrHome: ctx.home });
+  new ProjectRegistry({
+    file: ctx.paths.projectsFile,
+    pagrHome: ctx.home,
+    home: ctx.env.HOME ?? homedir(),
+  });
 
 async function viaDaemon(ctx: CliContext): Promise<boolean> {
   return (await daemonStatus(ctx)) !== null;
@@ -71,7 +76,9 @@ export async function runProjects(ctx: CliContext): Promise<void> {
     return;
   }
   if (list.length === 0) {
-    ctx.out(dim('no projects registered — `pagr project add` here, or `pagr project scan`'));
+    ctx.out(
+      dim('nothing registered yet — `pagr project use .` here, or `pagr project scan` to sweep'),
+    );
     return;
   }
   ctx.out(
@@ -149,6 +156,77 @@ export async function runProjectAdd(
         : '  daemon not running: the cloud learns about it on next connect',
     ),
   );
+}
+
+// ---------------------------------------------------------------------------
+// use
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a folder to a project, registering it if nothing covers it yet.
+ *
+ * When the daemon is up it must be the one to write: it holds the registry in memory and its
+ * next save would clobber anything this process wrote behind its back. So we ask it what it
+ * already has, and let it do the registering — which also means the cloud hears about the new
+ * project (id and name, never the path) through the same event as an explicit `project add`.
+ */
+async function ensureOne(
+  ctx: CliContext,
+  path: string,
+): Promise<{ rec: ProjectRecord; created: boolean; live: boolean }> {
+  try {
+    if (!(await viaDaemon(ctx))) {
+      const rec = registry(ctx).ensure(path);
+      return { rec, created: rec.created, live: false };
+    }
+    const known = await ipc(ctx).call<ProjectRecord[]>('projects.list');
+    const covering = projectContaining(known, path);
+    if (covering) return { rec: covering, created: false, live: true };
+    try {
+      const rec = await ipc(ctx).call<AddedProject>('projects.add', { path, allowNonGit: true });
+      return { rec, created: true, live: true };
+    } catch (err) {
+      // Someone (another `pagr`, a hook) registered it between the list and the add.
+      if (!(err instanceof IpcClientError) || err.code !== 'duplicate') throw err;
+      const again = projectContaining(await ipc(ctx).call<ProjectRecord[]>('projects.list'), path);
+      if (!again) throw err;
+      return { rec: again, created: false, live: true };
+    }
+  } catch (err) {
+    if (err instanceof ProjectError || err instanceof IpcClientError)
+      throw new CliError(err.message, EXIT.precondition, projectHint(err.code));
+    throw err;
+  }
+}
+
+/**
+ * `pagr project use [path]` — make a folder addressable, whether or not anyone registered it.
+ * Registering is a convenience here, not a prerequisite; what it is NOT is something the cloud
+ * can do. A path only ever becomes an id because someone ran this on the Mac itself.
+ */
+export async function runProjectUse(ctx: CliContext, path: string): Promise<void> {
+  const { rec, created, live } = await ensureOne(ctx, resolve(path));
+  if (ctx.json) {
+    printJson(ctx, { ...rec, created });
+    return;
+  }
+  const home = ctx.env.HOME ?? homedir();
+  ctx.out(
+    created
+      ? ok(`registered ${bold(rec.displayName)} as ${rec.projectId}`)
+      : ok(`${bold(rec.displayName)} is already reachable as ${rec.projectId}`),
+  );
+  ctx.out(dim(`  ${tildify(rec.path, home)}`));
+  if (rec.aliases.length) ctx.out(dim(`  also answers to: ${rec.aliases.join(', ')}`));
+  if (created)
+    ctx.out(
+      dim(
+        live
+          ? '  the cloud was told the id + name (never the path)'
+          : '  daemon not running: the cloud learns about it on next connect',
+      ),
+    );
+  ctx.out(dim(`  text "${rec.displayName}" to start a session here`));
 }
 
 // ---------------------------------------------------------------------------
@@ -412,9 +490,14 @@ export function registerProjects(program: Command, getCtx: () => CliContext): vo
     .command('projects')
     .description('list registered projects, with any live session')
     .action(() => runProjects(getCtx()));
-  const p = program.command('project').description('add, scan for, or remove projects');
+  const p = program
+    .command('project')
+    .description('make a folder reachable from Pagr, scan for repos, or remove a project');
+  p.command('use [path]')
+    .description('make a folder reachable now, registering it if needed (default: this folder)')
+    .action((path: string | undefined) => runProjectUse(getCtx(), path ?? process.cwd()));
   p.command('add [path]')
-    .description('register a folder (default: current directory)')
+    .description('register a folder under a name you choose (default: current directory)')
     .option('-n, --name <alias>', 'display name (default: folder name, or the git repo name)')
     .option('--alias <a,b>', 'comma-separated extra aliases for iMessage')
     .option('--allow-non-git', 'allow a folder without a .git directory')

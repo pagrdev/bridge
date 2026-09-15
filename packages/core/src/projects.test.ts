@@ -182,3 +182,163 @@ describe('ProjectRegistry', () => {
     expect(repoHint(join(home, 'nothing'))).toBeUndefined();
   });
 });
+
+/**
+ * Registration is a convenience, not a prerequisite: a folder the person names locally becomes
+ * addressable on the spot. The safety property that must survive is that only a LOCAL action can
+ * turn a path into an id — an id arriving from the cloud is a lookup and never a path.
+ */
+describe('ProjectRegistry.ensure (implicit registration)', () => {
+  let t: ReturnType<typeof tempHome>;
+  let home: string;
+  let pagrHome: string;
+  let file: string;
+  let reg: ProjectRegistry;
+  const open = (over: Partial<ConstructorParameters<typeof ProjectRegistry>[0]> = {}) =>
+    new ProjectRegistry({ file, home, pagrHome, ...over });
+  beforeEach(() => {
+    t = tempHome();
+    home = join(t.home, 'home');
+    pagrHome = join(home, '.pagr');
+    mkdirSync(pagrHome, { recursive: true });
+    file = join(pagrHome, 'projects.json');
+    reg = open();
+  });
+  afterEach(() => t.cleanup());
+
+  it('registers a folder nobody added, and does not care that it is not a git repo', () => {
+    const notes = join(home, 'notes');
+    mkdirSync(notes, { recursive: true });
+    const p = reg.ensure(notes);
+    expect(p.created).toBe(true);
+    expect(p.path).toBe(notes);
+    expect(p.displayName).toBe('notes');
+    expect(reg.resolve(p.projectId).path).toBe(notes);
+    expect(reg.summaries()[0]).not.toHaveProperty('path');
+  });
+
+  it('keeps one id per path across repeat calls, restarts and an explicit add', () => {
+    const repo = join(home, 'code', 'widgets');
+    makeRepo(repo);
+    const first = reg.ensure(repo);
+    const again = reg.ensure(repo);
+    expect(again.created).toBe(false);
+    expect(again.projectId).toBe(first.projectId);
+    expect(reg.list()).toHaveLength(1);
+
+    // a restart re-reads the file, so the cloud keeps talking to the same id
+    expect(open().resolve(first.projectId).path).toBe(repo);
+
+    // and explicit registration of the same path mints the same id, so the two paths agree
+    const fresh = open();
+    expect(fresh.remove(first.projectId)).toBe(true);
+    expect(fresh.add(repo).projectId).toBe(first.projectId);
+  });
+
+  it('reuses the project that already contains the path instead of nesting a second one', () => {
+    const repo = join(home, 'code', 'app');
+    makeRepo(repo);
+    const root = reg.ensure(repo);
+    const pkg = join(repo, 'packages', 'api');
+    mkdirSync(pkg, { recursive: true });
+    const inner = reg.ensure(pkg);
+    expect(inner.created).toBe(false);
+    expect(inner.projectId).toBe(root.projectId);
+    expect(reg.list()).toHaveLength(1);
+  });
+
+  it('refuses the same paths add refuses, with a reason', () => {
+    expect(() => reg.ensure('/')).toThrow(/refusing/);
+    expect(() => reg.ensure(home)).toThrow(/refusing/);
+    const inside = join(pagrHome, 'tmp');
+    mkdirSync(inside, { recursive: true });
+    expect(() => reg.ensure(inside)).toThrow(/refusing/);
+    expect(() => reg.ensure('/etc')).toThrow(/refusing/);
+    expect(() => reg.ensure(join(home, 'nope'))).toThrow(/does not exist/);
+    const f = join(home, 'file.txt');
+    writeFileSync(f, 'x');
+    expect(() => reg.ensure(f)).toThrow(/not a directory/);
+    expect(reg.list()).toEqual([]);
+  });
+
+  it('refuses a directory owned by someone other than the user running the daemon', () => {
+    const other = join(home, 'someone-elses');
+    mkdirSync(other, { recursive: true });
+    const foreign = open({ uid: () => 999_999 });
+    expect(() => foreign.ensure(other)).toThrow(/owned by another user/);
+    expect(() => foreign.add(other, { allowNonGit: true })).toThrow(/owned by another user/);
+    expect(foreign.list()).toEqual([]);
+  });
+
+  it('resolves symlinks before deciding, so a link into a refused root is still refused', () => {
+    const link = join(home, 'shortcut');
+    symlinkSync('/etc', link);
+    expect(() => reg.ensure(link)).toThrow(/refusing/);
+    const repo = join(home, 'code', 'widgets');
+    makeRepo(repo);
+    const alias = join(home, 'widgets-link');
+    symlinkSync(repo, alias);
+    const direct = reg.ensure(repo);
+    const viaLink = reg.ensure(alias);
+    expect(viaLink.projectId).toBe(direct.projectId);
+    expect(reg.list()).toHaveLength(1);
+  });
+
+  it('an id the registry did not mint locally never reaches the filesystem', () => {
+    const repo = join(home, 'code', 'widgets');
+    makeRepo(repo);
+    const real = reg.ensure(repo);
+    const secrets = join(home, 'secrets');
+    mkdirSync(secrets, { recursive: true });
+    writeFileSync(join(secrets, 'keys.txt'), 'x');
+
+    // 1. an id invented by the cloud, however well-formed
+    const forged = `proj_${'f'.repeat(32)}`;
+    expect(reg.has(forged)).toBe(false);
+    expect(() => reg.resolve(forged)).toThrow(/unknown project/);
+    expect(() => reg.assertContained(forged, 'keys.txt')).toThrow(/unknown project/);
+
+    // 2. an id derived exactly the way this device derives them, for a real directory that no
+    //    local action ever named. Knowing the scheme is not authorisation: the mapping is.
+    const wouldBe = reg.ensure(secrets).projectId;
+    expect(open().remove(wouldBe)).toBe(true);
+    const after = open();
+    expect(after.has(wouldBe)).toBe(false);
+    expect(() => after.resolve(wouldBe)).toThrow(/unknown project/);
+    expect(() => after.assertContained(wouldBe, 'keys.txt')).toThrow(/unknown project/);
+
+    // 3. the surviving project still only reaches its own tree
+    expect(() => after.assertContained(real.projectId, '../secrets/keys.txt')).toThrow(
+      /outside project/,
+    );
+    expect(() => after.assertContained(real.projectId, '/etc/passwd')).toThrow(/outside project/);
+  });
+
+  it('ids are opaque: nothing about them is derived from the path alone', () => {
+    const repo = join(home, 'code', 'widgets');
+    makeRepo(repo);
+    const id = reg.ensure(repo).projectId;
+    expect(id).toMatch(/^proj_[0-9a-f]{32}$/);
+    expect(id).not.toContain('widgets');
+    // a second device (a different registry file) would call the same path something else
+    const otherPagrHome = join(home, '.pagr-other');
+    mkdirSync(otherPagrHome, { recursive: true });
+    const elsewhere = new ProjectRegistry({
+      file: join(otherPagrHome, 'projects.json'),
+      home,
+      pagrHome: otherPagrHome,
+    });
+    expect(elsewhere.ensure(repo).projectId).not.toBe(id);
+  });
+
+  it('discovery marks an implicitly registered repo as known, never a second id', async () => {
+    const roots = join(home, 'code');
+    makeRepo(join(roots, 'a'));
+    makeRepo(join(roots, 'b'));
+    const a = reg.ensure(join(roots, 'a'));
+    const found = await reg.discover([roots]);
+    expect(found.repos.find((r) => r.path === join(roots, 'a'))?.registeredAs).toBe(a.projectId);
+    expect(found.repos.find((r) => r.path === join(roots, 'b'))?.registeredAs).toBeUndefined();
+    expect(reg.list()).toHaveLength(1);
+  });
+});

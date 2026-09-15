@@ -12,8 +12,11 @@ endorsed by Anthropic or OpenAI.
 
 ## What Pagr can reach
 
-Only repositories the user has explicitly registered with `pagr project add`. Nothing else on the
-machine is visible to it — not sibling directories, not the home folder, not arbitrary files.
+Folders on this Mac that the user has named locally — with `pagr project use`, `pagr project add`
+or `pagr project scan`. Any folder can be named, so registering one ahead of time is a convenience
+rather than a precondition, but the naming always happens here: Pagr's cloud can only refer to a
+folder by an id this Mac minted for it, and never by a path. A folder nobody has named on this Mac
+is not visible to it — not sibling directories, not the home folder, not arbitrary files.
 
 Pagr's cloud stores session status, short task summaries, and previews of actions an agent has
 paused on. It does not store source code, file contents, full agent transcripts, terminal output,
@@ -27,9 +30,10 @@ single most common misunderstanding.
 | `pagr connect` | Pairs this Mac. Creates a device key in the Keychain and opens a browser page to confirm the device. Needs a human — never attempt to complete it. |
 | `pagr status` | Pairing, daemon, gateway, agents and project summary. The first thing to run for any "is it working?" question. |
 | `pagr doctor` | Diagnoses install, pairing, daemon, gateway and agent problems, and prints the fix. |
-| `pagr projects` | Lists registered projects. |
-| `pagr project add [path] --name <name>` | Registers a folder. Defaults to the current directory. **Ask the user before running this** — it grants access to that directory. |
-| `pagr project remove <aliasOrId>` | Unregisters a project by id, name or alias. |
+| `pagr projects` | Lists the projects this Mac can reach. |
+| `pagr project use [path]` | Makes a folder reachable now, registering it if needed (repo or not). Defaults to the current directory. **Ask the user before running this** — it grants access to that directory. |
+| `pagr project add [path] --name <name>` | Registers a folder under a name you choose. Defaults to the current directory. **Ask the user before running this** — it grants access to that directory. |
+| `pagr project remove <aliasOrId>` | Unregisters a project by id, name or alias; its id stops resolving. |
 | `pagr sessions` | Lists coding-agent sessions Pagr knows about. |
 | `pagr logout` | Signs this Mac out. |
 

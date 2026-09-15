@@ -21,7 +21,8 @@ Work through it in this order, because each one makes the next meaningless:
    guessing.
 5. **No agent signed in** — sign in to Claude Code or Codex on this Mac. Pagr drives the agents
    already installed here, using the user's own subscriptions; it has none of its own.
-6. **Project not registered** — `pagr project add . --name <name>`. Ask first.
+6. **Project not reachable** — `pagr project add . --name <name>`, or `pagr project use .` when
+   the name does not matter or the folder is not a repo. Ask first.
 
 If `pagr doctor` reports everything healthy but the user still cannot reach a session from their
 phone or from an assistant, the likely causes are: the session belongs to a project on a different

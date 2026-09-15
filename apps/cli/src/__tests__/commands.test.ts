@@ -122,7 +122,8 @@ describe('projects', () => {
 
   it('says something useful when there are no projects', async () => {
     expect(await h.run(['projects'])).toBe(EXIT.ok);
-    expect(out()).toContain('pagr project add');
+    expect(out()).toContain('pagr project use');
+    expect(out()).toContain('pagr project scan');
   });
 });
 
