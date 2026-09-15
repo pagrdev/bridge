@@ -1,11 +1,15 @@
 import { createHash } from 'node:crypto';
 import type { EventPayload, Provider } from '@pagr/protocol';
+import type { LocalRiskAssessment } from './deviceFloor.js';
 import { newApprovalId } from './events.js';
 
 export type ApprovalDecision = 'allow' | 'deny';
 export type ApprovalResolution = 'allowed' | 'denied' | 'timed_out' | 'canceled';
-/** Who ended the approval: the cloud's decision, the local timer, the provider itself, or shutdown. */
-export type ApprovalSource = 'cloud' | 'timeout' | 'provider' | 'shutdown';
+/**
+ * Who ended the approval: the cloud's decision, this device deciding on its own (tier-A
+ * auto-approval or a device-floor refusal), the local timer, the provider itself, or shutdown.
+ */
+export type ApprovalSource = 'cloud' | 'device' | 'timeout' | 'provider' | 'shutdown';
 
 export interface PendingApprovalInput {
   approvalId?: string;
@@ -18,6 +22,12 @@ export interface PendingApprovalInput {
   hints?: Partial<EventPayload<'approval.requested'>['hints']>;
   /** Provider-side deadline; the effective deadline is the sooner of this and policy timeout. */
   expiresAt?: string;
+  /**
+   * What this Mac decided the action is, classified locally before the cloud was ever told about
+   * it. The device floor judges a cloud `allow` against this, never against anything the cloud
+   * echoes back.
+   */
+  assessment?: LocalRiskAssessment;
   /** Invoked exactly once with the final resolution. */
   onResolve: (
     resolution: ApprovalResolution,
@@ -36,6 +46,8 @@ export interface PendingApproval {
   preview: string;
   previewHash: string;
   hints: EventPayload<'approval.requested'>['hints'];
+  /** Local classification; `null` only for entries registered before one could be computed. */
+  assessment: LocalRiskAssessment | null;
   createdAt: string;
   expiresAt: string;
 }
@@ -104,6 +116,7 @@ export class PendingApprovalRegistry {
       preview: input.preview.slice(0, 1500),
       previewHash: sha256Hex(input.preview.slice(0, 1500)),
       hints,
+      assessment: input.assessment ?? null,
       createdAt: created.toISOString(),
       expiresAt: new Date(deadline).toISOString(),
     };
@@ -148,6 +161,16 @@ export class PendingApprovalRegistry {
       'cloud',
     );
     return { ok: true };
+  }
+
+  /**
+   * This device decided by itself: tier-A auto-approval. Returns false when the entry is already
+   * gone, so a race with a cloud decision can never answer the same prompt twice.
+   */
+  async decideLocally(approvalId: string, decision: ApprovalDecision): Promise<boolean> {
+    if (!this.pending.has(approvalId)) return false;
+    await this.finish(approvalId, decision === 'allow' ? 'allowed' : 'denied', decision, 'device');
+    return true;
   }
 
   /** Provider resolved it on its own (user answered in the terminal, turn interrupted…). */

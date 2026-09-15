@@ -21,6 +21,7 @@ import {
 import { AttachmentLeaseRegistry } from './attachmentLease.js';
 import { deleteAttachment, type FetchLike, fetchAttachment } from './attachments.js';
 import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.js';
+import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFloor.js';
 import { makeEvent } from './events.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
@@ -30,7 +31,12 @@ import type { SessionStore } from './sessions.js';
 
 type AckPayload = EventPayload<'command.ack'>;
 
-export interface ApprovalRequest extends Omit<PendingApprovalInput, 'onResolve'> {
+export interface ApprovalRequest extends Omit<PendingApprovalInput, 'onResolve' | 'assessment'> {
+  /**
+   * Unredacted local facts about the action (command, paths, cwd, project root). Classified here,
+   * on the Mac, into the assessment the device floor judges a cloud `allow` against.
+   */
+  local?: LocalActionDetail;
   /** Resolved exactly once. `decision` is null for timeouts / provider-side / shutdown. */
   onDecision: (
     decision: ApprovalDecision | null,
@@ -59,6 +65,12 @@ export interface DispatcherOptions {
   tmpDir: string;
   bridgeVersion: string;
   policyFile?: string;
+  /** `~/.pagr/device-policy.json` — the local approval floor. Never written by a command. */
+  devicePolicyFile?: string;
+  /** Environment the device floor reads `PAGR_DEVICE_FLOOR` from. Defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
+  /** Pre-built floor; overrides `devicePolicyFile`/`env`. Tests use it. */
+  deviceFloor?: DeviceFloor;
   fetch?: FetchLike;
   now?: () => Date;
   logger?: Logger;
@@ -77,6 +89,11 @@ export interface DispatcherOptions {
 export class Dispatcher {
   readonly approvals: PendingApprovalRegistry;
   readonly guard: SessionGuard;
+  /**
+   * The device-side approval floor. Built once at construction from local files and the
+   * environment: nothing the cloud sends can replace, widen or bypass it.
+   */
+  readonly floor: DeviceFloor;
   policy: PublicPolicy;
   private readonly logger: Logger;
   private readonly now: () => Date;
@@ -94,6 +111,7 @@ export class Dispatcher {
       ...(o.attachmentLeaseTtlMs ? { ttlMs: o.attachmentLeaseTtlMs } : {}),
     });
     this.policy = readPolicy(o.policyFile);
+    this.floor = o.deviceFloor ?? DeviceFloor.fromFile(o.devicePolicyFile, o.env ?? process.env);
     this.approvals = new PendingApprovalRegistry({
       now: this.now,
       onResolveError: (approvalId, err) =>
@@ -495,8 +513,32 @@ export class Dispatcher {
     return { sessions: out };
   }
 
+  /**
+   * The cloud's answer to a pending approval — and the one place a compromised cloud could
+   * otherwise have turned "nine typed commands" into a remote shell.
+   *
+   * An `allow` is checked against the classification this Mac made when the provider raised the
+   * prompt, before the cloud had been told anything about it. If the local classification puts the
+   * action in a risk class the user has not lifted on this Mac, the approval is answered **deny**,
+   * the agent is told, the phone is told why and how to opt in, and the command acks `failed`.
+   * There is no path here that turns a refusal into a quieter allow.
+   */
   private async respondToApproval(p: CommandPayload<'agent.respond_to_approval'>) {
-    const r = await this.approvals.respond(p);
+    // Read before `respond` consumes the entry. `respond` still re-checks the binding, so a
+    // mismatched request is reported as a mismatch rather than as a policy refusal.
+    const pending = p.decision === 'allow' ? this.approvals.get(p.approvalId) : null;
+    // An entry with no stored classification is re-classified here rather than waved through:
+    // a missing assessment must never be the reason a cloud `allow` succeeds.
+    const assessment =
+      pending &&
+      (pending.assessment ??
+        classifyLocally({
+          actionType: pending.actionType,
+          preview: pending.preview,
+          hints: pending.hints,
+        }));
+    const refusal = assessment ? this.floor.check(assessment) : null;
+    const r = await this.approvals.respond(refusal ? { ...p, decision: 'deny' } : p);
     if (!r.ok) {
       const msg = {
         unknown: 'no pending approval (expired or already used)',
@@ -507,6 +549,23 @@ export class Dispatcher {
       // An approval that timed out is not a session that vanished: `unknown_session` sent the
       // phone to "this session is gone" when the session was alive and only the prompt had lapsed.
       throw new DispatchError(r.error === 'unknown' ? 'unknown_approval' : 'invalid_payload', msg);
+    }
+    if (refusal && pending) {
+      this.logger.warn('device policy refused a cloud approval', {
+        approvalId: p.approvalId,
+        sessionId: pending.sessionId,
+        risks: refusal.risks.join(','),
+      });
+      // The user must be able to see this happened without reading the daemon log.
+      this.send('session.event', {
+        sessionId: pending.sessionId,
+        projectId: pending.projectId,
+        provider: pending.provider,
+        kind: 'needs_input',
+        summary: refusal.message.slice(0, 2000),
+        at: this.now().toISOString(),
+      });
+      throw new DispatchError('capability_unsupported', refusal.message);
     }
     return { approvalId: p.approvalId, decision: p.decision };
   }
@@ -527,10 +586,19 @@ export class Dispatcher {
    * consumed the entry by the time this runs, so a failed relay cannot be answered a second time.
    */
   requestApproval(input: ApprovalRequest): PendingApproval {
-    const { onDecision, ...rest } = input;
+    const { onDecision, local, ...rest } = input;
+    // Classified here, on the Mac, from what the provider asked for — before the cloud has been
+    // told this prompt exists, and never from anything the cloud will later echo back.
+    const assessment = classifyLocally({
+      actionType: rest.actionType,
+      preview: rest.preview,
+      hints: rest.hints ?? {},
+      ...(local ? { detail: local } : {}),
+    });
     const record = this.approvals.register(
       {
         ...rest,
+        assessment,
         onResolve: async (resolution, decision, source) => {
           try {
             await onDecision(decision, resolution, source);
@@ -570,6 +638,23 @@ export class Dispatcher {
       hints: record.hints,
       expiresAt: record.expiresAt,
     });
+    // `smartApprovalsTierA` (synced from the dashboard, persisted in `policy.json`) means "answer
+    // the obviously-safe ones for me". Which ones are obvious is decided here, not by the cloud:
+    // only an action this Mac classified as carrying no risk class at all, and which is not a
+    // shell command. A shell line always waits for a person. The device policy can pin this off
+    // locally regardless of what the dashboard says.
+    if (this.policy.smartApprovalsTierA && this.floor.tierAAutoApprove && assessment.tierA) {
+      this.logger.info('tier-A auto-approval', {
+        approvalId: record.approvalId,
+        actionType: record.actionType,
+      });
+      void this.approvals.decideLocally(record.approvalId, 'allow').catch((err) =>
+        this.logger.warn('tier-A auto-approval failed', {
+          approvalId: record.approvalId,
+          error: String(err),
+        }),
+      );
+    }
     return record;
   }
 
@@ -623,11 +708,13 @@ export class Dispatcher {
           actionType: e.actionType,
           preview: e.preview,
           hints: e.hints,
+          ...(e.local ? { local: e.local } : {}),
           expiresAt: e.expiresAt,
           onDecision: async (decision, _resolution, source) => {
-            // The provider already knows when it resolved the request itself. Cloud decisions and
-            // local timeouts (reported as an explicit deny) must be relayed.
-            if (source !== 'cloud' && source !== 'timeout') return;
+            // The provider already knows when it resolved the request itself. Everything else —
+            // the cloud's answer, a local timeout, and this device's own decision (tier A, or a
+            // floor refusal turned into a deny) — has to reach the agent.
+            if (source === 'provider' || source === 'shutdown') return;
             await adapter?.respondToApproval({
               approvalId: e.approvalId,
               providerRequestId: e.providerRequestId,

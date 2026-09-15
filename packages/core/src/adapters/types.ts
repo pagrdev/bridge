@@ -5,6 +5,7 @@ import type {
   Provider,
   SessionSummary,
 } from '@pagr/protocol';
+import type { LocalActionDetail } from '../deviceFloor.js';
 
 export interface LocalProject {
   projectId: string;
@@ -64,6 +65,13 @@ export type AdapterEvent =
         secretsTouch: boolean;
         productionHint: boolean;
       }>;
+      /**
+       * Unredacted local facts (command, paths, cwd) for the device floor to classify against.
+       * Stays on the Mac: `preview` is what the cloud is told. Optional so an adapter that cannot
+       * produce it still works — the floor then falls back to the preview and the hints, which are
+       * also computed locally.
+       */
+      local?: LocalActionDetail;
       expiresAt: string;
     }
   | {
@@ -92,4 +100,11 @@ export interface CodingAgentAdapter {
 }
 
 // Re-exported so adapter packages can import everything they need from one place.
-export type { AgentCapabilities, AgentConnectionStatus, AttachmentRef, Provider, SessionSummary };
+export type {
+  AgentCapabilities,
+  AgentConnectionStatus,
+  AttachmentRef,
+  LocalActionDetail,
+  Provider,
+  SessionSummary,
+};

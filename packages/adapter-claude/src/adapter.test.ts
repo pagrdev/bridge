@@ -123,13 +123,24 @@ describe('ClaudeAdapter against fake claude', () => {
         'default',
         '--permission-prompt-tool',
         'stdio',
+        '--setting-sources',
+        '--strict-mcp-config',
         '--session-id',
         '--disallowedTools',
       ]),
     );
     expect(args.argv[args.argv.indexOf('--session-id') + 1]).toMatch(/^[0-9a-f-]{36}$/);
+    // SEC-3: the cloned repo's own .claude/settings.json and .mcp.json must not be able to grant
+    // this session permissions, or no approval is ever raised and the phone is never asked.
+    expect(args.argv[args.argv.indexOf('--setting-sources') + 1]).toBe('user,local');
+    expect(args.argv[args.argv.indexOf('--setting-sources') + 1]).not.toContain('project');
+    // SEC-6: read-only must actually mean read-only; Bash alone is a write path (`sed -i`).
+    expect(args.argv[args.argv.indexOf('--disallowedTools') + 1].split(',')).toEqual(
+      expect.arrayContaining(['Bash', 'Edit', 'Write', 'NotebookEdit', 'Task']),
+    );
     expect(args.env.PAGR_SESSION_ID).toBe(SES);
-    expect(args.env.PAGR_DAEMON_SOCK).toBe(path.join(home, 'run', 'daemon.sock'));
+    // SEC-17: a cloud-started agent is not handed the daemon's IPC socket path.
+    expect(args.env.PAGR_DAEMON_SOCK).toBeUndefined();
     expect(fs.realpathSync(args.cwd)).toBe(fs.realpathSync(project));
     const persisted = JSON.parse(fs.readFileSync(path.join(home, 'claude-sessions.json'), 'utf8'));
     expect(persisted[SES].claudeSessionId).toMatch(/^[0-9a-f-]{36}$/);

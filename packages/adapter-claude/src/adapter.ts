@@ -12,7 +12,6 @@ import type {
   SessionSummary,
   StartSessionInput,
 } from '@pagr/bridge-core';
-import { resolveSocketPath } from '@pagr/bridge-core';
 import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.js';
 import { ClaudeProcess } from './claude-process.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
@@ -385,8 +384,14 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     });
   }
 
+  /**
+   * Environment for a spawned child. A key set to `undefined` in `extra` is REMOVED rather than
+   * inherited, so the adapter can withhold a variable the daemon itself has (PAGR_DAEMON_SOCK).
+   */
   private env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-    return { ...process.env, ...(this.opts.env ?? {}), ...extra };
+    const merged: NodeJS.ProcessEnv = { ...process.env, ...(this.opts.env ?? {}), ...extra };
+    for (const [k, v] of Object.entries(extra)) if (v === undefined) delete merged[k];
+    return merged;
   }
 
   private requireLive(sessionId: string): LiveSession {
@@ -496,15 +501,19 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     session: { kind: 'new'; id: string } | { kind: 'resume'; id: string },
   ): void {
     live.lastActivityMs = Date.now();
+    const settingSources =
+      this.opts.env?.PAGR_CLAUDE_SETTING_SOURCES ?? process.env.PAGR_CLAUDE_SETTING_SOURCES;
     const proc = new ClaudeProcess({
       command: this.opts.claudeCommand ?? ['claude'],
       cwd: live.projectPath,
-      env: this.env({
-        PAGR_SESSION_ID: live.summary.sessionId,
-        PAGR_DAEMON_SOCK: process.env.PAGR_DAEMON_SOCK ?? resolveSocketPath(this.opts.home),
-      }),
+      // PAGR_DAEMON_SOCK is deliberately NOT passed down. These children answer permission prompts
+      // over their own stdio, never over the daemon's IPC socket, so handing a cloud-started agent
+      // the socket path only gave it a lead. It is not a boundary — the socket sits at a
+      // well-known path and is uid-checked, so anything running as this user can still find it.
+      env: this.env({ PAGR_SESSION_ID: live.summary.sessionId, PAGR_DAEMON_SOCK: undefined }),
       session,
       readOnly: live.readOnly,
+      ...(settingSources ? { settingSources } : {}),
       logger: this.logger,
     });
     live.proc = proc;
@@ -623,10 +632,11 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       timer,
     });
     const preview = previewForTool(ev.toolName, ev.input, live.projectPath);
+    const command = typeof ev.input.command === 'string' ? ev.input.command : undefined;
+    const url = typeof ev.input.url === 'string' ? ev.input.url : undefined;
     let hints: Hints;
     if (ev.toolName === 'Bash') {
-      const cmd = typeof ev.input.command === 'string' ? ev.input.command : '';
-      hints = hintsForCommand(cmd, live.projectPath, live.projectPath);
+      hints = hintsForCommand(command ?? '', live.projectPath, live.projectPath);
     } else {
       hints = hintsForFiles(filePathsOf(ev.input), live.projectPath);
       if (ev.toolName === 'WebFetch' || ev.toolName === 'WebSearch') hints.networkAccess = true;
@@ -641,6 +651,15 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       actionType: actionTypeForTool(ev.toolName),
       preview: clip(preview, 1500),
       hints,
+      // Unredacted, for the device floor only. `preview` above is what leaves the Mac.
+      local: {
+        toolName: ev.toolName,
+        projectPath: live.projectPath,
+        cwd: live.projectPath,
+        paths: filePathsOf(ev.input),
+        ...(command !== undefined ? { command } : {}),
+        ...(url !== undefined ? { url } : {}),
+      },
       expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
     });
   }

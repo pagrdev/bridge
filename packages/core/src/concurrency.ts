@@ -43,7 +43,15 @@ export interface WorkspaceClaim {
    * in the working-tree rule: refusing on a path we cannot name would be a guess.
    */
   projectPath: string | null;
-  /** False for read-only sessions, which cannot corrupt anyone else's edits. */
+  /**
+   * False for read-only sessions, which cannot corrupt anyone else's edits.
+   *
+   * This has to be true of the session, not just recorded about it. Codex enforces it with a real
+   * sandbox (`sandbox: 'read-only'`). Claude Code has no sandbox, so the adapter must withhold
+   * every tool that can write — `Bash` included, since `sed -i` is a write and `Bash` was once
+   * left enabled here (SEC-6/BR-9). See `READ_ONLY_DISALLOWED_TOOLS` in the Claude adapter, which
+   * is what makes this flag honest.
+   */
   writeCapable: boolean;
 }
 

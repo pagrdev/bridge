@@ -1,11 +1,93 @@
 # Security
 
-## Threat model in one paragraph
+## The guarantee, precisely
 
 The bridge is the only piece of Pagr that runs on your machine, so it is the piece an attacker
 would most like to control. We assume the network is hostile, that the Pagr cloud could be
-compromised or coerced, and that another local user or process might poke at the daemon. The design
-goal is that **even a fully compromised cloud cannot turn the bridge into a remote shell**.
+compromised or coerced, and that another local process running as you might poke at the daemon.
+
+**What a compromised cloud can do.** It can start and stop Claude Code and Codex sessions in
+projects *you registered locally*, send them arbitrary instruction text, and answer the permission
+prompts those sessions raise. Instruction text is a real capability: "run `curl … | sh`" is a
+sentence an agent may act on. So the honest statement is not "the cloud cannot make the agent try
+anything"; it is that **the cloud cannot, by itself, make a high-risk action succeed**.
+
+**What it cannot do.** It cannot send a shell command, a filesystem path, or a binary to run —
+there is no command for it (`packages/protocol/src/schemas.ts`). It cannot reach a directory you
+have not registered. It cannot relay its own `allow` for anything this Mac classified as high risk
+(below). It cannot lift that classification: no command changes it, and there is no command that
+can. It never sees your device private key, and the bridge never reads your provider credentials.
+
+**The device-side floor** (`packages/core/src/deviceFloor.ts`) is what makes the second paragraph
+true. Every permission prompt is classified *on this Mac*, from the command string and the paths
+the provider itself asked for — before the cloud is told the prompt exists, and never from anything
+the cloud echoes back. If the local classification puts the action in one of these classes, a cloud
+`allow` is answered **deny** instead, the agent is told, and your phone gets a message saying which
+class blocked it and how to opt in:
+
+| Class | Refused by default |
+| --- | --- |
+| `remote_code` | a script fetched from the network and piped or substituted into an interpreter (`curl … \| sh`, `bash <(curl …)`, `eval "$(curl …)"`) |
+| `network` | anything that reaches a host: `curl`/`wget`/`ssh`/`scp`, `git push`/`pull`/`clone`, package installs, `WebFetch`/`WebSearch` |
+| `outside_project` | reading or writing a path outside the registered project root, or running with a cwd outside it |
+| `credentials` | `.env*`, `.ssh`, `.aws`, `.gnupg`, `.npmrc`, `.netrc`, `.pgpass`, `.git-credentials`, `id_rsa`/`id_ed25519`, `*.pem`/`*.p12`/`*.pfx`, `…_API_KEY`-shaped names, Keychain access |
+| `privilege` | `sudo`, `doas`, setuid, `launchctl`, `csrutil`, `spctl`, AppleScript `with administrator privileges` |
+| `destructive` | `rm -rf`, `mkfs`, `dd of=/dev/…`, and history-rewriting git: `reset --hard`, force-push, `filter-branch`, `rebase`, `branch -D` |
+
+**Lifting it is a local act, and only a local act.** Either edit `~/.pagr/device-policy.json`:
+
+```json
+{ "version": 1, "allow": ["network"], "allowedHosts": ["api.github.com"], "tierAAutoApprove": true }
+```
+
+…or start the daemon with `PAGR_DEVICE_FLOOR=network,destructive` (or `PAGR_DEVICE_FLOOR=all`).
+`allowedHosts` is the narrow form of the `network` lift: egress is permitted when *every* host the
+action names is on the list, so `git push`, which names no host, is never covered by it. An
+unrecognised class name is ignored rather than guessed at — a typo can never widen the floor. A
+corrupt or wrong-shaped policy file reads as the strict default, never as "allow". `pagr doctor`
+prints the floor and reports `warn` when any class has been lifted, so a lift is never invisible.
+
+**`smartApprovalsTierA`.** The dashboard setting is synced by `settings.sync_public_policy` and is
+now actually read. When it is on, the bridge answers `allow` itself for an action it classified as
+carrying **no** risk class at all *and* which is not a shell command — a shell line always waits for
+a person. Tier A therefore grants the cloud nothing it could not already have had by answering the
+prompt itself. Set `"tierAAutoApprove": false` in `device-policy.json` to pin it off locally
+regardless of what the dashboard says.
+
+**What is still trusted, and what this does not cover.** Read this part before relying on any of
+the above:
+
+- **The agents themselves.** Claude Code and Codex run as your user with your provider
+  credentials. The bridge does not sandbox them, and cannot. Once an action is approved, what it
+  does is between you and the agent.
+- **Reading is not always an approval.** The floor only sees actions the provider *prompts* for.
+  Claude Code does not prompt to read a file inside the project it was started in, so an
+  instruction can make an agent read a `.env` that is committed to your repo, and whatever the
+  agent then says about it travels back through the cloud in the session transcript. Keep secrets
+  out of registered project directories; the floor is not a data-exfiltration control.
+- **The classifier is patterns, not semantics.** It is deterministic and conservative, and it is
+  applied to the command the provider asked to run — but an attacker who controls the instruction
+  can try to phrase a command so it does not match (obfuscation, a helper script written in one
+  approved step and run in the next, an unusual interpreter). Treat the floor as a floor: it
+  removes the one-step remote-shell path and makes the interesting cases loud, not as a proof.
+- **Anything already running as you.** The IPC socket is uid-checked, not capability-checked. Any
+  process running as your user can open it. Dropping `PAGR_DAEMON_SOCK` from the environment of
+  cloud-started `claude` children stops the bridge *handing over* the path; it is not a boundary,
+  because the path is well known.
+- **`.claude/settings.local.json`.** Bridge-spawned sessions load `--setting-sources user,local`,
+  so a cloned repo's own `.claude/settings.json` can no longer grant itself permissions and no
+  longer suppresses the prompt. `local` is `.claude/settings.local.json`, which is gitignored by
+  convention but still lives in the project directory — a repo that commits one anyway can still
+  grant permissions to a session started in it. Set `PAGR_CLAUDE_SETTING_SOURCES=user` on the
+  daemon to drop that too.
+- **The interactive hook path.** The daemon accepts hook-shaped approval requests so that prompts
+  from your *own* `claude` can be answered from your phone. Nothing installs that hook yet (see
+  `docs/TROUBLESHOOTING.md`), so the path is dormant. When it is used it goes through the same
+  floor — but the hook only sees what Claude Code hands it, which is less than the bridge-spawned
+  path sees, so its classification is coarser.
+- **Codex `read-only` vs Claude read-only.** Codex enforces read-only with a real sandbox. Claude
+  Code has none, so read-only there is enforced by withholding tools (below). That is a deny-list
+  against a tool set that can change between releases.
 
 ## What the bridge can be asked to do
 
@@ -18,17 +100,14 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | `agent.start_session` | start a Claude Code / Codex session **in a project you registered locally**, with an instruction string and up to 4 image attachments |
 | `agent.send_instruction` | send follow-up text to an existing session |
 | `agent.stop_session` | interrupt a session |
-| `agent.respond_to_approval` | answer a permission prompt the agent raised, bound to the exact preview you saw |
-| `settings.sync_public_policy` | update the approval timeout / tier-A auto-approve flags |
+| `agent.respond_to_approval` | answer a permission prompt the agent raised, bound to the exact preview you saw — and subject to the device floor above |
+| `settings.sync_public_policy` | update the approval timeout and the tier-A auto-approve flag |
 
 There is deliberately **no** `shell.exec`, `fs.read`, `fs.write`, `process.spawn`, or "run this
 binary". The cloud cannot send a filesystem path: project references are opaque `proj_…` ids that
 only resolve against `~/.pagr/projects.json` on your machine (`projects.ts`). Sending a path where an
-id is expected fails schema validation before anything else runs.
-
-The coding agents themselves (Claude Code, Codex) still run with your user's permissions and their
-own permission models. The bridge relays their approval prompts to you; it never auto-approves
-anything unless you enable the tier-A policy in the dashboard, and it never widens what the agent can do.
+id is expected fails schema validation before anything else runs. Nothing in this list can write
+`device-policy.json` or change what the floor refuses.
 
 ## Command authentication (`commandGuard.ts`)
 
@@ -54,13 +133,15 @@ Every command is checked, in this order, and the first failure rejects it with a
 8. **Local existence** — referenced project / session ids must exist locally.
 
 A compromised gateway that lacks the server signing key can therefore do nothing; a stolen signing key
-still cannot target a different device, replay old commands, or reach unregistered directories.
+still cannot target a different device, replay old commands, reach unregistered directories, or get a
+high-risk approval past the device floor.
 
 ## Device identity (`identity.ts`, `keychain.ts`)
 
 - Ed25519 keypair generated locally with Node's `crypto`. Only the public key is sent at pairing.
 - Private key lives in the macOS Keychain (`@napi-rs/keyring`, service `dev.pagr.bridge`), with a
-  `/usr/bin/security` fallback. A plaintext file store exists only behind `PAGR_INSECURE_FILE_STORE=1`.
+  `/usr/bin/security` fallback that passes the key on stdin, never on the command line. A plaintext
+  file store exists only behind `PAGR_INSECURE_FILE_STORE=1`.
 - Gateway auth is challenge/response: the bridge signs `${deviceId}.${nonce}`; no long-lived bearer token.
 - Revoking the device in the dashboard removes the public key server-side; the bridge is then refused at
   the next connection.
@@ -73,14 +154,43 @@ exponential backoff. The only local endpoint is a Unix-domain socket at `~/.pagr
 - created mode `0600` inside a `0700` directory;
 - on start, a stale socket is unlinked only if it is a socket owned by the current uid;
 - ownership and mode are re-verified after bind;
-- requests are newline-delimited JSON with a 1 MiB line cap; unknown methods are refused.
+- requests are newline-delimited JSON with a 1 MiB line cap; unknown methods are refused;
+- `agent.event` must name a session this daemon owns and agree with that record about provider and
+  project, so a local script cannot push fabricated session events to your phone. The socket is
+  uid-checked, so this is a same-user boundary, not a trust boundary.
 
-## Approvals (`approvals.ts`, `dispatcher.ts`)
+## Approvals (`approvals.ts`, `dispatcher.ts`, `deviceFloor.ts`)
 
 Each pending approval is bound to session id, provider request id, and `sha256(preview)`. The cloud's
 decision must echo all three; a mismatch is rejected. Entries are single-use and expire after the
 policy timeout (default 600 s), at which point the provider is told **deny**. When the provider resolves
 a request on its own (you answered in the terminal), the bridge records that and does not answer twice.
+
+Those three checks only prove the cloud echoed back what the bridge had just told it, so they are
+not on their own an authorisation of anything. The decision that matters is the local one: when the
+prompt is registered, the bridge classifies the action itself (see "The guarantee, precisely") and
+keeps the result. A cloud `allow` is checked against **that** classification. A refusal answers the
+provider `deny`, emits a `session.event` naming the class and the opt-in, and acks the command
+`failed` / `capability_unsupported`. There is no path that turns a refusal into a quieter allow, and
+none that answers the same prompt twice.
+
+## Agents the bridge spawns (`adapter-claude`, `adapter-codex`)
+
+`claude` is started with `--setting-sources user,local --strict-mcp-config`, so the *project's* own
+`.claude/settings.json` and `.mcp.json` cannot grant the session permissions or add tools to it. Without
+those flags a repository you had merely cloned could ship `permissions.allow: ["Bash(*)"]`, or a
+PreToolUse hook that returns allow, and no approval would ever be raised — you would never be asked,
+and the device floor would never see the action. See the caveat about `.claude/settings.local.json`
+above.
+
+A **read-only** Claude session is given
+`--disallowedTools Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,Task,Agent`. `Bash`
+has to be in that list: `sed -i`, `tee` and `>` are writes, so a read-only session that kept `Bash`
+could edit the checkout while `concurrency.ts` recorded it as `writeCapable: false` and let a second
+write-capable session into the same working tree — the exact race the one-writer rule exists to
+prevent. Codex read-only sessions use the provider's own `sandbox: 'read-only'`.
+
+Cloud-started `claude` children do not receive `PAGR_DAEMON_SOCK`.
 
 ## Filesystem containment (`projects.ts`)
 
@@ -108,8 +218,15 @@ turn that never ends — after one hour, with `cleanupTmp` sweeping anything old
 
 ## Supply chain
 
-Runtime dependencies are `ws`, `zod`, and `@napi-rs/keyring`. Child processes (in adapters) are spawned
-with argument arrays, never through a shell. There is no auto-update mechanism in this repository.
+Third-party runtime dependencies across the published packages are `zod` (all), `ws` and
+`@napi-rs/keyring` (`@pagr/bridge-core`), and `commander` and `picocolors` (`@pagr/cli`). The
+optional `integrations/claude-channel` add-on, which is not part of the default install, also uses
+`@modelcontextprotocol/sdk`.
+
+Child processes are spawned with argument arrays, never through a shell. Secrets are never passed
+as argv: the `/usr/bin/security` fallback writes the device private key to the tool's stdin, because
+argv is visible in `ps` to every user on the machine. There is no auto-update mechanism in this
+repository.
 
 ## Reporting a vulnerability
 

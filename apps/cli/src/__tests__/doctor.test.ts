@@ -111,6 +111,22 @@ describe('doctor · state files', () => {
     expect(check(r, 'permissions')?.status).toBe('ok');
   });
 
+  it('reports the device approval floor, and says so loudly when it has been lifted', async () => {
+    let r = await report(['--offline']);
+    expect(check(r, 'device policy')?.status).toBe('ok');
+    expect(check(r, 'device policy')?.detail).toContain('cannot run remote scripts');
+    writeFileSync(
+      getPaths(h.home).devicePolicyFile,
+      JSON.stringify({ version: 1, allow: ['network', 'destructive'] }),
+      { mode: 0o600 },
+    );
+    r = await report(['--offline']);
+    // Not a fault — the user asked for it — but never invisible.
+    expect(check(r, 'device policy')?.status).toBe('warn');
+    expect(check(r, 'device policy')?.detail).toContain('network, destructive');
+    expect(check(r, 'device policy')?.fix).toContain('device-policy.json');
+  });
+
   it('reports an unwritable home rather than silently working around it', async () => {
     const ro = join(h.home, '..', 'ro-home');
     mkdirSync(ro, { recursive: true });

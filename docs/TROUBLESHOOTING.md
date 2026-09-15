@@ -1,6 +1,6 @@
 # Troubleshooting the Pagr bridge
 
-Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 0700/0600 permissions), `config.json` and `projects.json` integrity, the secret store (with a real read/write round-trip), the device key, pairing, API reachability, clock skew, the daemon socket, the gateway handshake, gateway reachability, the `codex`/`claude` CLIs and the launch agent — printing a fix for each failure.
+Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 0700/0600 permissions), `config.json` and `projects.json` integrity, the secret store (with a real read/write round-trip), the device key, pairing, API reachability, clock skew, the daemon socket, the gateway handshake, gateway reachability, the device approval floor, the `codex`/`claude` CLIs and the launch agent — printing a fix for each failure.
 
 - `pagr doctor` exits **0** on a Mac that simply has not been set up yet. Not paired, no daemon and no launch agent are `warn`/`skip`, each carrying the next command to run; the network checks are skipped entirely until something has actually chosen an API URL. It exits **5** only for a real fault — a Keychain that will not open, a state file that will not parse, a configured API that nothing answers, a daemon that was installed and does not reply.
 - `pagr doctor --json` produces a support-ready report. Every error message in the CLI points here. It carries `"paired"` next to `"ok"`, so a script can tell "healthy but unpaired" from "healthy and paired".
@@ -116,6 +116,23 @@ pagr projects        # still there; the cloud learns the ids on the next connect
 ```
 
 Use `pagr logout --purge` to also forget the project registry, or `pagr uninstall --yes` to remove `~/.pagr` entirely.
+
+## "This Mac's device policy refused the approval"
+
+You approved something from your phone and the bridge answered the agent `deny` anyway. That is the
+device floor (`docs/SECURITY.md`): a decision relayed through Pagr is not enough on its own for
+remote scripts, network egress, paths outside the project, credential files, privilege escalation,
+or destructive/history-rewriting git. The message names the class that blocked it.
+
+To allow that class on this Mac, add it to `~/.pagr/device-policy.json` and restart the daemon:
+
+```json
+{ "version": 1, "allow": ["network"], "allowedHosts": ["api.github.com"] }
+```
+
+…or start the daemon with `PAGR_DEVICE_FLOOR=network` (`all` lifts everything). `pagr doctor` shows
+what is currently in force. There is deliberately no way to do this from your phone or the
+dashboard — that is the point of the floor.
 
 ## `~/.pagr` problems
 

@@ -146,6 +146,71 @@ describe('permission.mjs hook', () => {
     expect(wrongEvent).toEqual({ stdout: '', code: 0 });
   });
 
+  it('relativizes paths under the session cwd so the preview carries no local layout (SEC-15)', async () => {
+    const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-')));
+    try {
+      const d = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+      await runHook(
+        {
+          ...stdinPayload,
+          cwd: project,
+          tool_name: 'Write',
+          tool_input: { file_path: path.join(project, 'src', 'a.ts'), content: 'x' },
+        },
+        { PAGR_DAEMON_SOCK: sock },
+      );
+      await d.close();
+      const params = d.seen[0]?.params as { preview: string; hints: Record<string, boolean> };
+      // The absolute path contains the user's account name; only the project-relative part leaves.
+      expect(params.preview).toBe('Write src/a.ts');
+      expect(params.preview).not.toContain(project);
+      expect(params.preview).not.toContain(os.homedir());
+      expect(params.hints.touchesOutsideProject).toBeUndefined();
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it('treats /tmp and /private/tmp as one place, and still flags a real escape (SEC-15)', async () => {
+    const aliased = fs.mkdtempSync(path.join('/tmp', 'pagr-alias-'));
+    const real = fs.realpathSync(aliased);
+    try {
+      expect(real).not.toBe(aliased); // macOS: /tmp → /private/tmp
+      const d = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+      await runHook(
+        {
+          ...stdinPayload,
+          cwd: aliased,
+          tool_name: 'Write',
+          tool_input: { file_path: path.join(real, 'a.ts'), content: 'x' },
+        },
+        { PAGR_DAEMON_SOCK: sock },
+      );
+      await d.close();
+      const inside = d.seen[0]?.params as { preview: string; hints: Record<string, boolean> };
+      expect(inside.preview).toBe('Write a.ts');
+      expect(inside.hints.touchesOutsideProject).toBeUndefined();
+
+      const d2 = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+      await runHook(
+        {
+          ...stdinPayload,
+          cwd: aliased,
+          tool_name: 'Bash',
+          tool_input: { command: 'cat /etc/hosts' },
+        },
+        { PAGR_DAEMON_SOCK: sock },
+      );
+      await d2.close();
+      const outside = d2.seen[0]?.params as { preview: string; hints: Record<string, boolean> };
+      expect(outside.hints.touchesOutsideProject).toBe(true);
+      // A path outside the project is the one worth showing in full.
+      expect(outside.preview).toBe('$ cat /etc/hosts');
+    } finally {
+      fs.rmSync(aliased, { recursive: true, force: true });
+    }
+  });
+
   it('installHooks copies the script and hookSettings references it', () => {
     const { hookPath } = installHooks(dir);
     expect(hookPath).toBe(path.join(dir, 'hooks', 'permission.mjs'));

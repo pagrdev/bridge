@@ -5,6 +5,8 @@ import {
   auditPermissions,
   checkHomeWritable,
   clockSkewMs,
+  DEVICE_FLOOR_ENV,
+  DeviceFloor,
   describeClockSkew,
   hasIdentity,
   inspectConfig,
@@ -105,6 +107,27 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
           : 'files are user-only (0700/0600)'
         : after.map((i) => `${i.path} is ${i.actual}, want ${i.expected}`).join('; '),
     ...(after.length === 0 ? {} : { fix: 'run `pagr doctor --fix`' }),
+  });
+
+  // ---- device approval floor ---------------------------------------------
+  // The one thing in `pagr doctor` that is about what the CLOUD can do to this Mac, so it reports
+  // `warn` when it has been lifted — not as a fault, but so a lift is never invisible.
+  const floor = DeviceFloor.fromFile(ctx.paths.devicePolicyFile, process.env);
+  const lifted = floor.lifted;
+  add({
+    name: 'device policy',
+    status: lifted.length === 0 ? 'ok' : 'warn',
+    detail:
+      lifted.length === 0
+        ? 'a cloud approval cannot run remote scripts, reach the network, leave the project, touch credentials, escalate, or destroy'
+        : `lifted locally: ${lifted.join(', ')}${
+            process.env[DEVICE_FLOOR_ENV] ? ` (via ${DEVICE_FLOOR_ENV})` : ''
+          }`,
+    ...(lifted.length === 0
+      ? {}
+      : {
+          fix: `remove them from ${ctx.paths.devicePolicyFile} (or unset ${DEVICE_FLOOR_ENV}) to restore the default`,
+        }),
   });
 
   // ---- state files --------------------------------------------------------

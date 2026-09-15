@@ -15,7 +15,12 @@ export {
   channelModeEnabled,
   channelStatus,
 } from './channel-mode.js';
-export { ClaudeProcess, type ClaudeProcessOptions } from './claude-process.js';
+export {
+  ClaudeProcess,
+  type ClaudeProcessOptions,
+  DEFAULT_SETTING_SOURCES,
+  READ_ONLY_DISALLOWED_TOOLS,
+} from './claude-process.js';
 export { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 export { bundledHookPath, hookSettings, installHooks } from './hooks/install.js';
 export { MockClaudeAdapter, type MockClaudeOptions } from './mock.js';
