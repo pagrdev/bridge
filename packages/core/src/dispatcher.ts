@@ -31,6 +31,34 @@ import type { SessionStore } from './sessions.js';
 
 type AckPayload = EventPayload<'command.ack'>;
 
+/**
+ * Most sessions the bridge will describe in a `device.hello`. The adapters already prune their
+ * maps, but a hello is sent on every connect and the gateway only needs what is live or recent:
+ * anything older is still resumable by id and is reported on demand by `agent.get_status`.
+ */
+export const MAX_HELLO_SESSIONS = 100;
+
+/**
+ * Byte ceiling for the hello payload, with headroom under the gateway's 256 KiB frame cap for the
+ * event envelope and JSON escaping.
+ */
+export const MAX_HELLO_BYTES = 128 * 1024;
+
+const TERMINAL_STATUSES = new Set<SessionStatus>(['completed', 'failed', 'stopped']);
+const isTerminalStatus = (s: SessionStatus): boolean => TERMINAL_STATUSES.has(s);
+
+const helloBytes = (hello: EventPayload<'device.hello'>): number =>
+  Buffer.byteLength(JSON.stringify(hello), 'utf8');
+
+/** Live sessions first, then the most recently updated: what a phone opening the app needs. */
+export function rankHelloSessions(sessions: SessionSummary[]): SessionSummary[] {
+  return [...sessions].sort((a, b) => {
+    const live = Number(isLiveStatus(b.status)) - Number(isLiveStatus(a.status));
+    if (live !== 0) return live;
+    return (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0);
+  });
+}
+
 export interface ApprovalRequest extends Omit<PendingApprovalInput, 'onResolve' | 'assessment'> {
   /**
    * Unredacted local facts about the action (command, paths, cwd, project root). Classified here,
@@ -80,6 +108,10 @@ export interface DispatcherOptions {
   guard?: SessionGuard;
   /** Backstop lifetime for a downloaded attachment whose turn never ends. Default one hour. */
   attachmentLeaseTtlMs?: number;
+  /** Most sessions a `device.hello` may carry. Default `MAX_HELLO_SESSIONS`. */
+  maxHelloSessions?: number;
+  /** Byte ceiling for a `device.hello` payload. Default `MAX_HELLO_BYTES`. */
+  maxHelloBytes?: number;
 }
 
 /**
@@ -227,20 +259,73 @@ export class Dispatcher {
     const sessions: SessionSummary[] = [];
     for (const adapter of this.o.adapters.values()) {
       try {
-        for (const s of await adapter.listSessions()) sessions.push(s);
+        for (const s of await adapter.listSessions()) sessions.push(this.authoritative(s));
       } catch {
         // adapter may not support listing
       }
     }
-    return {
+    const hello: EventPayload<'device.hello'> = {
       bridgeVersion: this.o.bridgeVersion,
       protocolVersion: 1,
       platform: 'darwin',
       osVersion: this.o.osVersion ?? release(),
       agents,
       projects: this.o.registry.summaries(),
-      sessions,
+      sessions: rankHelloSessions(sessions).slice(0, this.o.maxHelloSessions ?? MAX_HELLO_SESSIONS),
     };
+    const dropped = sessions.length - hello.sessions.length;
+    if (dropped > 0)
+      this.logger.info('device.hello trimmed to the most relevant sessions', {
+        reported: hello.sessions.length,
+        omitted: dropped,
+      });
+    return this.fitHello(hello, sessions.length);
+  }
+
+  /**
+   * A session's status as this Mac knows it. `sessions.json` is reconciled against the providers
+   * at every daemon start, so a session it records as completed / failed / stopped is finished —
+   * and a hello must never tell the cloud otherwise. The gateway upserts these summaries, so one
+   * downgraded row is enough to make a dead session look resumable on the user's phone (BR-4).
+   */
+  private authoritative(summary: SessionSummary): SessionSummary {
+    const rec = this.o.sessions.get(summary.sessionId);
+    if (!rec || !isTerminalStatus(rec.status) || isTerminalStatus(summary.status)) return summary;
+    return { ...summary, status: rec.status, activeTurn: false, updatedAt: rec.updatedAt };
+  }
+
+  /**
+   * Make an oversized hello impossible. The gateway caps an inbound frame at 256 KiB and closes
+   * with 1009 on anything larger; since the hello is sent on every single connect, one that does
+   * not fit is an endless reconnect loop that explains itself nowhere (BR-3). So: measure what
+   * would go on the wire and shed sessions (then projects) until it fits, loudly.
+   */
+  private fitHello(
+    hello: EventPayload<'device.hello'>,
+    totalSessions: number,
+  ): EventPayload<'device.hello'> {
+    const limit = this.o.maxHelloBytes ?? MAX_HELLO_BYTES;
+    let out = hello;
+    let bytes = helloBytes(out);
+    if (bytes <= limit) return out;
+    while (bytes > limit && out.sessions.length > 0) {
+      const keep = Math.floor(out.sessions.length / 2);
+      out = { ...out, sessions: out.sessions.slice(0, keep) };
+      bytes = helloBytes(out);
+    }
+    while (bytes > limit && out.projects.length > 0) {
+      const keep = Math.floor(out.projects.length / 2);
+      out = { ...out, projects: out.projects.slice(0, keep) };
+      bytes = helloBytes(out);
+    }
+    this.logger.warn('device.hello was too large for the gateway frame cap and was trimmed', {
+      bytes,
+      limitBytes: limit,
+      sessions: out.sessions.length,
+      omittedSessions: totalSessions - out.sessions.length,
+      projects: out.projects.length,
+    });
+    return out;
   }
 
   private adapterFor(provider: Provider): CodingAgentAdapter {

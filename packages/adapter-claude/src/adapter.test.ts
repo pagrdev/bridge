@@ -93,6 +93,102 @@ describe('ClaudeAdapter against fake claude', () => {
     expect(await missing.probe()).toMatchObject({ mode: 'disabled', installed: false });
   });
 
+  it('repeated probes reuse the cached version and sign-in instead of re-forking claude', async () => {
+    // The daemon probes on every gateway connect; a flapping network used to mean two forks of
+    // `claude` per reconnect (`--version` and `auth status`).
+    const trace = path.join(home, 'trace.txt');
+    const a = new ClaudeAdapter({
+      home: path.join(home, 'probe-home'),
+      claudeCommand: ['node', FIXTURE],
+      env: { FAKE_CLAUDE_TRACE: trace },
+      log: false,
+    });
+    try {
+      for (let i = 0; i < 5; i++) expect((await a.probe()).authStatus).toBe('authenticated');
+      expect(fs.readFileSync(trace, 'utf8').trim().split('\n')).toEqual([
+        '--version',
+        'auth status',
+      ]);
+      // A zero TTL turns memoisation off, so the freshness can still be forced.
+      const live = new ClaudeAdapter({
+        home: path.join(home, 'probe-home-2'),
+        claudeCommand: ['node', FIXTURE],
+        env: { FAKE_CLAUDE_TRACE: trace },
+        versionCacheMs: 0,
+        authCacheMs: 0,
+        log: false,
+      });
+      await live.probe();
+      await live.probe();
+      await live.shutdown();
+      expect(fs.readFileSync(trace, 'utf8').trim().split('\n').length).toBe(6);
+    } finally {
+      await a.shutdown();
+    }
+  });
+
+  it('a completed session is still completed after a daemon restart (BR-4)', async () => {
+    const c = collector();
+    adapter.subscribe(c.emit);
+    await adapter.startSession({
+      sessionId: SES,
+      project: proj(),
+      instruction: 'say hello',
+      localImagePaths: [],
+      readOnly: true,
+    });
+    await c.waitFor(sessionEvent('completed'));
+    await adapter.shutdown();
+
+    // Same PAGR_HOME, new process: `listSessions` used to hard-code `idle` for everything it
+    // remembered, so every reconnect told the cloud this finished session was resumable.
+    const restarted = new ClaudeAdapter({ home, claudeCommand: ['node', FIXTURE], log: false });
+    try {
+      expect(await restarted.listSessions()).toEqual([
+        expect.objectContaining({ sessionId: SES, status: 'completed', activeTurn: false }),
+      ]);
+      expect(await restarted.getStatus(SES)).toMatchObject({ status: 'completed' });
+    } finally {
+      await restarted.shutdown();
+    }
+  });
+
+  it('bounds a session map that grew to 1200 entries (BR-3)', async () => {
+    const seeded: Record<string, unknown> = {};
+    for (let i = 0; i < 1200; i++) {
+      const at = new Date(Date.now() - (1200 - i) * 60_000).toISOString();
+      seeded[`ses_${i.toString(16).padStart(32, '0')}`] = {
+        claudeSessionId: `11111111-1111-4111-8111-${i.toString(16).padStart(12, '0')}`,
+        projectId: PROJ,
+        projectPath: project,
+        startedAt: at,
+        updatedAt: at,
+        lastStatus: 'completed',
+      };
+    }
+    fs.writeFileSync(path.join(home, 'claude-sessions.json'), JSON.stringify(seeded));
+    const grown = new ClaudeAdapter({ home, claudeCommand: ['node', FIXTURE], log: false });
+    try {
+      const list = await grown.listSessions();
+      expect(list.length).toBe(500);
+      // The newest survive, and each keeps the status it finished with.
+      expect(list.every((x) => x.status === 'completed')).toBe(true);
+      expect(list.some((x) => x.sessionId === `ses_${(1199).toString(16).padStart(32, '0')}`)).toBe(
+        true,
+      );
+      expect(list.some((x) => x.sessionId === `ses_${(0).toString(16).padStart(32, '0')}`)).toBe(
+        false,
+      );
+      // The sweep is written back, so the file stops growing rather than being re-read entire.
+      const onDisk = JSON.parse(
+        fs.readFileSync(path.join(home, 'claude-sessions.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(Object.keys(onDisk).length).toBe(500);
+    } finally {
+      await grown.shutdown();
+    }
+  });
+
   it('starts a session with the verified flags/env and completes', async () => {
     const c = collector();
     adapter.subscribe(c.emit);

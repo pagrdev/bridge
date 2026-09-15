@@ -1,17 +1,18 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AttachmentRef, DeviceEvent, Provider } from '@pagr/protocol';
+import type { AttachmentRef, DeviceEvent, Provider, SessionStatus } from '@pagr/protocol';
 import { DeviceEvent as DeviceEventSchema } from '@pagr/protocol';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter } from './adapters/fake.js';
 import type { CodingAgentAdapter } from './adapters/types.js';
 import { sha256Hex } from './approvals.js';
-import { Dispatcher } from './dispatcher.js';
+import { Dispatcher, MAX_HELLO_SESSIONS } from './dispatcher.js';
 import { ProjectRegistry } from './projects.js';
 import { SessionStore } from './sessions.js';
 import { ids, makeBody } from './testFixtures.js';
 import { useTempHome } from './testUtil.js';
+import { MAX_FRAME_BYTES } from './transport.js';
 
 const PNG = Buffer.concat([
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -954,5 +955,119 @@ describe('Dispatcher', () => {
     expect(resolution).toBe('canceled');
     expect(codex.calls.at(-1)?.method).toBe('shutdown');
     expect(acks().length).toBeGreaterThan(0);
+  });
+});
+
+describe('device.hello is bounded (BR-3, BR-4)', () => {
+  const t = useTempHome('pagr-hello-');
+  const deviceId = ids.dev();
+  let codex: FakeAdapter;
+  let registry: ProjectRegistry;
+  let sessions: SessionStore;
+  let projectId: string;
+  let home: string;
+
+  const seed = (n: number, at: (i: number) => string, status: SessionStatus = 'completed') => {
+    for (let i = 0; i < n; i++) {
+      const id = `ses_${i.toString(16).padStart(32, '0')}`;
+      codex.sessions.set(id, {
+        sessionId: id,
+        projectId,
+        provider: 'codex',
+        status,
+        activeTurn: false,
+        startedAt: at(i),
+        updatedAt: at(i),
+        displayName: `session ${i} ${'n'.repeat(100)}`,
+        taskSummary: 'x'.repeat(500),
+      });
+    }
+  };
+
+  const dispatcher = (over: Partial<ConstructorParameters<typeof Dispatcher>[0]> = {}) =>
+    new Dispatcher({
+      deviceId,
+      adapters: new Map<Provider, CodingAgentAdapter>([['codex', codex]]),
+      registry,
+      sessions,
+      emit: () => {},
+      tmpDir: join(home, '.pagr', 'tmp'),
+      bridgeVersion: '0.1.0',
+      policyFile: join(home, '.pagr', 'policy.json'),
+      osVersion: '25.0.0',
+      ...over,
+    });
+
+  beforeEach(() => {
+    codex = new FakeAdapter('codex');
+    home = join(t.home, 'home');
+    mkdirSync(join(home, 'repo', '.git'), { recursive: true });
+    registry = new ProjectRegistry({ home, pagrHome: join(home, '.pagr') });
+    projectId = registry.add(join(home, 'repo')).projectId;
+    sessions = new SessionStore();
+  });
+
+  it('keeps a 1200-session hello inside the gateway frame cap, newest first', async () => {
+    // A heavy user reaches this in weeks. Unbounded, this hello was ~1 MB: the gateway closed
+    // with 1009, the bridge reconnected and sent the identical frame again, forever.
+    seed(1200, (i) => new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString());
+    const hello = await dispatcher().probe();
+    expect(codex.sessions.size).toBe(1200);
+    expect(hello.sessions.length).toBe(MAX_HELLO_SESSIONS);
+    expect(Buffer.byteLength(JSON.stringify(hello), 'utf8')).toBeLessThan(MAX_FRAME_BYTES);
+    // Newest first, so what the phone opens onto is what it gets.
+    expect(hello.sessions[0]?.sessionId).toBe(`ses_${(1199).toString(16).padStart(32, '0')}`);
+  });
+
+  it('prefers live sessions over more recent dead ones', async () => {
+    seed(300, (i) => new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString());
+    const liveId = `ses_${'a'.repeat(32)}`;
+    codex.sessions.set(liveId, {
+      sessionId: liveId,
+      projectId,
+      provider: 'codex',
+      status: 'working',
+      activeTurn: true,
+      // Older than every completed session above.
+      startedAt: '2020-01-01T00:00:00.000Z',
+      updatedAt: '2020-01-01T00:00:00.000Z',
+    });
+    const hello = await dispatcher().probe();
+    expect(hello.sessions[0]?.sessionId).toBe(liveId);
+    expect(hello.sessions.length).toBe(MAX_HELLO_SESSIONS);
+  });
+
+  it('sheds sessions, then projects, rather than building a frame that cannot be sent', async () => {
+    seed(1200, (i) => new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString());
+    const hello = await dispatcher({ maxHelloBytes: 4000 }).probe();
+    expect(Buffer.byteLength(JSON.stringify(hello), 'utf8')).toBeLessThanOrEqual(4000);
+    expect(hello.sessions.length).toBeLessThan(MAX_HELLO_SESSIONS);
+    expect(hello.bridgeVersion).toBe('0.1.0');
+  });
+
+  it('never downgrades a session this Mac knows is finished (BR-4)', async () => {
+    const id = `ses_${'b'.repeat(32)}`;
+    sessions.upsert({
+      sessionId: id,
+      provider: 'codex',
+      projectId,
+      providerSessionId: 'thread-1',
+      status: 'completed',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-02T00:00:00.000Z',
+    });
+    // An adapter that has forgotten the outcome (or a stale map) must not resurrect it: the
+    // gateway upserts hello summaries, so `idle` here is a dead session offered as resumable.
+    codex.sessions.set(id, {
+      sessionId: id,
+      projectId,
+      provider: 'codex',
+      status: 'idle',
+      activeTurn: false,
+      startedAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const hello = await dispatcher().probe();
+    expect(hello.sessions[0]).toMatchObject({ sessionId: id, status: 'completed' });
   });
 });

@@ -339,8 +339,20 @@ export const AuthResult = z.object({
   error: z.string().optional(),
   /** Server public keys currently trusted for command signatures (keyId → base64url raw key). */
   serverKeys: z.record(z.string()).optional(),
+  /**
+   * Detached Ed25519 signature over `SERVER_KEY_SET_CONTEXT + canonicalize(serverKeys)`, made
+   * with a key the bridge ALREADY trusts. Required to add a key id or change a pinned key's
+   * value; dropping keys (and re-sending the pinned set) needs none. Without it a gateway that
+   * has been talked into serving an extra key cannot poison a bridge's pin set (SEC-7).
+   */
+  serverKeysSignature: z
+    .object({ keyId: z.string().min(1).max(32), signature: z.string().min(1).max(200) })
+    .optional(),
   minBridgeVersion: z.string().optional(),
 });
+
+/** Domain separator for `serverKeysSignature`, so a command signature can never be replayed as one. */
+export const SERVER_KEY_SET_CONTEXT = 'pagr.server-keys.v1:';
 
 export const GatewayFrame = z.discriminatedUnion('kind', [
   AuthChallenge,

@@ -40,7 +40,7 @@ import {
   type TurnSteerResponse,
   type UserInput,
 } from './protocol.js';
-import { SessionMap } from './session-map.js';
+import { type PersistedSession, SessionMap } from './session-map.js';
 
 export interface CodexAdapterOptions {
   /** PAGR_HOME; state + logs live here. */
@@ -105,6 +105,29 @@ interface PendingApproval {
 
 export const newApprovalId = (): string => `apr_${randomUUID().replace(/-/g, '')}`;
 const now = () => new Date().toISOString();
+
+const TERMINAL = new Set<SessionSummary['status']>(['completed', 'failed', 'stopped']);
+
+/**
+ * How a session with no live thread is reported. A finished session keeps the status it finished
+ * with: `listSessions` used to hard-code `idle` for every remembered session, and since the cloud
+ * upserts what a `device.hello` carries, every reconnect resurrected completed, failed and
+ * stopped sessions as resumable on the user's phone (BR-4). Anything non-terminal has no thread
+ * loaded after a restart, so it is reported as `idle` — resumable, which is true.
+ */
+export function persistedSummary(sessionId: string, p: PersistedSession): SessionSummary {
+  const recorded = p.lastStatus as SessionSummary['status'];
+  return {
+    sessionId,
+    projectId: p.projectId,
+    provider: 'codex',
+    status: TERMINAL.has(recorded) ? recorded : 'idle',
+    activeTurn: false,
+    startedAt: p.startedAt,
+    updatedAt: p.updatedAt,
+    ...(p.displayName ? { displayName: p.displayName } : {}),
+  };
+}
 
 const CAPABILITIES = {
   canStartSession: true,
@@ -250,19 +273,10 @@ export class CodexAdapter implements CodingAgentAdapter {
   }
 
   async listSessions(): Promise<SessionSummary[]> {
+    // Bound what we remember before anyone copies it into a `device.hello` (BR-3).
+    this.map.prune({ protect: new Set(this.sessions.keys()) });
     const out = new Map<string, SessionSummary>();
-    for (const [sid, p] of this.map.entries()) {
-      out.set(sid, {
-        sessionId: sid,
-        projectId: p.projectId,
-        provider: 'codex',
-        status: this.sessions.has(sid) ? 'unknown' : 'idle',
-        activeTurn: false,
-        startedAt: p.startedAt,
-        updatedAt: p.updatedAt,
-        ...(p.displayName ? { displayName: p.displayName } : {}),
-      });
-    }
+    for (const [sid, p] of this.map.entries()) out.set(sid, persistedSummary(sid, p));
     for (const [sid, s] of this.sessions) out.set(sid, s.summary);
     return [...out.values()];
   }
@@ -272,16 +286,7 @@ export class CodexAdapter implements CodingAgentAdapter {
     if (live) return live.summary;
     const p = this.map.get(sessionId);
     if (!p) return null;
-    return {
-      sessionId,
-      projectId: p.projectId,
-      provider: 'codex',
-      status: 'idle',
-      activeTurn: false,
-      startedAt: p.startedAt,
-      updatedAt: p.updatedAt,
-      ...(p.displayName ? { displayName: p.displayName } : {}),
-    };
+    return persistedSummary(sessionId, p);
   }
 
   async startSession(input: StartSessionInput): Promise<SessionSummary> {
