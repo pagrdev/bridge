@@ -16,7 +16,7 @@ import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.j
 import { ClaudeProcess } from './claude-process.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 import { FileLogger } from './logger.js';
-import { SessionMap } from './session-map.js';
+import { type PersistedSession, SessionMap } from './session-map.js';
 import { actionTypeForTool, filePathsOf, previewForTool, type StreamEvent } from './stream-json.js';
 
 export interface ClaudeAdapterOptions {
@@ -34,6 +34,10 @@ export interface ClaudeAdapterOptions {
   retireGraceMs?: number;
   /** Extra env for spawned processes (tests). */
   env?: NodeJS.ProcessEnv;
+  /** Override the `claude --version` memo TTL (tests); 0 disables memoisation. */
+  versionCacheMs?: number;
+  /** Override the sign-in memo TTL (tests); 0 disables memoisation. */
+  authCacheMs?: number;
   log?: boolean;
   /** ADR 0001 `approved-channel`. Set by `createClaudeAdapter` from `PAGR_CLAUDE_CHANNEL=1`. */
   channel?: boolean;
@@ -42,6 +46,22 @@ export interface ClaudeAdapterOptions {
 }
 
 export const DEFAULT_MAX_CLAUDE_PROCESSES = 6;
+
+/** How long `claude --version` is trusted. The daemon probes on every gateway connect. */
+const VERSION_CACHE_MS = 5 * 60_000;
+/** Shorter while Claude Code is absent, so an install is noticed quickly. */
+const MISSING_CACHE_MS = 30_000;
+/** Sign-in state changes under the user, so it is re-read far more often than the version. */
+const AUTH_CACHE_MS = 60_000;
+
+/** Presence-only check; the files are never opened. */
+const credentialsPresent = (): boolean => {
+  const home = os.homedir();
+  return (
+    fs.existsSync(path.join(home, '.claude', '.credentials.json')) ||
+    fs.existsSync(path.join(home, '.claude.json'))
+  );
+};
 
 interface LiveSession {
   summary: SessionSummary;
@@ -67,6 +87,29 @@ interface PendingApproval {
 
 export const newApprovalId = (): string => `apr_${randomUUID().replace(/-/g, '')}`;
 const now = () => new Date().toISOString();
+
+const TERMINAL = new Set<SessionSummary['status']>(['completed', 'failed', 'stopped']);
+
+/**
+ * How a session with no live process is reported. A finished session keeps the status it
+ * finished with: `listSessions` used to hard-code `idle` for every remembered session, and since
+ * the cloud upserts what a `device.hello` carries, every reconnect resurrected completed, failed
+ * and stopped sessions as resumable on the user's phone (BR-4). Anything non-terminal has no
+ * process behind it after a restart, so it is reported as `idle` — resumable, which is true.
+ */
+export function persistedSummary(sessionId: string, p: PersistedSession): SessionSummary {
+  const recorded = p.lastStatus as SessionSummary['status'];
+  return {
+    sessionId,
+    projectId: p.projectId,
+    provider: 'claude',
+    status: TERMINAL.has(recorded) ? recorded : 'idle',
+    activeTurn: false,
+    startedAt: p.startedAt,
+    updatedAt: p.updatedAt,
+    ...(p.displayName ? { displayName: p.displayName } : {}),
+  };
+}
 
 /** Attachments are referenced by local path; Claude reads them with its own tools. */
 const withImages = (instruction: string, images: string[]): string =>
@@ -102,6 +145,8 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   /** Non-null only under `PAGR_CLAUDE_CHANNEL=1` (ADR 0001 `approved-channel`, dev flag only). */
   private readonly channel: ChannelMode | null;
   private shuttingDown = false;
+  private versionCache: { value: string | null; atMs: number } | null = null;
+  private authCache: { value: AgentConnectionStatus['authStatus']; atMs: number } | null = null;
 
   constructor(private readonly opts: ClaudeAdapterOptions) {
     this.logger = new FileLogger(
@@ -125,8 +170,14 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     return this.processCount(null);
   }
 
+  /**
+   * Two forks of `claude` used to run on EVERY gateway connect — `--version` and `auth status` —
+   * so a flapping network meant a fork storm. Both answers are memoised: the version for a few
+   * minutes (shorter while the binary is missing, so an install is noticed quickly), the sign-in
+   * for a minute, since that is what actually changes under the user.
+   */
   async probe(): Promise<AgentConnectionStatus> {
-    const version = await this.run(['--version']);
+    const version = await this.claudeVersion();
     if (version === null) {
       return {
         provider: 'claude',
@@ -137,33 +188,12 @@ export class ClaudeAdapter implements CodingAgentAdapter {
         detail: 'Install Claude Code (https://code.claude.com), then run `claude` once and sign in',
       };
     }
-    const ver = /(\d+\.\d+\.\d+)/.exec(version)?.[1] ?? version.trim();
-    let authStatus: AgentConnectionStatus['authStatus'] = 'unknown';
-    // `claude auth status` prints JSON incl. `loggedIn` (exit 0 logged in, 1 if not).
-    // We read ONLY the boolean; email/org fields are discarded and never logged.
-    const auth = await this.run(['auth', 'status'], true);
-    if (auth !== null) {
-      try {
-        const j = JSON.parse(auth) as { loggedIn?: boolean };
-        if (typeof j.loggedIn === 'boolean')
-          authStatus = j.loggedIn ? 'authenticated' : 'unauthenticated';
-      } catch {
-        /* older CLI without JSON output */
-      }
-    }
-    if (authStatus === 'unknown') {
-      // Presence-only inference; contents are never read.
-      const home = os.homedir();
-      const hasCreds =
-        fs.existsSync(path.join(home, '.claude', '.credentials.json')) ||
-        fs.existsSync(path.join(home, '.claude.json'));
-      authStatus = hasCreds ? 'authenticated' : 'unauthenticated';
-    }
+    const authStatus = await this.claudeAuthStatus();
     const status: AgentConnectionStatus = {
       provider: 'claude',
       mode: 'cli-hooks',
       installed: true,
-      providerVersion: ver,
+      providerVersion: version,
       authStatus,
       capabilities: { ...CAPABILITIES },
     };
@@ -171,20 +201,49 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     return this.channel ? channelStatus(status, this.channel.hasAttachedProject()) : status;
   }
 
-  async listSessions(): Promise<SessionSummary[]> {
-    const out = new Map<string, SessionSummary>();
-    for (const [sid, p] of this.map.entries()) {
-      out.set(sid, {
-        sessionId: sid,
-        projectId: p.projectId,
-        provider: 'claude',
-        status: 'idle',
-        activeTurn: false,
-        startedAt: p.startedAt,
-        updatedAt: p.updatedAt,
-        ...(p.displayName ? { displayName: p.displayName } : {}),
-      });
+  /** `claude --version`, memoised. Null means "not installed". */
+  private async claudeVersion(): Promise<string | null> {
+    const cached = this.versionCache;
+    const ttl =
+      this.opts.versionCacheMs ?? (cached?.value === null ? MISSING_CACHE_MS : VERSION_CACHE_MS);
+    if (cached && ttl > 0 && Date.now() - cached.atMs < ttl) return cached.value;
+    const raw = await this.run(['--version']);
+    const value = raw === null ? null : (/(\d+\.\d+\.\d+)/.exec(raw)?.[1] ?? raw.trim());
+    this.versionCache = { value, atMs: Date.now() };
+    return value;
+  }
+
+  /**
+   * Whether the user is signed in, memoised for a minute. `claude auth status` prints JSON
+   * including `loggedIn` (exit 0 signed in, 1 if not); ONLY that boolean is read — email and org
+   * fields are discarded and never logged. Between refreshes, and on an older CLI without the
+   * JSON output, this falls back to the presence (never the contents) of the credentials file.
+   */
+  private async claudeAuthStatus(): Promise<AgentConnectionStatus['authStatus']> {
+    const cached = this.authCache;
+    const ttl = this.opts.authCacheMs ?? AUTH_CACHE_MS;
+    if (cached && ttl > 0 && Date.now() - cached.atMs < ttl) return cached.value;
+    let value: AgentConnectionStatus['authStatus'] = 'unknown';
+    const auth = await this.run(['auth', 'status'], true);
+    if (auth !== null) {
+      try {
+        const j = JSON.parse(auth) as { loggedIn?: boolean };
+        if (typeof j.loggedIn === 'boolean')
+          value = j.loggedIn ? 'authenticated' : 'unauthenticated';
+      } catch {
+        /* older CLI without JSON output */
+      }
     }
+    if (value === 'unknown') value = credentialsPresent() ? 'authenticated' : 'unauthenticated';
+    this.authCache = { value, atMs: Date.now() };
+    return value;
+  }
+
+  async listSessions(): Promise<SessionSummary[]> {
+    // Bound what we remember before anyone copies it into a `device.hello` (BR-3).
+    this.map.prune({ protect: new Set(this.sessions.keys()) });
+    const out = new Map<string, SessionSummary>();
+    for (const [sid, p] of this.map.entries()) out.set(sid, persistedSummary(sid, p));
     for (const [sid, s] of this.sessions) out.set(sid, s.summary);
     return [...out.values()];
   }
@@ -194,16 +253,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     if (live) return live.summary;
     const p = this.map.get(sessionId);
     if (!p) return null;
-    return {
-      sessionId,
-      projectId: p.projectId,
-      provider: 'claude',
-      status: 'idle',
-      activeTurn: false,
-      startedAt: p.startedAt,
-      updatedAt: p.updatedAt,
-      ...(p.displayName ? { displayName: p.displayName } : {}),
-    };
+    return persistedSummary(sessionId, p);
   }
 
   async startSession(input: StartSessionInput): Promise<SessionSummary> {

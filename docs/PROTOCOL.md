@@ -18,17 +18,40 @@ bridge → gateway            gateway → bridge
 auth.request {deviceId}
                             auth.challenge {nonce}
 auth.response {deviceId, nonce, signature, bridgeVersion, protocolVersion}
-                            auth.result {ok, error?, serverKeys?, minBridgeVersion?}
+                            auth.result {ok, error?, serverKeys?, serverKeysSignature?, minBridgeVersion?}
 event {event: DeviceEvent}  command {envelope: CommandEnvelope}
 pong                        ping
 ```
 
 - `signature` is base64url Ed25519 over the UTF-8 string `${deviceId}.${nonce}` using the device key.
 - `serverKeys` is `keyId → base64url raw 32-byte Ed25519 public key`. The bridge pins this set
-  (`config.json`) and uses it to verify commands. Rotation works by shipping overlapping sets.
+  (`config.json`) and uses it to verify commands. A set that adds a key id, or re-points a pinned id
+  at a different key, is only accepted with `serverKeysSignature` — see *Server key rotation* in
+  `docs/SECURITY.md`. Narrowing the set (the second half of a rotation) needs no signature.
 - If `minBridgeVersion` is greater than the running version the bridge stops reconnecting and logs an
   update-required error.
-- The bridge answers `ping` with `pong` and sends `device.heartbeat` every 20 s.
+- The bridge answers `ping` with `pong` and sends `device.heartbeat` every 20 s. It also sends a
+  WebSocket ping on the same schedule and tears the socket down if the peer has sent nothing at all
+  for three heartbeats — a slept laptop leaves a half-open socket that still reads as connected.
+- The authentication phase has its own deadline (20 s). A proxy that accepts the upgrade and then
+  says nothing gets retried, not waited on forever.
+
+### `auth.result{ok:false}` and close codes
+
+`error` is a machine-readable code, and the bridge acts on which one it is:
+
+| `error` | bridge |
+| --- | --- |
+| `revoked`, `bad_signature`, `device_mismatch`, `protocol_version` | stops. The identity is refused; only `pagr connect` (or an update) fixes it |
+| `rate_limited` | transient. Backs off at least a minute and retries — a per-IP limit is shared by every bridge behind one NAT and is **not** a revocation |
+| `nonce_expired`, `nonce_mismatch`, `invalid_frame`, anything unrecognised | transient. Normal backoff |
+
+| close | meaning | bridge |
+| --- | --- | --- |
+| 4000 | a newer connection took this device identity | backs off hard (5 min) and reports that another machine is using this pairing, rather than racing it |
+| 4001 | handshake failed | per the `error` code above |
+| 4002 | below `minBridgeVersion` | stops; update required |
+| 1009 | frame over the gateway's 256 KiB cap | never provoked: the bridge measures every frame and refuses to send an oversized one |
 
 Implementation: `packages/core/src/transport.ts`.
 
@@ -83,7 +106,7 @@ Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payl
 
 | `type` | when | payload |
 | --- | --- | --- |
-| `device.hello` | after each successful auth | bridge/OS version, `agents: AgentConnectionStatus[]`, `projects: ProjectSummary[]`, `sessions` |
+| `device.hello` | after each successful auth | bridge/OS version, `agents: AgentConnectionStatus[]`, `projects: ProjectSummary[]`, `sessions` (bounded — see below) |
 | `device.heartbeat` | every 20 s | `{ activeSessions }` |
 | `command.ack` | exactly once per received command (`inReplyTo = commandId`) | `{ commandId, status: accepted\|rejected\|completed\|failed\|duplicate, errorCode?, message?, result? }` |
 | `project.registered` / `project.removed` | local CLI or `project.remove` | `ProjectSummary` / `{ projectId }` |
@@ -103,6 +126,22 @@ execution (waiting for it if it is still running), so the same `commandId` can b
 with the same result. (`duplicate` remains a valid status in the schema for older bridges; a bridge at
 this version answers a duplicate with the genuine terminal status instead.) `unknown_approval` distinguishes an approval that expired or was already answered
 from a session that no longer exists.
+
+### `device.hello` is bounded
+
+The hello is sent on **every** connect, so it can never be allowed to grow past the frame cap — an
+oversized one is a 1009 close followed by an identical oversized one, forever. Three things bound it:
+
+- each adapter prunes its own session map (terminal entries past a week, then a 500-entry ceiling,
+  live sessions never evicted);
+- the hello carries at most 100 sessions, live first and then most-recently-updated;
+- the serialised payload is measured before it is sent and sheds sessions (then projects) until it
+  fits, logging what it dropped.
+
+A session left out is not forgotten — it is still resumable by id and still answers
+`agent.get_status`. Statuses in the hello are the real ones: a session this Mac knows finished is
+reported `completed` / `failed` / `stopped`, never downgraded to `idle`, because the cloud upserts
+these summaries and a downgrade shows a dead session on the user's phone as resumable.
 
 ## Approval hints
 

@@ -13,9 +13,14 @@
 //         else     → assistant text + result success
 //       exits 0 when stdin closes.
 
+import { appendFileSync } from 'node:fs';
 import readline from 'node:readline';
 
 const argv = process.argv.slice(2);
+// FAKE_CLAUDE_TRACE=<file> records every invocation (one line of argv per process), so a test can
+// prove the adapter is not forking `claude` on every probe.
+if (process.env.FAKE_CLAUDE_TRACE)
+  appendFileSync(process.env.FAKE_CLAUDE_TRACE, `${argv.join(' ')}\n`);
 if (argv.includes('--version')) {
   process.stdout.write('2.1.220 (Claude Code)\n');
   process.exit(0);

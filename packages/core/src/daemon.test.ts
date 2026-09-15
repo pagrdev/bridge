@@ -9,16 +9,21 @@ import { FakeAdapter } from './adapters/fake.js';
 import type { CodingAgentAdapter } from './adapters/types.js';
 import { updateConfig } from './config.js';
 import {
+  classifyStartFailure,
   createDaemon,
   type Daemon,
+  DaemonStartRefused,
   installLaunchAgent,
   renderPlist,
+  startDaemon,
   uninstallLaunchAgent,
 } from './daemon.js';
 import { DaemonAlreadyRunningError } from './daemonLock.js';
-import { verifyRaw } from './identity.js';
+import { InvalidDeviceKeyError, verifyRaw } from './identity.js';
 import { IpcClient } from './ipc.js';
-import { MemorySecretStore } from './keychain.js';
+import { MemorySecretStore, SecretStoreError } from './keychain.js';
+import { DAEMON_EXIT } from './launchAgent.js';
+import { PagrHomeError } from './paths.js';
 import { DEFAULT_SESSION_RETENTION_MS } from './sessions.js';
 import { FakeServerSigner, ids, makeBody } from './testFixtures.js';
 import { useTempHome } from './testUtil.js';
@@ -664,6 +669,190 @@ describe('daemon startup reconciliation', () => {
       expect(d.channelStatus().enabled).toBe(false);
     } finally {
       await d.stop();
+    }
+  });
+});
+
+describe('startDaemon exit contract (BR-11)', () => {
+  const t = useTempHome('pagr-start-');
+  let seq = 0;
+  let home: string;
+  let exits: number[];
+  let stderr: string[];
+  let writeSpy: ReturnType<typeof vi.spyOn>;
+
+  const pair = (over: Record<string, unknown> = {}) =>
+    updateConfig(join(home, 'config.json'), {
+      deviceId: ids.dev(),
+      userId: ids.usr(),
+      // Nothing listens there; the transport retries in the background and never throws.
+      gatewayUrl: 'ws://127.0.0.1:1',
+      serverKeys: {},
+      ...over,
+    });
+
+  const start = (over: Partial<Parameters<typeof startDaemon>[0]> = {}) =>
+    startDaemon({
+      home,
+      adapters: new Map(),
+      secretStore: new MemorySecretStore(),
+      env: { PAGR_ENV: 'local' },
+      startRetry: { baseMs: 1, maxMs: 1 },
+      sleep: async () => {},
+      exit: (code: number) => {
+        exits.push(code);
+      },
+      ...over,
+    });
+
+  beforeEach(() => {
+    home = join(t.home, `h${seq++}`);
+    mkdirSync(home, { recursive: true });
+    exits = [];
+    stderr = [];
+    writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+  });
+  afterEach(() => writeSpy.mockRestore());
+
+  it('classifies what a restart can and cannot fix', () => {
+    // launchd will not restart a non-zero exit, so only these may take one.
+    expect(
+      classifyStartFailure(new SecretStoreError('locked', 'keychain is locked')).unrecoverable,
+    ).toBe(true);
+    expect(classifyStartFailure(new SecretStoreError('denied', 'user denied')).unrecoverable).toBe(
+      true,
+    );
+    expect(
+      classifyStartFailure(new SecretStoreError('unavailable', 'no store')).unrecoverable,
+    ).toBe(true);
+    expect(classifyStartFailure(new InvalidDeviceKeyError('bad key')).unrecoverable).toBe(true);
+    expect(
+      classifyStartFailure(new PagrHomeError('permission', '/x', 'denied')).unrecoverable,
+    ).toBe(true);
+    // These can come right on their own, and killing the daemon for them is worse than waiting.
+    expect(classifyStartFailure(new SecretStoreError('io', 'transient')).unrecoverable).toBe(false);
+    expect(classifyStartFailure(new PagrHomeError('no_space', '/x', 'full')).unrecoverable).toBe(
+      false,
+    );
+    expect(classifyStartFailure(new Error('getaddrinfo ENOTFOUND gateway')).unrecoverable).toBe(
+      false,
+    );
+  });
+
+  it(`exits ${DAEMON_EXIT.unrecoverable} when this Mac is not paired`, async () => {
+    await expect(start()).rejects.toBeInstanceOf(DaemonStartRefused);
+    expect(exits).toEqual([DAEMON_EXIT.unrecoverable]);
+    expect(stderr.join('')).toContain('not paired');
+  });
+
+  it(`exits ${DAEMON_EXIT.unrecoverable} on an unusable config.json`, async () => {
+    writeFileSync(join(home, 'config.json'), '{ this is not json');
+    await expect(start()).rejects.toBeInstanceOf(DaemonStartRefused);
+    expect(exits).toEqual([DAEMON_EXIT.unrecoverable]);
+    expect(stderr.join('')).toMatch(/config\.json/);
+  });
+
+  it(`exits ${DAEMON_EXIT.unrecoverable} when the Keychain will not open`, async () => {
+    pair();
+    const locked = {
+      kind: 'keyring' as const,
+      get: () => Promise.reject(new SecretStoreError('locked', 'the login keychain is locked')),
+      set: () => Promise.resolve(),
+      delete: () => Promise.resolve(),
+    };
+    await expect(start({ secretStore: locked })).rejects.toBeInstanceOf(DaemonStartRefused);
+    expect(exits).toEqual([DAEMON_EXIT.unrecoverable]);
+    // One line naming the fix — not ten thousand of them at ten-second intervals.
+    expect(stderr.join('')).toMatch(/keychain is locked/i);
+  });
+
+  it('retries a transient failure in this process instead of handing launchd a corpse', async () => {
+    pair();
+    const inner = new MemorySecretStore();
+    let attempts = 0;
+    const flaky = {
+      kind: 'keyring' as const,
+      get: (k: string) => {
+        attempts++;
+        if (attempts <= 2) return Promise.reject(new SecretStoreError('io', 'temporary failure'));
+        return inner.get(k);
+      },
+      set: (k: string, v: string) => inner.set(k, v),
+      delete: (k: string) => inner.delete(k),
+    };
+    const d = await start({ secretStore: flaky });
+    try {
+      expect(attempts).toBeGreaterThan(2);
+      expect(exits).toEqual([]); // never exited, so launchd never saw a failure
+      expect(d.status().paired).toBe(true);
+    } finally {
+      await d.stop();
+    }
+  });
+});
+
+describe('a refused device does not keep hammering the gateway (BR-5)', () => {
+  const t = useTempHome('pagr-revoked-');
+  let wss: WebSocketServer;
+  let authAttempts: number;
+
+  let writeSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    authAttempts = 0;
+    writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise<void>((r) => wss.once('listening', r));
+    wss.on('connection', (sock) => {
+      sock.on('message', (raw) => {
+        const f = JSON.parse(raw.toString()) as BridgeFrame;
+        if (f.kind === 'auth.request')
+          sock.send(JSON.stringify({ kind: 'auth.challenge', nonce: 'x'.repeat(40) }));
+        if (f.kind === 'auth.response') {
+          authAttempts++;
+          const res: GatewayFrame = { kind: 'auth.result', ok: false, error: 'revoked' };
+          sock.send(JSON.stringify(res));
+        }
+      });
+    });
+  });
+  afterEach(async () => {
+    writeSpy.mockRestore();
+    await new Promise<void>((r) => {
+      for (const c of wss.clients) c.terminate();
+      wss.close(() => r());
+    });
+  });
+
+  it('stops reconnecting and ends the process with the unrecoverable status', async () => {
+    const home = join(t.home, 'pagr');
+    mkdirSync(home, { recursive: true });
+    const exits: number[] = [];
+    updateConfig(join(home, 'config.json'), { deviceId: ids.dev(), userId: ids.usr() });
+    const paired = await createDaemon({
+      home,
+      adapters: new Map(),
+      secretStore: new MemorySecretStore(),
+      gatewayUrl: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`,
+      backoff: { baseMs: 10, maxMs: 20 },
+      env: { PAGR_ENV: 'local' },
+      exit: (code) => {
+        exits.push(code);
+      },
+    });
+    try {
+      await paired.start();
+      // The daemon takes itself down rather than retrying a refusal it cannot argue with.
+      await until(() => exits.includes(DAEMON_EXIT.unrecoverable));
+      expect(paired.transport?.lastFailure).toMatchObject({ code: 'revoked', fatal: true });
+      const attemptsWhenRefused = authAttempts;
+      await new Promise((r) => setTimeout(r, 200)); // ~10 base backoffs
+      expect(authAttempts).toBe(attemptsWhenRefused);
+    } finally {
+      await paired.stop();
     }
   });
 });

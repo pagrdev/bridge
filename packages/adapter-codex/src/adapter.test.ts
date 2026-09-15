@@ -548,6 +548,75 @@ describe('CodexAdapter read-only persistence (finding 5)', () => {
   });
 });
 
+describe('CodexAdapter session map bounds and honesty (BR-3, BR-4)', () => {
+  let home: string;
+  let project: string;
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-map-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-'));
+  });
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  });
+
+  it('a completed session is still completed after a daemon restart', async () => {
+    const first = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+    const c = collector();
+    first.subscribe(c.emit);
+    await first.startSession({
+      sessionId: SES,
+      project: { projectId: PROJ, path: project, displayName: 'demo' },
+      instruction: 'run tests',
+      localImagePaths: [],
+      readOnly: false,
+    });
+    await c.waitFor(sessionEvent('completed'));
+    await first.shutdown();
+
+    // `listSessions` used to hard-code `idle`, and the cloud upserts what a `device.hello`
+    // carries — so every reconnect offered this finished session back as resumable.
+    const again = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+    try {
+      expect(await again.listSessions()).toEqual([
+        expect.objectContaining({ sessionId: SES, status: 'completed', activeTurn: false }),
+      ]);
+      expect(await again.getStatus(SES)).toMatchObject({ status: 'completed' });
+    } finally {
+      await again.shutdown();
+    }
+  });
+
+  it('bounds a session map that grew to 1200 entries', async () => {
+    const seeded: Record<string, unknown> = {};
+    for (let i = 0; i < 1200; i++) {
+      const at = new Date(Date.now() - (1200 - i) * 60_000).toISOString();
+      seeded[`ses_${i.toString(16).padStart(32, '0')}`] = {
+        threadId: `thread-${i}`,
+        projectId: PROJ,
+        projectPath: project,
+        startedAt: at,
+        updatedAt: at,
+        lastStatus: 'completed',
+      };
+    }
+    fs.writeFileSync(path.join(home, 'codex-sessions.json'), JSON.stringify(seeded));
+    const grown = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+    try {
+      const list = await grown.listSessions();
+      expect(list.length).toBe(500);
+      expect(list.every((x) => x.status === 'completed')).toBe(true);
+      const onDisk = JSON.parse(
+        fs.readFileSync(path.join(home, 'codex-sessions.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(Object.keys(onDisk).length).toBe(500);
+      expect(grown.appServerRunning).toBe(false); // listing must not start anything
+    } finally {
+      await grown.shutdown();
+    }
+  });
+});
+
 describe('CodexAdapter process lifecycle under load', () => {
   let home: string;
   let project: string;

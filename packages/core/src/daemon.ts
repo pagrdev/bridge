@@ -6,12 +6,12 @@ import type { FetchLike } from './attachments.js';
 import { cleanupTmp } from './attachments.js';
 import { CommandTracker, verifyIncoming } from './commandGuard.js';
 import { SessionGuard } from './concurrency.js';
-import { type BridgeConfig, readConfig, updateConfig } from './config.js';
+import { type BridgeConfig, inspectConfig, readConfig, updateConfig } from './config.js';
 import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
 import type { LocalActionDetail } from './deviceFloor.js';
 import { Dispatcher } from './dispatcher.js';
 import { makeEvent } from './events.js';
-import { type DeviceIdentity, loadOrCreateIdentity } from './identity.js';
+import { type DeviceIdentity, InvalidDeviceKeyError, loadOrCreateIdentity } from './identity.js';
 import {
   type ChannelBridge,
   IpcMethodError,
@@ -19,9 +19,10 @@ import {
   IpcSocketBusyError,
   registerChannelMethods,
 } from './ipc.js';
-import type { SecretStore } from './keychain.js';
+import { type SecretStore, SecretStoreError } from './keychain.js';
+import { DAEMON_EXIT } from './launchAgent.js';
 import { type Logger, silentLogger } from './logging.js';
-import { ensurePaths, type PagrPaths } from './paths.js';
+import { ensurePaths, PagrHomeError, type PagrPaths } from './paths.js';
 import { ProjectError, ProjectRegistry } from './projects.js';
 import { type ReconciledSession, reconcileSessions } from './reconcile.js';
 import { ReplayCache } from './replay.js';
@@ -46,7 +47,9 @@ export interface CreateDaemonOptions {
   /** Test hooks. */
   WebSocketCtor?: ConstructorParameters<typeof GatewayClient>[0]['WebSocketCtor'];
   heartbeatMs?: number;
-  backoff?: { baseMs?: number; maxMs?: number };
+  backoff?: { baseMs?: number; maxMs?: number; rateLimitedMs?: number; replacedMs?: number };
+  livenessTimeoutMs?: number;
+  authTimeoutMs?: number;
   tmpCleanupOlderThanMs?: number;
   /** How long terminal sessions stay in `sessions.json` (default one week). */
   sessionRetentionMs?: number;
@@ -54,6 +57,11 @@ export interface CreateDaemonOptions {
   maxSessionRecords?: number;
   /** Environment for security checks (`PAGR_ENV`, `PAGR_ALLOW_INSECURE_WS`); defaults to process.env. */
   env?: NodeJS.ProcessEnv;
+  /**
+   * How the daemon ends its own process when it hits something only a human can fix. Defaults to
+   * `process.exit`; tests pass a recorder. See `DAEMON_EXIT`.
+   */
+  exit?: (code: number) => void;
 }
 
 export interface DaemonStatus {
@@ -177,6 +185,24 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   const commands = new CommandTracker();
   let serverKeys: Record<string, string> = { ...config.serverKeys };
   const startedAt = now().toISOString();
+  const exitProcess = o.exit ?? ((code: number) => process.exit(code));
+
+  let daemonRef: Daemon | null = null;
+  let ending = false;
+  /**
+   * End the process for something only a human can fix. `DAEMON_EXIT.unrecoverable` is the half
+   * of the launchd contract this side owns: the launch agent restarts the daemon on exit 0 and on
+   * a crash signal, and refuses to restart it after any non-zero exit, so this must never be used
+   * for something that might come right on its own (see `DAEMON_EXIT`).
+   */
+  const fatal = (reason: string): void => {
+    if (ending) return;
+    ending = true;
+    process.stderr.write(`pagr daemon: ${reason}\n`);
+    void Promise.resolve(daemonRef?.stop())
+      .catch(() => {})
+      .finally(() => exitProcess(DAEMON_EXIT.unrecoverable));
+  };
 
   let transport: GatewayClient | null = null;
   const emit = (event: DeviceEvent) => {
@@ -295,6 +321,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       now,
       ...(o.WebSocketCtor ? { WebSocketCtor: o.WebSocketCtor } : {}),
       ...(o.heartbeatMs ? { heartbeatMs: o.heartbeatMs } : {}),
+      ...(o.livenessTimeoutMs ? { livenessTimeoutMs: o.livenessTimeoutMs } : {}),
+      ...(o.authTimeoutMs ? { authTimeoutMs: o.authTimeoutMs } : {}),
       ...(o.backoff ? { backoff: o.backoff } : {}),
     });
     transport.on('connected', () => {
@@ -304,9 +332,33 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         .then((hello) => emit(makeEvent(deviceId, 'device.hello', hello, { now })));
     });
     transport.on('disconnected', (reason) => logger.info('gateway disconnected', { reason }));
-    transport.on('blocked', (min) =>
-      logger.error('bridge too old; update required', { minBridgeVersion: min }),
+    // A refusal of this identity is not a network problem: say which it is, in words, once. The
+    // transport has already stopped reconnecting for the fatal kind and keeps retrying the
+    // transient kind (a per-IP rate limit is shared by every bridge behind one office NAT).
+    transport.on('auth_failed', (_code, failure) => {
+      if (failure.fatal) {
+        logger.error('gateway refused this device; the daemon will not reconnect', {
+          error: failure.code,
+          fix: failure.reason,
+        });
+        fatal(`the gateway refused this device (${failure.code}): ${failure.reason}`);
+      } else {
+        logger.warn('gateway refused the handshake for now; retrying', {
+          error: failure.code,
+          detail: failure.reason,
+        });
+      }
+    });
+    transport.on('replaced', (retryInMs) =>
+      logger.error('another machine is using this device identity', {
+        retryInMs,
+        fix: 'run `pagr connect` on the Mac that should own this pairing, or `pagr logout` on the other one',
+      }),
     );
+    transport.on('blocked', (min) => {
+      logger.error('bridge too old; update required', { minBridgeVersion: min });
+      fatal(`this bridge is older than the gateway's minimum (${min}); update the pagr CLI`);
+    });
   }
 
   const ipc = new IpcServer({ socketPath: paths.socketPath, logger: logger.child({ mod: 'ipc' }) });
@@ -668,32 +720,139 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       return changed;
     },
   };
+  daemonRef = daemon;
   return daemon;
 }
 
-/** Convenience for the CLI: create + start, and stop on SIGINT/SIGTERM. */
-export async function startDaemon(o: CreateDaemonOptions): Promise<Daemon> {
-  const logger = o.logger ?? silentLogger;
-  let d: Daemon;
-  try {
-    d = await createDaemon(o);
-    await d.start();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.error('daemon failed to start', { message });
-    // Another instance owns this home: let the caller (CLI) report it with its own exit code.
-    if (err instanceof DaemonAlreadyRunningError) throw err;
-    // Fail loudly: a daemon that cannot listen on its IPC socket is useless, and launchd would
-    // otherwise keep restarting a silently broken process.
-    process.stderr.write(`pagr daemon: failed to start: ${message}\n`);
-    process.exit(1);
+export interface StartDaemonOptions extends CreateDaemonOptions {
+  /** Backoff for transient start failures. Default 5 s doubling to 60 s. */
+  startRetry?: { baseMs?: number; maxMs?: number; maxAttempts?: number };
+  /** Test seam for the retry sleep. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** A start failure and what the launchd contract should do about it. */
+export interface StartFailure {
+  /** True when a restart cannot help: it needs a person. */
+  unrecoverable: boolean;
+  /** One line naming the fix, written to stderr (i.e. `launchd.err.log`). */
+  reason: string;
+}
+
+/**
+ * Classify a start failure for the launchd contract (`DAEMON_EXIT`).
+ *
+ * Unrecoverable means "no amount of restarting fixes this": a Keychain that is locked, denied or
+ * missing entirely (each retry can raise its own dialog at login), a device key that will not
+ * parse, a `PAGR_HOME` that cannot be written. Everything else — a full disk, an I/O blip, an
+ * adapter that was not up yet, a gateway that is unreachable because the daemon booted before the
+ * network — is transient and is retried inside this process instead of being handed to launchd.
+ */
+export function classifyStartFailure(err: unknown): StartFailure {
+  const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof SecretStoreError) {
+    const unrecoverable =
+      err.code === 'locked' || err.code === 'denied' || err.code === 'unavailable';
+    return {
+      unrecoverable,
+      reason: unrecoverable
+        ? `${message}${err.hint ? ` — ${err.hint}` : ' — unlock the login Keychain and run `pagr daemon install` again'}`
+        : message,
+    };
   }
-  const onSignal = () => {
-    void d.stop().finally(() => process.exit(0));
+  if (err instanceof InvalidDeviceKeyError)
+    return { unrecoverable: true, reason: `${message}${err.hint ? ` — ${err.hint}` : ''}` };
+  if (err instanceof PagrHomeError) {
+    // A full disk or a transient I/O error can come right; a path this user cannot write cannot.
+    const unrecoverable = err.code !== 'no_space' && err.code !== 'io';
+    return { unrecoverable, reason: `${message}${err.hint ? ` — ${err.hint}` : ''}` };
+  }
+  return { unrecoverable: false, reason: message };
+}
+
+const startDelay = (attempt: number, base: number, max: number): number =>
+  Math.min(max, base * 2 ** attempt);
+
+/**
+ * Convenience for the CLI (and the entry point launchd runs): create + start, and stop on
+ * SIGINT/SIGTERM.
+ *
+ * Exit-code contract, the other half of the launch agent's `KeepAlive` (see `DAEMON_EXIT`):
+ * exit 0 is a clean or self-requested stop and gets restarted after the throttle; exit
+ * `DAEMON_EXIT.unrecoverable` (78) means a person has to do something and launchd leaves it
+ * alone; and a transient failure exits with nothing at all — the process stays up and keeps
+ * retrying, because a daemon that merely started before the network did must not be killed off
+ * permanently (BR-11).
+ */
+export async function startDaemon(o: StartDaemonOptions): Promise<Daemon> {
+  const logger = o.logger ?? silentLogger;
+  const exitProcess = o.exit ?? ((code: number) => process.exit(code));
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
+  const baseMs = o.startRetry?.baseMs ?? 5_000;
+  const maxMs = o.startRetry?.maxMs ?? 60_000;
+  const maxAttempts = o.startRetry?.maxAttempts ?? Number.POSITIVE_INFINITY;
+
+  const refuse = (reason: string): never => {
+    logger.error('daemon cannot start', { reason });
+    process.stderr.write(`pagr daemon: ${reason}\n`);
+    exitProcess(DAEMON_EXIT.unrecoverable);
+    throw new DaemonStartRefused(reason);
   };
-  process.once('SIGINT', onSignal);
-  process.once('SIGTERM', onSignal);
-  return d;
+
+  // Read the pairing before anything is created: "not paired" and "config.json is unreadable"
+  // both look like an idle daemon at runtime, and launchd would restart that shape forever.
+  // A home that cannot be prepared at all falls through to the loop, which classifies it.
+  try {
+    const paths = ensurePaths(o.home);
+    const inspected = inspectConfig(paths.configFile);
+    if (inspected.problem) refuse(`${inspected.problem.message} — ${inspected.problem.hint}`);
+    if (!inspected.config.deviceId || !(o.gatewayUrl ?? inspected.config.gatewayUrl))
+      refuse('this Mac is not paired with a Pagr account — run `pagr connect`');
+  } catch (err) {
+    if (err instanceof DaemonStartRefused) throw err;
+    const failure = classifyStartFailure(err);
+    if (failure.unrecoverable) refuse(`failed to start: ${failure.reason}`);
+  }
+
+  for (let attempt = 0; ; attempt++) {
+    let d: Daemon | null = null;
+    try {
+      d = await createDaemon(o);
+      await d.start();
+      const started = d;
+      const onSignal = () => {
+        void started.stop().finally(() => exitProcess(DAEMON_EXIT.ok));
+      };
+      process.once('SIGINT', onSignal);
+      process.once('SIGTERM', onSignal);
+      return started;
+    } catch (err) {
+      // A partially started daemon still holds the pid lock and the socket; releasing them is
+      // what makes the next attempt a retry rather than a self-inflicted "already running".
+      await d?.stop().catch(() => {});
+      // Another instance genuinely owns this home. The CLI reports it with its own (non-zero,
+      // so never restarted) exit code, and a second daemon must not retry into the first one.
+      if (err instanceof DaemonAlreadyRunningError) throw err;
+      const failure = classifyStartFailure(err);
+      if (failure.unrecoverable) refuse(`failed to start: ${failure.reason}`);
+      if (attempt + 1 >= maxAttempts) throw err;
+      const delayMs = startDelay(attempt, baseMs, maxMs);
+      logger.warn('daemon failed to start; retrying in this process', {
+        reason: failure.reason,
+        delayMs,
+        attempt: attempt + 1,
+      });
+      await sleep(delayMs);
+    }
+  }
+}
+
+/** Thrown after the exit seam declined to end the process (tests only). */
+export class DaemonStartRefused extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'DaemonStartRefused';
+  }
 }
 
 export {

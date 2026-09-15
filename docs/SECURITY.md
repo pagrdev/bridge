@@ -109,13 +109,34 @@ only resolve against `~/.pagr/projects.json` on your machine (`projects.ts`). Se
 id is expected fails schema validation before anything else runs. Nothing in this list can write
 `device-policy.json` or change what the floor refuses.
 
+## Server key rotation (`transport.ts`)
+
+`auth.result` is not itself signed, so it cannot on its own authenticate a **widening** of what the
+bridge trusts. The rule is therefore about what a key set grants, not about whether it overlaps:
+
+| Offered set | Accepted |
+| --- | --- |
+| nothing pinned yet | yes — pairing (over HTTPS) is the trust root |
+| identical to the pinned set | yes |
+| a subset of the pinned set (same key for every id it keeps) | yes — retiring a key only narrows trust |
+| adds a key id, or re-points a pinned id at a different key | **only** with `serverKeysSignature` |
+
+`serverKeysSignature` is `{keyId, signature}`, an Ed25519 signature by a key the bridge **already**
+pins, over `pagr.server-keys.v1:` + `canonicalize(serverKeys)`. The domain prefix means a command
+signature can never be replayed as a key-set signature. A set that fails the rule is neither trusted
+nor written to `config.json`, and the refusal is logged.
+
+Rotation stays a two-step, both of which this allows: publish `{old, new}` signed by `old`, then,
+once every bridge has it, publish `{new}` unsigned. What it stops is the additive attack — anyone who
+obtains one server key appending a key of their own and having the bridge persist it forever.
+
 ## Command authentication (`commandGuard.ts`)
 
 Every command is checked, in this order, and the first failure rejects it with a typed `command.ack`:
 
 1. **Schema** — closed enum of command types, zod-validated payloads.
 2. **Known signing key** — `keyId` must be in the server key set pinned at pairing and refreshed from
-   `auth.result`. Keys can overlap during rotation.
+   `auth.result`, under the rule below.
 3. **Ed25519 signature** over `canonicalize(body)` (sorted keys, no whitespace).
 4. **Device binding** — `body.deviceId` must equal this device's id.
 5. **Expiry** — `expiresAt` in the past, or `issuedAt` more than 2 minutes in the future, is rejected.

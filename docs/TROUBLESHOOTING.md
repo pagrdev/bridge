@@ -112,7 +112,7 @@ Note that Claude Code cannot be steered mid-turn: instructions sent while a turn
 
 ## Revoked device
 
-Revoking a device in the dashboard closes its socket and rejects its signatures. The daemon logs `auth failed` and stops reconnecting. Re-pairing creates a **new** identity — revoked key material is never reused:
+Revoking a device in the dashboard closes its socket and rejects its signatures. The daemon logs `gateway refused this device` with the reason `revoked`, stops reconnecting, and exits 78 so launchd does not restart it into the same wall. Re-pairing creates a **new** identity — revoked key material is never reused:
 
 ```bash
 pagr logout          # bootout the agent, delete the private key, drop config (projects kept)
@@ -121,6 +121,36 @@ pagr projects        # still there; the cloud learns the ids on the next connect
 ```
 
 Use `pagr logout --purge` to also forget the project registry, or `pagr uninstall --yes` to remove `~/.pagr` entirely.
+
+**Not every refusal is a revocation.** The gateway also rate-limits authentication attempts per IP
+address, and after a deploy every Mac in one office can trip that limiter together. That refusal is
+reported as `rate_limited`, logged as *too many authentication attempts from this network — backing
+off, this is not a revocation*, and the daemon keeps retrying (at least a minute apart). Only
+`revoked`, `bad_signature`, `device_mismatch` and `protocol_version` stop it. If `pagr daemon logs`
+shows `rate_limited`, wait — do not re-pair.
+
+## Another Mac is using this pairing
+
+The gateway keeps exactly one live connection per device identity, so a second daemon with the same
+identity evicts the first. That happens after a Migration Assistant transfer, a restored backup, or a
+shared login Keychain — and both Macs then lose commands as they evict each other.
+
+The daemon recognises the eviction (close code 4000) and does **not** race back in: it backs off for
+five minutes, and logs *another machine is connected to Pagr with this device identity*. `pagr status`
+shows the gateway as `displaced` while it waits.
+
+Fix it by deciding which Mac owns the pairing: run `pagr logout` on the other one (or `pagr connect`
+on the one that should own it, which mints a fresh `dev_…` identity). Two Macs are fine — they just
+need one pairing each.
+
+## The gateway says connected but nothing arrives
+
+A slept laptop, a VPN drop or a NAT that forgot the flow leaves a socket that still reads as open
+here while the gateway has already forgotten the device. The daemon pings the gateway on the
+heartbeat schedule (20 s) and tears the connection down if nothing at all comes back for three of
+them, then reconnects — so a stuck `connected` resolves itself in about a minute rather than queueing
+your commands into a dead socket. `pagr daemon logs` shows `gateway stopped answering; tearing the
+connection down`.
 
 ## "This Mac's device policy refused the approval"
 
@@ -182,6 +212,22 @@ The plist does **not** name a Node binary. It runs `~/.pagr/bin/pagr-node`, a ge
 
 So if the daemon is not running and `pagr daemon status` says the agent is installed but not loaded, read `pagr daemon logs -n 50` (and `~/.pagr/logs/launchd.err.log`) — launchd has deliberately stopped retrying, and `pagr daemon start` is the way back once the cause is fixed.
 
+The daemon's half of that contract is exactly two statuses:
+
+| Status | When | launchd |
+| --- | --- | --- |
+| **0** | clean stop (`pagr daemon stop`, SIGTERM at logout) or a self-requested restart | restarts after the throttle |
+| **78** | something only a person can fix: a locked / denied / missing Keychain, an unusable device key, an unparsable `config.json`, this Mac not being paired, the gateway refusing this device (revoked), or a bridge below the gateway's minimum version. `EX_CONFIG` from `sysexits(3)` | does **not** restart |
+
+Anything transient — a gateway that is unreachable because the daemon booted before the network, DNS
+that is not up yet, a disk blip — is **not** an exit at all: the daemon stays up and retries inside
+its own process, logging each attempt. A daemon that started too early must never be killed off
+permanently for it. One exception you may see interactively: `pagr daemon run` exits **5** when
+another daemon already holds this `PAGR_HOME` — also non-zero, so launchd leaves it alone too.
+
+Whatever the status, the reason is one line on stderr (`~/.pagr/logs/launchd.err.log`) and one line
+in `~/.pagr/logs/daemon.log`. There is never a silent loop.
+
 ## "It works in my terminal but not from my phone"
 
 launchd gives a launch agent a **minimal environment**: `PAGR_HOME` and the `PATH` captured when you ran `pagr connect` / `pagr daemon install`, and nothing else. Nothing from `.zshrc`, `.zprofile` or `.bash_profile` reaches it. So an agent that is authenticated by an environment variable in your shell — `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, and the rest — works when you run it yourself and looks signed out to the daemon.
@@ -227,7 +273,15 @@ session with the exit code in its `session.event`, never as a session that hangs
 
 **`sessions.json` growing** — terminal sessions are kept for a week (well past the cloud's 24h
 follow-up window) and the file is capped at 500 records, oldest terminal first. Both the retention
-sweep and the cap run at startup and hourly.
+sweep and the cap run at startup and hourly. Each adapter's own map (`claude-sessions.json`,
+`codex-sessions.json`) follows the same policy and is swept whenever sessions are listed; a session
+that is running right now is never evicted from either.
+
+**Old sessions missing from the dashboard after a reconnect** — the `device.hello` the bridge sends
+on every connect carries at most 100 sessions, live ones first and then the most recently updated.
+That is a hard requirement, not a preference: the gateway drops any frame over 256 KiB, and a hello
+that does not fit would be resent identically on every reconnect, forever. Anything left out is still
+resumable by id, and `pagr sessions` on the Mac still lists everything.
 
 ## Registering lots of projects
 
