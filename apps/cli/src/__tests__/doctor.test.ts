@@ -247,6 +247,69 @@ describe('doctor · daemon, socket and launchd', () => {
     expect(check(r, 'launch agent')?.detail).toContain('no longer exists');
   });
 
+  it('flags a plist whose Node was deleted by an upgrade', async () => {
+    await h.run(['daemon', 'install']);
+    const plist = join(h.launchAgentsDir, 'dev.pagr.bridge.plist');
+    // what an older install + `brew upgrade node` leaves behind
+    writeFileSync(
+      plist,
+      readPlistWith(
+        plist,
+        join(h.home, 'bin', 'pagr-node'),
+        '/opt/homebrew/Cellar/node/22.11.0/bin/node',
+      ),
+    );
+    h.execImpl = () => 'loaded';
+    const r = await report(['--offline']);
+    expect(check(r, 'launch agent')?.status).toBe('warn');
+    expect(check(r, 'launch agent')?.detail).toContain('Node upgrade');
+    expect(check(r, 'launch agent')?.fix).toContain('pagr daemon install');
+  });
+
+  it('agent env: skipped until there is a launch agent to compare against', async () => {
+    h.overrides.env = { ...h.overrides.env, ANTHROPIC_API_KEY: 'sk-ant-secret' };
+    const r = await report(['--offline']);
+    expect(check(r, 'agent env')?.status).toBe('skip');
+  });
+
+  it('agent env: names the variables the daemon will never see, never their values', async () => {
+    await h.run(['daemon', 'install']);
+    h.overrides.env = {
+      ...h.overrides.env,
+      ANTHROPIC_API_KEY: 'sk-ant-secret',
+      OPENAI_API_KEY: 'sk-openai-secret',
+    };
+    h.execImpl = () => 'loaded';
+    const r = await report(['--offline']);
+    const c = check(r, 'agent env');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('ANTHROPIC_API_KEY');
+    expect(c?.detail).toContain('OPENAI_API_KEY');
+    expect(c?.detail).toContain('look signed out');
+    expect(JSON.stringify(r)).not.toContain('sk-ant-secret');
+    expect(JSON.stringify(r)).not.toContain('sk-openai-secret');
+    expect(c?.fix).toContain('codex login');
+    // a warning, never a failure: the bridge works, the agent just cannot authenticate
+    expect(r.ok).toBe(true);
+  });
+
+  it('agent env: ok once the variable is actually in the launch agent', async () => {
+    await h.run(['daemon', 'install']);
+    const plist = join(h.launchAgentsDir, 'dev.pagr.bridge.plist');
+    writeFileSync(
+      plist,
+      readPlistWith(
+        plist,
+        '<key>PAGR_HOME</key>',
+        '<key>ANTHROPIC_API_KEY</key>\n      <string>set-by-hand</string>\n      <key>PAGR_HOME</key>',
+      ),
+    );
+    h.overrides.env = { ...h.overrides.env, ANTHROPIC_API_KEY: 'sk-ant-secret' };
+    h.execImpl = () => 'loaded';
+    const r = await report(['--offline']);
+    expect(check(r, 'agent env')?.status).toBe('ok');
+  });
+
   it('flags an installed-but-not-loaded agent', async () => {
     h.overrides.binPath = process.execPath; // a plist that is current, just not loaded
     await h.run(['daemon', 'install']);

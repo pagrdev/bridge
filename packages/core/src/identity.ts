@@ -104,6 +104,52 @@ export async function loadOrCreateIdentity(
   return identity;
 }
 
+/**
+ * A replacement device key that exists only in memory until `commit()`.
+ *
+ * `pagr connect --force` used to delete the working key and mint its replacement BEFORE the new
+ * pairing existed. Any failure after that point — a 5xx, a denied approval, a Ctrl-C, a timeout —
+ * left `config.json` holding the OLD deviceId while the only key on the machine was the new one,
+ * so every signature failed `bad_signature` and the Mac was stranded with no way back. Staging
+ * makes the swap atomic from the user's point of view: the old key stays exactly where it is
+ * until the cloud has accepted the new one, and `rollback()` puts it back if the last step fails.
+ */
+export interface StagedIdentity {
+  /** The new identity. Live in memory; NOT in the secret store until `commit()`. */
+  identity: DeviceIdentity;
+  /** Whether there was a previous key to restore. */
+  replacesExistingKey: boolean;
+  /** Persist the new key, replacing the old one. */
+  commit(): Promise<void>;
+  /** Undo `commit()` (or do nothing if it never ran). Safe to call in any state. */
+  rollback(): Promise<void>;
+}
+
+export async function stageNewIdentity(store: SecretStore): Promise<StagedIdentity> {
+  // Read the current key FIRST. A locked or denied Keychain throws here, before anything has
+  // changed — the one safe moment to fail.
+  const previous = await store.get(PRIVATE_KEY_SECRET);
+  const { privateKeyPem, publicKeyPem } = generateKeyPairPem();
+  let committed = false;
+  return {
+    identity: {
+      publicKeyRaw: rawPublicKeyFromPem(publicKeyPem),
+      sign: (data) => signWithPem(privateKeyPem, data),
+    },
+    replacesExistingKey: previous !== null,
+    commit: async () => {
+      await store.set(PRIVATE_KEY_SECRET, privateKeyPem);
+      committed = true;
+    },
+    rollback: async () => {
+      if (!committed) return;
+      if (previous === null) await store.delete(PRIVATE_KEY_SECRET);
+      else await store.set(PRIVATE_KEY_SECRET, previous);
+      committed = false;
+    },
+  };
+}
+
 /** Whether `loadOrCreateIdentity` minted a brand-new key (vs. reusing the stored one). */
 const identityWasCreated = new WeakMap<DeviceIdentity, boolean>();
 export const wasNewlyCreated = (identity: DeviceIdentity): boolean =>

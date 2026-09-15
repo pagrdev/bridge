@@ -44,6 +44,14 @@ function collector() {
 const sessionEvent = (type: string) => (e: AdapterEvent) =>
   e.kind === 'session_event' && e.type === type;
 
+async function waitUntil(pred: () => boolean, ms = 5000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > deadline) throw new Error('timeout waiting for condition');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 describe('CodexAdapter against fake app-server', () => {
   let home: string;
   let adapter: CodexAdapter;
@@ -68,17 +76,146 @@ describe('CodexAdapter against fake app-server', () => {
 
   const proj = () => ({ projectId: PROJ, path: project, displayName: 'demo' });
 
-  it('probe reports installed + unauthenticated via account/read', async () => {
-    const s = await adapter.probe();
-    expect(s).toMatchObject({
-      provider: 'codex',
-      mode: 'app-server',
-      installed: true,
-      providerVersion: '0.149.1',
-      authStatus: 'unauthenticated',
+  it('probe reports installed + unauthenticated WITHOUT starting an app-server', async () => {
+    const trace = path.join(home, 'trace.txt');
+    const codexHome = path.join(home, 'codex-home');
+    const a = new CodexAdapter({
+      home,
+      codexCommand: ['node', FIXTURE],
+      codexHome,
+      env: { FAKE_CODEX_TRACE: trace },
+      log: false,
     });
-    expect(s.capabilities.canSteerActiveTurn).toBe(true);
-    expect(s.capabilities.canReceiveLiveExternalMessages).toBe(false);
+    try {
+      const s = await a.probe();
+      expect(s).toMatchObject({
+        provider: 'codex',
+        mode: 'app-server',
+        installed: true,
+        providerVersion: '0.149.1',
+        authStatus: 'unauthenticated',
+      });
+      expect(s.capabilities.canSteerActiveTurn).toBe(true);
+      expect(s.capabilities.canReceiveLiveExternalMessages).toBe(false);
+      // The whole point: probing is what the daemon does on every gateway connect. It must not
+      // leave a `codex app-server` behind, and it must not have forked one to find that out.
+      expect(a.appServerRunning).toBe(false);
+      expect(fs.readFileSync(trace, 'utf8').trim().split('\n')).toEqual(['--version']);
+    } finally {
+      await a.shutdown();
+    }
+  });
+
+  it('probe reports authenticated when codex has credentials on disk', async () => {
+    const codexHome = path.join(home, 'codex-home');
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), '{"OPENAI_API_KEY":"redacted"}');
+    const a = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], codexHome, log: false });
+    try {
+      expect((await a.probe()).authStatus).toBe('authenticated');
+      expect(a.appServerRunning).toBe(false);
+    } finally {
+      await a.shutdown();
+    }
+  });
+
+  it('repeated probes reuse the cached version instead of re-forking codex', async () => {
+    const trace = path.join(home, 'trace.txt');
+    const a = new CodexAdapter({
+      home,
+      codexCommand: ['node', FIXTURE],
+      codexHome: path.join(home, 'codex-home'),
+      env: { FAKE_CODEX_TRACE: trace },
+      log: false,
+    });
+    try {
+      for (let i = 0; i < 5; i++) await a.probe();
+      expect(fs.readFileSync(trace, 'utf8').trim().split('\n')).toEqual(['--version']);
+    } finally {
+      await a.shutdown();
+    }
+  });
+
+  it('probe asks a RUNNING app-server for the real account status', async () => {
+    const codexHome = path.join(home, 'codex-home');
+    fs.mkdirSync(codexHome, { recursive: true });
+    // Credentials on disk say "authenticated"; the live app-server is the authority and says no.
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), '{}');
+    const a = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], codexHome, log: false });
+    try {
+      await a.startSession({
+        sessionId: SES,
+        project: proj(),
+        instruction: 'hello',
+        localImagePaths: [],
+        readOnly: true,
+      });
+      expect(a.appServerRunning).toBe(true);
+      expect((await a.probe()).authStatus).toBe('unauthenticated');
+    } finally {
+      await a.shutdown();
+    }
+  });
+
+  it('stops the idle app-server, and resumes the thread on the next instruction', async () => {
+    const a = new CodexAdapter({
+      home,
+      codexCommand: ['node', FIXTURE],
+      codexHome: path.join(home, 'codex-home'),
+      idleShutdownMs: 10,
+      log: false,
+    });
+    const c = collector();
+    a.subscribe(c.emit);
+    try {
+      await a.startSession({
+        sessionId: SES,
+        project: proj(),
+        instruction: 'Run the tests',
+        localImagePaths: [],
+        readOnly: false,
+      });
+      await c.waitFor(sessionEvent('completed'));
+      await waitUntil(() => !a.appServerRunning);
+      expect(a.appServerRunning).toBe(false);
+      // A follow-up must still work: a fresh app-server is started and the thread resumed.
+      const res = await a.sendInstruction({
+        sessionId: SES,
+        instruction: 'and again',
+        localImagePaths: [],
+        mode: 'queue',
+      });
+      expect(res.delivered).toBe('new_turn');
+      expect(a.appServerRunning).toBe(true);
+    } finally {
+      await a.shutdown();
+    }
+  });
+
+  it('keeps the app-server while a turn is still running', async () => {
+    const a = new CodexAdapter({
+      home,
+      codexCommand: ['node', FIXTURE],
+      codexHome: path.join(home, 'codex-home'),
+      idleShutdownMs: 10,
+      log: false,
+    });
+    const c = collector();
+    a.subscribe(c.emit);
+    try {
+      await a.startSession({
+        sessionId: SES,
+        project: proj(),
+        instruction: 'please wait here',
+        localImagePaths: [],
+        readOnly: false,
+      });
+      await c.waitFor(sessionEvent('started'));
+      await new Promise((r) => setTimeout(r, 60));
+      expect(a.appServerRunning).toBe(true);
+    } finally {
+      await a.shutdown();
+    }
   });
 
   it('probe reports disabled when codex is missing', async () => {

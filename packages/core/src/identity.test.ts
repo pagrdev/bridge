@@ -9,9 +9,66 @@ import {
   publicKeyPemFromRaw,
   rawPublicKeyFromPem,
   signWithPem,
+  stageNewIdentity,
   verifyRaw,
 } from './identity.js';
 import { MemorySecretStore, SecretStoreError } from './keychain.js';
+
+describe('staged identity (`pagr connect --force`)', () => {
+  const store = () => new MemorySecretStore();
+
+  it('leaves the working key in place until commit', async () => {
+    const s = store();
+    const old = await loadOrCreateIdentity(s);
+    const oldPem = s.map.get(PRIVATE_KEY_SECRET);
+
+    const staged = await stageNewIdentity(s);
+    expect(staged.replacesExistingKey).toBe(true);
+    expect(staged.identity.publicKeyRaw).not.toBe(old.publicKeyRaw);
+    // Nothing was written: a pairing that fails now leaves the Mac exactly as it was.
+    expect(s.map.get(PRIVATE_KEY_SECRET)).toBe(oldPem);
+    const reloaded = await loadOrCreateIdentity(s);
+    expect(reloaded.publicKeyRaw).toBe(old.publicKeyRaw);
+
+    await staged.commit();
+    expect(s.map.get(PRIVATE_KEY_SECRET)).not.toBe(oldPem);
+    expect((await loadOrCreateIdentity(s)).publicKeyRaw).toBe(staged.identity.publicKeyRaw);
+  });
+
+  it('rollback puts the previous key back after a commit', async () => {
+    const s = store();
+    const old = await loadOrCreateIdentity(s);
+    const staged = await stageNewIdentity(s);
+    await staged.commit();
+    await staged.rollback();
+    expect((await loadOrCreateIdentity(s)).publicKeyRaw).toBe(old.publicKeyRaw);
+  });
+
+  it('rollback before commit changes nothing, and is idempotent', async () => {
+    const s = store();
+    const old = await loadOrCreateIdentity(s);
+    const staged = await stageNewIdentity(s);
+    await staged.rollback();
+    await staged.rollback();
+    expect((await loadOrCreateIdentity(s)).publicKeyRaw).toBe(old.publicKeyRaw);
+  });
+
+  it('on a machine with no key at all, rollback removes the staged one', async () => {
+    const s = store();
+    const staged = await stageNewIdentity(s);
+    expect(staged.replacesExistingKey).toBe(false);
+    await staged.commit();
+    expect(await hasIdentity(s)).toBe(true);
+    await staged.rollback();
+    expect(await hasIdentity(s)).toBe(false);
+  });
+
+  it('the staged identity signs verifiably with its own key', async () => {
+    const staged = await stageNewIdentity(store());
+    const sig = staged.identity.sign('dev_x.nonce');
+    expect(verifyRaw(staged.identity.publicKeyRaw, 'dev_x.nonce', sig)).toBe(true);
+  });
+});
 
 describe('identity', () => {
   it('creates a keypair on first load and reuses it after', async () => {

@@ -5,12 +5,13 @@ import {
   DaemonAlreadyRunningError,
   ensurePaths,
   FakeAdapter,
-  installLaunchAgent,
   isPidAlive,
   launchAgentPlistPath,
   readConfig,
   readDaemonLock,
   startDaemon,
+  startLaunchAgent,
+  stopLaunchAgent,
   uninstallLaunchAgent,
 } from '@pagr/bridge-core';
 import type { Provider } from '@pagr/protocol';
@@ -18,6 +19,13 @@ import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, socketPath } from '../ipc.js';
+import {
+  agentEnvGaps,
+  describeEnvGaps,
+  ENV_GAP_FIX,
+  installAgent,
+  launchAgentPlan,
+} from '../launchd.js';
 import { bad, dim, kv, ok, printJson, warn } from '../output.js';
 
 /** Mirrors core's launchAgent label (not re-exported from the core index). */
@@ -94,34 +102,108 @@ export function launchAgentLoaded(ctx: CliContext): boolean {
 
 export function runDaemonInstall(ctx: CliContext): string {
   const paths = ensurePaths(ctx.home);
-  const plist = installLaunchAgent({
-    programArguments: [process.execPath, ctx.binPath, 'daemon', 'run'],
-    logsDir: paths.logsDir,
-    env: { PAGR_HOME: ctx.home, ...(ctx.env.PATH ? { PATH: ctx.env.PATH } : {}) },
-    exec: (f, a) => void ctx.exec(f, a),
-    hasLaunchctl: () => ctx.hasLaunchctl(),
-    ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
-  });
+  const plan = launchAgentPlan(ctx);
+  const plist = installAgent(ctx, paths.logsDir);
+  const gaps = agentEnvGaps(ctx.env, plan.env);
   if (ctx.json) {
-    printJson(ctx, { installed: true, plist, label: LAUNCH_AGENT_LABEL, logsDir: paths.logsDir });
+    printJson(ctx, {
+      installed: true,
+      plist,
+      label: LAUNCH_AGENT_LABEL,
+      logsDir: paths.logsDir,
+      launcher: plan.launcherPath,
+      shellOnlyAgentEnv: gaps.map((g) => g.name),
+    });
     return plist;
   }
   ctx.out(ok(`launch agent installed ${dim(plist)}`));
   ctx.out(dim(`  label ${LAUNCH_AGENT_LABEL}; logs in ${paths.logsDir}`));
   ctx.out(dim('  confirm it came up with `pagr status` (gateway should read connected)'));
+  if (gaps.length > 0) {
+    ctx.out(
+      warn(
+        `${describeEnvGaps(gaps)} ${gaps.length === 1 ? 'is' : 'are'} set in this shell but not for the daemon`,
+      ),
+    );
+    ctx.out(dim(`  ${ENV_GAP_FIX}`));
+  }
   return plist;
 }
 
+/**
+ * Stop the daemon, keep the install. `stop` used to be an alias for `uninstall`, which deleted
+ * the launch agent: "stopping" the daemon silently meant nothing ever started again at login.
+ */
+export function runDaemonStop(ctx: CliContext): 'stopped' | 'not_loaded' | 'not_installed' {
+  const result = stopLaunchAgent({
+    exec: (f, a) => void ctx.exec(f, a),
+    hasLaunchctl: () => ctx.hasLaunchctl(),
+    ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
+  });
+  const plist = launchAgentPlistPath(ctx.launchAgentsDir);
+  if (ctx.json) {
+    printJson(ctx, {
+      stopped: result === 'stopped',
+      state: result,
+      installed: result !== 'not_installed',
+      plist,
+      label: LAUNCH_AGENT_LABEL,
+    });
+    return result;
+  }
+  if (result === 'not_installed') {
+    ctx.out(warn('there is no launch agent installed, so nothing was running'));
+    ctx.out(dim('  `pagr daemon install` sets it up'));
+    return result;
+  }
+  ctx.out(ok(result === 'stopped' ? 'daemon stopped' : 'daemon was not running'));
+  ctx.out(dim(`  the launch agent is still installed (${plist}) and starts again at login`));
+  ctx.out(dim('  `pagr daemon start` to start it now · `pagr daemon uninstall` to remove it'));
+  return result;
+}
+
+export function runDaemonStart(ctx: CliContext): 'started' | 'restarted' {
+  const result = startLaunchAgent({
+    exec: (f, a) => void ctx.exec(f, a),
+    hasLaunchctl: () => ctx.hasLaunchctl(),
+    ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
+  });
+  if (ctx.json) {
+    printJson(ctx, {
+      started: true,
+      state: result,
+      plist: launchAgentPlistPath(ctx.launchAgentsDir),
+      label: LAUNCH_AGENT_LABEL,
+    });
+    return result;
+  }
+  ctx.out(ok(result === 'started' ? 'daemon started' : 'daemon restarted (it was already loaded)'));
+  ctx.out(dim('  confirm it with `pagr status`; `pagr daemon logs -n 50` if it does not come up'));
+  return result;
+}
+
+/** The destructive one: the job is removed and nothing starts at the next login. */
 export function runDaemonUninstall(ctx: CliContext): boolean {
+  const plist = launchAgentPlistPath(ctx.launchAgentsDir);
+  const existed = existsSync(plist);
+  if (!ctx.json && existed) {
+    ctx.out(warn(`removing the launch agent ${dim(plist)}`));
+    ctx.out(
+      dim(
+        '  this stops the daemon and it will NOT start at login any more; your pairing, device key and projects are untouched',
+      ),
+    );
+  }
   const removed = uninstallLaunchAgent({
     exec: (f, a) => void ctx.exec(f, a),
     ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
   });
   if (ctx.json) {
-    printJson(ctx, { removed, label: LAUNCH_AGENT_LABEL });
+    printJson(ctx, { removed, plist, label: LAUNCH_AGENT_LABEL });
     return removed;
   }
   ctx.out(removed ? ok('launch agent removed') : warn('launch agent was not installed'));
+  if (removed) ctx.out(dim('  put it back with `pagr daemon install` (no re-pairing needed)'));
   return removed;
 }
 
@@ -162,6 +244,10 @@ export async function runDaemonStatus(ctx: CliContext): Promise<void> {
       ['log', ctx.paths.logFile],
     ]),
   );
+  // Installed but not loaded is the state `pagr daemon stop` leaves behind, and the state
+  // launchd leaves behind after a start failure it refuses to retry. Both end at `start`.
+  if (installed && !loaded)
+    ctx.out(dim('  `pagr daemon start` to run it now (`pagr daemon logs -n 50` if it will not)'));
 }
 
 export async function runDaemonLogs(
@@ -207,7 +293,7 @@ export function registerDaemon(program: Command, getCtx: () => CliContext): void
           throw new CliError(
             err.message,
             EXIT.precondition,
-            'stop it first with `pagr daemon stop` (launchd) or kill that pid, then retry',
+            'stop it first with `pagr daemon stop` (which leaves the launch agent installed) or kill that pid, then retry',
           );
         throw err;
       }
@@ -215,11 +301,14 @@ export function registerDaemon(program: Command, getCtx: () => CliContext): void
   d.command('install')
     .description('install + start the launchd agent')
     .action(() => void runDaemonInstall(getCtx()));
-  d.command('uninstall')
-    .description('stop + remove the launchd agent')
-    .action(() => void runDaemonUninstall(getCtx()));
+  d.command('start')
+    .description('start the installed launchd agent')
+    .action(() => void runDaemonStart(getCtx()));
   d.command('stop')
-    .description('alias for uninstall')
+    .description('stop the daemon, keeping the launchd agent installed')
+    .action(() => void runDaemonStop(getCtx()));
+  d.command('uninstall')
+    .description('stop the daemon AND remove the launchd agent (it will not start at login)')
     .action(() => void runDaemonUninstall(getCtx()));
   d.command('status')
     .description('launch agent + daemon process status')

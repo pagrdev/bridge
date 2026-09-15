@@ -2,13 +2,11 @@ import { existsSync } from 'node:fs';
 import {
   auditPermissions,
   checkHomeWritable,
-  deleteIdentity,
+  type DeviceIdentity,
   describeClockSkew,
   ensurePaths,
   getPaths,
-  hasIdentity,
   inspectConfig,
-  installLaunchAgent,
   loadOrCreateIdentity,
   MAX_TOLERABLE_CLOCK_SKEW_MS,
   type PairStartResponse,
@@ -16,6 +14,8 @@ import {
   persistPairing,
   pollPairing,
   repairPermissions,
+  type StagedIdentity,
+  stageNewIdentity,
   startPairing,
 } from '@pagr/bridge-core';
 import type { Command } from 'commander';
@@ -23,6 +23,13 @@ import type { CliContext } from '../context.js';
 import { isRemoteSession } from '../context.js';
 import { CliError, EXIT, interruptedError, toCliError } from '../errors.js';
 import { daemonStatus } from '../ipc.js';
+import {
+  agentEnvGaps,
+  describeEnvGaps,
+  ENV_GAP_FIX,
+  installAgent,
+  launchAgentPlan,
+} from '../launchd.js';
 import { bold, cyan, dim, duration, ok, printJson, say, spinner, step, warn } from '../output.js';
 import { resolveApiUrl } from '../urls.js';
 
@@ -118,15 +125,19 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
   // --- 2. device key --------------------------------------------------------
   say(ctx, step(2, STEPS, 'Preparing the device key'));
   const store = await ctx.secretStore();
-  if (opts.force && existing.deviceId && (await hasIdentity(store))) {
-    await deleteIdentity(store);
-    say(ctx, ok(`removed the old device key for ${bold(existing.deviceId)} from ${store.kind}`));
-  }
-  const identity = await loadOrCreateIdentity(store);
+  // `--force` on a paired Mac STAGES its replacement key: it is minted in memory and the working
+  // key stays in the store untouched until the cloud has approved the new pairing (step 5). A
+  // failure anywhere before that — 5xx, denial, timeout, Ctrl-C — leaves the old identity exactly
+  // as it was, instead of stranding the Mac with a config and a key that disagree.
+  const staged: StagedIdentity | null =
+    opts.force && existing.deviceId ? await stageNewIdentity(store) : null;
+  const identity: DeviceIdentity = staged ? staged.identity : await loadOrCreateIdentity(store);
   say(
     ctx,
     ok(
-      `device key ready ${dim(`(${store.kind}; public key ${identity.publicKeyRaw.slice(0, 12)}…)`)}`,
+      staged
+        ? `replacement device key minted ${dim(`(public key ${identity.publicKeyRaw.slice(0, 12)}…; the key for ${existing.deviceId} stays in ${store.kind} until this pairing is approved)`)}`
+        : `device key ready ${dim(`(${store.kind}; public key ${identity.publicKeyRaw.slice(0, 12)}…)`)}`,
     ),
   );
   if (store.kind === 'file')
@@ -212,6 +223,26 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
       note(
         `this Mac now belongs to a different Pagr account (was ${existing.userId}, now ${done.userId}) — if that was not deliberate, run \`pagr connect --force\` and approve with the right account`,
       );
+    // The replacement key goes in only now that the cloud has accepted it, and the config right
+    // after. If either write fails the previous identity is restored, so the Mac keeps working
+    // with the pairing it already had.
+    if (staged) {
+      try {
+        await staged.commit();
+      } catch (err) {
+        throw new CliError(
+          `approved as ${done.deviceId}, but the new device key could not be stored: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          EXIT.secretStore,
+          {
+            code: 'device_key_not_stored',
+            hint: `nothing changed on this Mac — it is still paired as ${existing.deviceId} and still works. Fix the Keychain (\`pagr doctor\`), revoke ${done.deviceId} in the dashboard, then run \`pagr connect --force\` again`,
+            cause: err,
+          },
+        );
+      }
+    }
     try {
       persistPairing(paths.configFile, done, {
         apiUrl,
@@ -221,6 +252,7 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
       });
     } catch (err) {
       // The pairing exists in the cloud but we could not record it: full disk, read-only home.
+      await rollbackQuietly(staged, note);
       throw new CliError(
         `paired with Pagr, but ${paths.configFile} could not be written: ${
           err instanceof Error ? err.message : String(err)
@@ -228,7 +260,9 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
         EXIT.state,
         {
           code: 'pairing_not_persisted',
-          hint: 'free up disk space (or fix the permissions on PAGR_HOME) and run `pagr connect --force`; then revoke the stranded device in the dashboard',
+          hint: staged
+            ? `the previous device key was put back, so this Mac still works as ${existing.deviceId} — free up disk space (or fix the permissions on PAGR_HOME), revoke ${done.deviceId} in the dashboard, then run \`pagr connect --force\` again`
+            : 'free up disk space (or fix the permissions on PAGR_HOME) and run `pagr connect --force`; then revoke the stranded device in the dashboard',
           cause: err,
         },
       );
@@ -242,15 +276,9 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
         'launchd is not available here, so the background daemon was not installed — run `pagr daemon run` in the foreground',
       );
     else {
-      plist = installLaunchAgent({
-        programArguments: [process.execPath, ctx.binPath, 'daemon', 'run'],
-        logsDir: paths.logsDir,
-        env: { PAGR_HOME: ctx.home, ...(ctx.env.PATH ? { PATH: ctx.env.PATH } : {}) },
-        exec: (f, a) => void ctx.exec(f, a),
-        hasLaunchctl: () => ctx.hasLaunchctl(),
-        ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
-      });
+      plist = installAgent(ctx, paths.logsDir);
       say(ctx, ok(`background daemon installed ${dim(plist)}`));
+      noteAgentEnvGaps(ctx, note);
     }
 
     // --- 6. prove the gateway handshake ------------------------------------
@@ -358,6 +386,39 @@ function printSummary(ctx: CliContext, r: ConnectResult): void {
   ctx.out(`  2. ${dim('link iMessage from the dashboard (Settings → Messaging)')}`);
   ctx.out(`  3. ${cyan('pagr status')}    ${dim('confirm the gateway stays connected')}`);
   ctx.out(dim('\nSomething off? `pagr doctor` explains and fixes almost everything.'));
+}
+
+/**
+ * A rollback that itself fails must not replace the error the user actually needs to see.
+ * It is reported as a warning instead, with the one command that repairs the machine.
+ */
+async function rollbackQuietly(
+  staged: StagedIdentity | null,
+  note: (line: string) => void,
+): Promise<void> {
+  if (!staged) return;
+  try {
+    await staged.rollback();
+  } catch (err) {
+    note(
+      `the previous device key could not be put back (${
+        err instanceof Error ? err.message : String(err)
+      }) — run \`pagr logout\` then \`pagr connect\` to start clean`,
+    );
+  }
+}
+
+/**
+ * An agent authenticated by a variable in the user's shell profile is invisible to launchd, and
+ * that is the whole of "it works in my terminal but not from my phone". Say it at install time;
+ * `pagr doctor` says it again. Only the NAMES are printed, and nothing is copied into the plist.
+ */
+function noteAgentEnvGaps(ctx: CliContext, note: (line: string) => void): void {
+  const gaps = agentEnvGaps(ctx.env, launchAgentPlan(ctx).env);
+  if (gaps.length === 0) return;
+  note(
+    `${describeEnvGaps(gaps)} ${gaps.length === 1 ? 'is set' : 'are set'} in this shell but not for the background daemon — ${ENV_GAP_FIX}`,
+  );
 }
 
 /** A real path the user can recognise, so step 1 is copy-pasteable. */
