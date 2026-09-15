@@ -17,6 +17,17 @@ describe('ReplayCache', () => {
     expect(c.add('a', 3000)).toBe(true);
   });
 
+  it('refuses an entry that is already expired', () => {
+    // Accepting one would remember nothing: `has` evicts it on the next read, so the nonce would
+    // silently be replayable again.
+    const c = new ReplayCache({ now: () => 1000 });
+    expect(c.add('past', 1000)).toBe(false);
+    expect(c.add('past', 999)).toBe(false);
+    expect(c.has('past')).toBe(false);
+    expect(c.size).toBe(0);
+    expect(c.add('future', 1001)).toBe(true);
+  });
+
   it('evicts oldest when bounded', () => {
     const c = new ReplayCache({ maxEntries: 2, now: () => 0 });
     c.add('a', 10);

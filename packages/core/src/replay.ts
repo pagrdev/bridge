@@ -37,10 +37,13 @@ export class ReplayCache {
   }
 
   /**
-   * Record a key. Returns false if it was already present (replay).
+   * Record a key. Returns false if it was already present (replay) or if the entry would already
+   * be expired — an already-expired entry remembers nothing, so accepting it would silently leave
+   * the nonce replayable.
    * `expiresAtMs` bounds how long the key must be remembered.
    */
   add(key: string, expiresAtMs: number): boolean {
+    if (expiresAtMs <= this.now()) return false;
     if (this.has(key)) return false;
     this.entries.set(key, expiresAtMs);
     this.prune();

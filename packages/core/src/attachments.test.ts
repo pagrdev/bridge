@@ -48,6 +48,11 @@ describe('attachments', () => {
       res.statusCode = 500;
       res.end();
     });
+    routes.set('/redirect', (res) => {
+      res.statusCode = 302;
+      res.setHeader('location', `${base}/png`);
+      res.end();
+    });
   });
   afterAll(() => new Promise<void>((r) => server.close(() => r())));
 
@@ -96,6 +101,40 @@ describe('attachments', () => {
       fetchAttachment(ref('/hang', PNG), { tmpDir, timeoutMs: 100 }),
     ).rejects.toMatchObject({ code: 'timeout' });
     expect(existsSync(tmpDir) ? statSync(tmpDir).isDirectory() : true).toBe(true);
+  });
+
+  it('refuses to follow a redirect (the allow-list only ever saw the first URL)', async () => {
+    // The redirect target here is harmless, but a permitted host could just as well bounce the
+    // download to loopback or a metadata service, which the URL check never gets to see.
+    const tmpDir = join(t.home, 'tmp');
+    const r = ref('/redirect', PNG);
+    await expect(fetchAttachment(r, { tmpDir, env: LOCAL })).rejects.toMatchObject({
+      name: 'AttachmentError',
+      code: 'network', // node's fetch throws on a refused redirect
+    });
+    expect(existsSync(join(tmpDir, `${r.attachmentId}.png`))).toBe(false);
+    // a fetch that hands back the 3xx instead of throwing is refused too, never followed
+    await expect(
+      fetchAttachment(ref('/png', PNG), {
+        tmpDir,
+        env: LOCAL,
+        fetch: async () =>
+          new Response(null, { status: 302, headers: { location: 'https://evil.example/x' } }),
+      }),
+    ).rejects.toMatchObject({ code: 'unsafe_url' });
+    // ...and the redirect flag is actually asked for, so a custom fetch can honour it too.
+    let seen: { redirect?: string } | undefined;
+    await expect(
+      fetchAttachment(ref('/png', PNG), {
+        tmpDir,
+        env: LOCAL,
+        fetch: async (url, init) => {
+          seen = init;
+          return fetch(url, init);
+        },
+      }),
+    ).resolves.toContain(tmpDir);
+    expect(seen?.redirect).toBe('error');
   });
 
   it('sniffs magic bytes', () => {

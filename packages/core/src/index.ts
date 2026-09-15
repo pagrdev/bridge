@@ -1,6 +1,7 @@
 export { FakeAdapter } from './adapters/fake.js';
 export * from './adapters/types.js';
 export * from './approvals.js';
+export * from './attachmentLease.js';
 export * from './attachments.js';
 export * from './commandGuard.js';
 export * from './concurrency.js';

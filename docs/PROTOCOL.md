@@ -95,9 +95,14 @@ Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payl
 | `attachment.consumed` | after a download attempt | `{ attachmentId, ok, error? }` |
 
 `errorCode` values: `bad_signature`, `expired`, `replayed`, `wrong_device`, `unknown_project`,
-`unknown_session`, `capability_unsupported`, `provider_error`, `invalid_payload`.
+`unknown_session`, `unknown_approval`, `capability_unsupported`, `provider_error`, `invalid_payload`.
 `status: rejected` means the guard refused the command before dispatch; `failed` means dispatch ran and
-the adapter or a precondition failed; `duplicate` means an idempotent retry returned the original result.
+the adapter or a precondition failed. A second copy of a command already accepted — the gateway's 30 s
+resend, or a retry under the same `idempotencyKey` — is answered with the terminal ack of the single
+execution (waiting for it if it is still running), so the same `commandId` can be acked more than once
+with the same result. (`duplicate` remains a valid status in the schema for older bridges; a bridge at
+this version answers a duplicate with the genuine terminal status instead.) `unknown_approval` distinguishes an approval that expired or was already answered
+from a session that no longer exists.
 
 ## Approval hints
 

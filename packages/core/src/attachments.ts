@@ -22,7 +22,10 @@ export class AttachmentError extends Error {
   }
 }
 
-export type FetchLike = (url: string, init: { signal: AbortSignal }) => Promise<Response>;
+export type FetchLike = (
+  url: string,
+  init: { signal: AbortSignal; redirect: 'error' },
+) => Promise<Response>;
 
 export interface FetchAttachmentOptions {
   tmpDir: string;
@@ -149,13 +152,19 @@ export async function fetchAttachment(
   const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? 15_000);
   let res: Response;
   try {
-    res = await doFetch(ref.downloadUrl, { signal: ctl.signal });
+    // `redirect: 'error'`: the allow-list above can only vet the URL the cloud handed us. Following
+    // a 3xx would let a permitted host bounce the download to a forbidden one (loopback, link-local,
+    // metadata service) with no second check — so a redirect is refused outright, never followed.
+    res = await doFetch(ref.downloadUrl, { signal: ctl.signal, redirect: 'error' });
   } catch (err) {
     clearTimeout(timer);
     if (ctl.signal.aborted) throw new AttachmentError('timeout', 'download timed out');
     throw new AttachmentError('network', err instanceof Error ? err.message : String(err));
   }
   try {
+    // Belt and braces for a `fetch` implementation that resolves a redirect instead of throwing.
+    if (res.redirected || (res.status >= 300 && res.status < 400))
+      throw new AttachmentError('unsafe_url', 'downloadUrl redirected; redirects are not followed');
     if (!res.ok) throw new AttachmentError('http', `download failed: HTTP ${res.status}`);
     const declared = Number(res.headers.get('content-length') ?? '0');
     if (declared > ref.sizeBytes)

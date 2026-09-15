@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { DeviceEvent, Provider, SessionSummary } from '@pagr/protocol';
+import type { DeviceEvent, EventPayload, Provider, SessionSummary } from '@pagr/protocol';
 import { z } from 'zod';
 import type { CodingAgentAdapter } from './adapters/types.js';
 import type { FetchLike } from './attachments.js';
 import { cleanupTmp } from './attachments.js';
-import { IdempotencyCache, verifyIncoming } from './commandGuard.js';
+import { CommandTracker, verifyIncoming } from './commandGuard.js';
 import { SessionGuard } from './concurrency.js';
 import { type BridgeConfig, readConfig, updateConfig } from './config.js';
 import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
@@ -173,7 +173,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   const registry = new ProjectRegistry({ file: paths.projectsFile, pagrHome: paths.home });
   const sessions = new SessionStore(paths.sessionsFile, now);
   const replay = new ReplayCache({ file: paths.replayFile, now: () => now().getTime() });
-  const idempotency = new IdempotencyCache();
+  const commands = new CommandTracker();
   let serverKeys: Record<string, string> = { ...config.serverKeys };
   const startedAt = now().toISOString();
 
@@ -206,7 +206,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       trustedServerKeys: serverKeys,
       now,
       replay,
-      idempotency,
+      commands,
       registry,
       sessions,
     });
@@ -224,20 +224,49 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         { now, ...(verdict.commandId ? { inReplyTo: verdict.commandId } : {}) },
       );
       emit(ack);
+      // The guard records a command as in-flight before the local-existence checks, so a rejection
+      // from those must settle it too — otherwise a resend would wait on it forever.
+      if (verdict.commandId) commands.settle(verdict.commandId, ack);
       return ack;
     }
     if (verdict.duplicate) {
+      // The gateway resends an envelope it has had no ack for (after ~30 s). Answer with the
+      // terminal ack of the ONE execution — waiting for it if it is still running — so a command
+      // slower than the resend window is reported by its real outcome, never as a replay.
+      logger.info('duplicate command', {
+        commandId: verdict.body.commandId,
+        inFlight: verdict.inFlight,
+      });
+      const original = await verdict.ack;
       const dup = makeEvent(
         deviceId,
         'command.ack',
-        { ...(verdict.cachedAck.payload as { commandId: string }), status: 'duplicate' },
+        original.payload as EventPayload<'command.ack'>,
         { now, inReplyTo: verdict.body.commandId },
       );
       emit(dup);
       return dup;
     }
-    const ack = await dispatcher.handle(verdict.body);
-    idempotency.set(verdict.body.idempotencyKey, ack);
+    let ack: DeviceEvent;
+    try {
+      ack = await dispatcher.handle(verdict.body);
+    } catch (err) {
+      // `dispatcher.handle` answers every command itself; this only runs if it threw anyway, and
+      // exists so a duplicate awaiting this command can never hang.
+      ack = makeEvent(
+        deviceId,
+        'command.ack',
+        {
+          commandId: verdict.body.commandId,
+          status: 'failed',
+          errorCode: 'provider_error',
+          message: (err instanceof Error ? err.message : String(err)).slice(0, 500),
+        },
+        { now, inReplyTo: verdict.body.commandId },
+      );
+      emit(ack);
+    }
+    commands.settle(verdict.body.commandId, ack);
     return ack;
   };
 
@@ -542,6 +571,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       await daemon.reconcile();
       cleanupTimer = setInterval(() => {
         cleanupTmp(paths.tmpDir, o.tmpCleanupOlderThanMs ?? 24 * 3600_000, now);
+        // Backstop for attachments whose turn never reported an end (see AttachmentLeaseRegistry).
+        dispatcher.sweepAttachmentLeases();
         // Completed sessions must stay resumable well past 24h; only very old terminal ones go.
         sessions.prune({
           retentionMs: o.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION_MS,
