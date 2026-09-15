@@ -7,14 +7,15 @@ would most like to control. We assume the network is hostile, that the Pagr clou
 compromised or coerced, and that another local process running as you might poke at the daemon.
 
 **What a compromised cloud can do.** It can start and stop Claude Code and Codex sessions in
-projects *you registered locally*, send them arbitrary instruction text, and answer the permission
+projects *a local action on this Mac made reachable*, send them arbitrary instruction text, and answer the permission
 prompts those sessions raise. Instruction text is a real capability: "run `curl … | sh`" is a
 sentence an agent may act on. So the honest statement is not "the cloud cannot make the agent try
 anything"; it is that **the cloud cannot, by itself, make a high-risk action succeed**.
 
 **What it cannot do.** It cannot send a shell command, a filesystem path, or a binary to run —
-there is no command for it (`packages/protocol/src/schemas.ts`). It cannot reach a directory you
-have not registered. It cannot relay its own `allow` for anything this Mac classified as high risk
+there is no command for it (`packages/protocol/src/schemas.ts`). It cannot name a directory at all: an id
+resolves only to a folder something running on this Mac put in the registry, and an id the
+registry does not know is refused without the filesystem being touched. It cannot relay its own `allow` for anything this Mac classified as high risk
 (below). It cannot lift that classification: no command changes it, and there is no command that
 can. It never sees your device private key, and the bridge never reads your provider credentials.
 
@@ -97,7 +98,7 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | --- | --- |
 | `device.probe`, `project.list`, `agent.get_status` | read-only status |
 | `project.remove` | forget a project id (never deletes files) |
-| `agent.start_session` | start a Claude Code / Codex session **in a project you registered locally**, with an instruction string and up to 4 image attachments |
+| `agent.start_session` | start a Claude Code / Codex session **in a project this Mac made reachable**, with an instruction string and up to 4 image attachments |
 | `agent.send_instruction` | send follow-up text to an existing session |
 | `agent.stop_session` | interrupt a session |
 | `agent.respond_to_approval` | answer a permission prompt the agent raised, bound to the exact preview you saw — and subject to the device floor above |
@@ -106,7 +107,12 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 There is deliberately **no** `shell.exec`, `fs.read`, `fs.write`, `process.spawn`, or "run this
 binary". The cloud cannot send a filesystem path: project references are opaque `proj_…` ids that
 only resolve against `~/.pagr/projects.json` on your machine (`projects.ts`). Sending a path where an
-id is expected fails schema validation before anything else runs. Nothing in this list can write
+id is expected fails schema validation before anything else runs. The reverse direction — a path
+becoming an id — happens only here: `pagr project use` / `add` / `scan`, and the daemon acting on
+what you typed. Registering is a convenience, so any folder you name is reachable without setting
+it up first; it is still the *naming*, locally, that creates the id. An id the registry does not
+know is `unknown_project`, whether it was invented, guessed, or once belonged to a project you
+removed. Nothing in this list can write
 `device-policy.json` or change what the floor refuses.
 
 ## Server key rotation (`transport.ts`)
@@ -154,7 +160,7 @@ Every command is checked, in this order, and the first failure rejects it with a
 8. **Local existence** — referenced project / session ids must exist locally.
 
 A compromised gateway that lacks the server signing key can therefore do nothing; a stolen signing key
-still cannot target a different device, replay old commands, reach unregistered directories, or get a
+still cannot target a different device, replay old commands, reach a directory no local action named, or get a
 high-risk approval past the device floor.
 
 ## Device identity (`identity.ts`, `keychain.ts`)

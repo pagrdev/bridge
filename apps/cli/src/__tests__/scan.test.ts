@@ -177,4 +177,16 @@ describe('pagr project scan', () => {
     expect(await h.run(['project', 'scan', root, '--depth', '1', '--json'])).toBe(EXIT.ok);
     expect((lastJson(h) as { candidates: unknown[] }).candidates).toEqual([]);
   });
+
+  it('treats an implicitly registered repo as known, never a second id', async () => {
+    expect(await h.run(['project', 'use', join(root, 'alpha')])).toBe(EXIT.ok);
+    const implicitId = Object.keys(projects())[0];
+    h.stdout.length = 0;
+    expect(await h.run(['project', 'scan', root, '--all'])).toBe(EXIT.ok);
+    const list = Object.entries(projects());
+    expect(list).toHaveLength(2);
+    expect(list.filter(([, p]) => p.displayName === 'alpha')).toHaveLength(1);
+    expect(Object.keys(projects())).toContain(implicitId as string);
+    expect(plain(h.stdout)).toContain('already registered');
+  });
 });

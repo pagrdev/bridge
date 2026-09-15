@@ -9,7 +9,7 @@ This repository is the open-source half of Pagr: the daemon and CLI that run on 
 - A user-level macOS daemon (`pagr daemon`) that opens **one outbound TLS WebSocket** to Pagr's gateway. No inbound ports.
 - A device identity: an **Ed25519 keypair generated locally**, private key in **macOS Keychain**, public key registered with your account during pairing.
 - Typed adapters for **Codex** (local `codex app-server` over stdio) and **Claude Code** (the unmodified `claude` CLI). Sessions the bridge starts relay their permission prompts over Claude Code's own stdio permission protocol; the `PermissionRequest` hook script that ships in that package is for answering prompts from **your own** interactive `claude` from your phone, is not wired up yet (see `docs/TROUBLESHOOTING.md`), and is never used by a session the bridge starts. Your provider credentials never leave your Mac; the bridge does not read them.
-- A local **project registry** mapping opaque `proj_…` IDs to folders you explicitly added. The cloud only ever sees the ID and a display name.
+- A local **project registry** mapping opaque `proj_…` IDs to folders. Any folder on your disk can be reached — naming one on this Mac (`pagr project use`, `project add`, or `project scan`) mints its id — but only this Mac can turn a path into an id. The cloud only ever sees the ID and a display name, and an id it invents resolves to nothing.
 - A **command guard** that rejects anything that isn't a schema-valid, server-signed, unexpired, non-replayed command bound to this device.
 - A **device-side approval floor**: every permission prompt is classified on your Mac, and a decision from the cloud is refused for remote scripts, network egress, paths outside the project, credential files, privilege escalation and destructive or history-rewriting git — unless *you* lift that class in `~/.pagr/device-policy.json` or `PAGR_DEVICE_FLOOR`. No command can lift it. `pagr doctor` shows what is in force.
 
@@ -24,9 +24,10 @@ It is *not* a sandbox, and instruction text is a real capability: the cloud can 
 ```bash
 npm install -g @pagr/cli
 pagr connect          # generates device key, opens browser to pair with your account
-pagr project add      # register the current folder
+pagr project use      # make the current folder reachable (repo or not) — no setup needed
+pagr project add      # …or register it under a name you choose
 pagr project scan     # …or find every repo under ~/code, ~/src, ~/Developer… and pick
-pagr projects         # what is registered, and what is running in each
+pagr projects         # what is reachable, and what is running in each
 pagr status
 ```
 

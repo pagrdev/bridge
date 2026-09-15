@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -45,6 +45,11 @@ export interface DiscoveredRepo {
   registeredAs?: string;
 }
 
+/** What `ensure()` returns: the project covering a path, and whether this call created it. */
+export interface EnsuredProject extends AddedProject {
+  created: boolean;
+}
+
 export interface AddProjectOptions {
   displayName?: string;
   aliases?: string[];
@@ -57,6 +62,7 @@ export class ProjectError extends Error {
       | 'not_found'
       | 'not_directory'
       | 'not_git'
+      | 'not_owned'
       | 'forbidden_root'
       | 'duplicate'
       | 'unknown_project'
@@ -75,13 +81,67 @@ export interface ProjectRegistryOptions {
   /** The pagr home (defaults to `<home>/.pagr`). Anything under it is refused. */
   pagrHome?: string;
   now?: () => Date;
-  idGen?: () => string;
+  /**
+   * Override id minting. Left unset, ids are derived from the path (see `projectIdFor`) so that
+   * the same folder keeps one id however it was registered.
+   */
+  idGen?: (path: string) => string;
+  /** The uid the daemon runs as (defaults to `process.getuid()`); a seam for tests. */
+  uid?: () => number;
 }
 
+/** A random project id. Kept for embedders passing their own `idGen`; not the default. */
 export const newProjectId = (): string => `proj_${randomBytes(16).toString('hex')}`;
+
+/**
+ * Device-local salt for id derivation, beside `projects.json`. Its own file because
+ * `projects.json` is read elsewhere as "one key per project" and must stay exactly that.
+ */
+const SALT_FILE = 'project-id-salt.json';
+
+/**
+ * A project id is `proj_` + a device-salted hash of the real path.
+ *
+ * Deterministic on purpose: the same folder must come back with the same id whether it was
+ * registered explicitly or implicitly, after a restart, and even after the registry file is lost
+ * — otherwise the cloud's view of that project's sessions fractures into two ids.
+ *
+ * Salted on purpose: an unsalted hash would let the cloud confirm a guessed
+ * `/Users/<name>/code/<repo>`, which is the one fact this registry exists to keep local. The salt
+ * never leaves the Mac, so off-device an id is opaque.
+ */
+export function projectIdFor(realPath: string, salt: string): string {
+  return `proj_${createHash('sha256').update(`${salt}\u0000${realPath}`).digest('hex').slice(0, 32)}`;
+}
 
 const isUnder = (child: string, parent: string): boolean =>
   child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+
+/** Roots no project may live under, however the path was spelled. */
+const SYSTEM_ROOTS = ['/System', '/private/etc', '/etc', '/usr', '/bin', '/sbin'];
+
+/**
+ * The project whose root contains `candidatePath` (deepest root wins), or undefined. Exported
+ * because the CLI has to answer the same question about a list it got from the daemon over IPC,
+ * and one copy of "is this path inside that project" is the only safe number of copies.
+ */
+export function projectContaining<T extends { path: string }>(
+  records: Iterable<T>,
+  candidatePath: string,
+): T | undefined {
+  if (!isAbsolute(candidatePath)) return undefined;
+  let real: string;
+  try {
+    real = realpathNearest(resolve(candidatePath));
+  } catch {
+    return undefined;
+  }
+  let best: T | undefined;
+  for (const rec of records) {
+    if (isUnder(real, rec.path) && (!best || rec.path.length > best.path.length)) best = rec;
+  }
+  return best;
+}
 
 /**
  * Local project registry (`~/.pagr/projects.json`). This is the ONLY place local paths live;
@@ -93,34 +153,64 @@ export class ProjectRegistry {
   private readonly home: string;
   private readonly pagrHome: string;
   private readonly now: () => Date;
-  private readonly idGen: () => string;
+  private readonly idGen: (path: string) => string;
+  private readonly uid: () => number;
+  private readonly saltFile: string | undefined;
+  private salt: string | undefined;
 
   constructor(opts: ProjectRegistryOptions = {}) {
     this.file = opts.file;
+    this.saltFile = this.file ? join(dirname(this.file), SALT_FILE) : undefined;
     this.home = safeRealpath(opts.home ?? homedir());
     this.pagrHome = safeRealpath(opts.pagrHome ?? join(this.home, '.pagr'));
     this.now = opts.now ?? (() => new Date());
-    this.idGen = opts.idGen ?? newProjectId;
+    this.idGen = opts.idGen ?? ((path) => projectIdFor(path, this.deviceSalt()));
+    this.uid = opts.uid ?? (() => process.getuid?.() ?? -1);
     if (this.file) {
       const raw = readJson<Record<string, ProjectRecord>>(this.file, {});
       for (const [k, v] of Object.entries(raw)) if (v && typeof v === 'object') this.map.set(k, v);
     }
   }
 
+  /**
+   * The salt this device derives ids with, created on first use. Re-read from disk on a miss so
+   * a CLI invocation and the daemon agree on one salt instead of each minting its own. A race
+   * cannot break anything already registered: the persisted path→id record is the authority,
+   * and the salt only decides what a brand new id looks like.
+   */
+  private deviceSalt(): string {
+    if (this.salt) return this.salt;
+    const stored = this.saltFile ? readJson<{ salt?: string }>(this.saltFile, {}).salt : undefined;
+    if (typeof stored === 'string' && stored.length >= 32) {
+      this.salt = stored;
+      return stored;
+    }
+    const fresh = randomBytes(32).toString('hex');
+    this.salt = fresh;
+    if (this.saltFile) writeJson(this.saltFile, { salt: fresh });
+    return fresh;
+  }
+
   private forbiddenRoots(): string[] {
     return ['/', '/System', '/private/etc', '/etc', '/usr', '/bin', '/sbin', '/Library', this.home];
   }
 
-  add(inputPath: string, opts: AddProjectOptions = {}): AddedProject {
+  /**
+   * Everything both registration paths must agree on. The path is realpath-resolved BEFORE any
+   * containment decision, so a symlink cannot smuggle a refused root past these checks, and the
+   * forbidden-root rules are applied before ownership so `/` reads as "refusing", not as
+   * "someone else's".
+   */
+  private vetPath(inputPath: string): string {
     const abs = resolve(inputPath);
     if (!existsSync(abs)) throw new ProjectError('not_found', `path does not exist: ${abs}`);
     const path = realpathSync(abs);
-    if (!statSync(path).isDirectory())
-      throw new ProjectError('not_directory', `not a directory: ${path}`);
+    const st = statSync(path);
+    if (!st.isDirectory()) throw new ProjectError('not_directory', `not a directory: ${path}`);
     for (const root of this.forbiddenRoots()) {
       if (path === root) throw new ProjectError('forbidden_root', `refusing to register ${path}`);
     }
-    for (const root of ['/System', '/private/etc', '/etc', '/usr', '/bin', '/sbin']) {
+    for (const root of SYSTEM_ROOTS) {
       if (isUnder(path, root))
         throw new ProjectError('forbidden_root', `refusing to register ${path}`);
     }
@@ -129,6 +219,22 @@ export class ProjectRegistry {
         'forbidden_root',
         `refusing to register a path inside ${this.pagrHome}`,
       );
+    const uid = this.uid();
+    if (uid >= 0 && st.uid !== uid)
+      throw new ProjectError(
+        'not_owned',
+        `${path} is owned by another user (uid ${st.uid}); refusing to register it`,
+      );
+    return path;
+  }
+
+  /**
+   * Explicit registration: curation. It refuses the surprises a person typing a path would want
+   * to hear about — a folder that is not a repository, a path already registered, a name already
+   * taken. `ensure()` is the forgiving door; this one is allowed to argue.
+   */
+  add(inputPath: string, opts: AddProjectOptions = {}): AddedProject {
+    const path = this.vetPath(inputPath);
     const allowNonGit = opts.allowNonGit ?? false;
     if (!allowNonGit && !existsSync(join(path, '.git')))
       throw new ProjectError('not_git', `${path} is not a git repository (use --allow-non-git)`);
@@ -136,6 +242,32 @@ export class ProjectRegistry {
       if (existing.path === path)
         throw new ProjectError('duplicate', `already registered as ${existing.projectId}`);
     }
+    return this.register(path, { ...opts, allowNonGit });
+  }
+
+  /**
+   * Make a path the person named addressable, registering it on the spot if nothing covers it
+   * yet. Registration is a convenience here, not a prerequisite.
+   *
+   * LOCAL CALLERS ONLY. This is the single place a path turns into an id, and it is why the
+   * cloud can never name a directory: every cloud-facing surface takes an id and goes through
+   * `resolve()`, which only ever finds what a local action put in the map.
+   *
+   * A path already inside a registered project returns that project rather than nesting a second
+   * root under a second id — it is already reachable, which is the whole question being asked.
+   * Non-git folders are allowed: the person pointed at this exact folder, so `.git` is a
+   * discovery heuristic here, not a safety rule.
+   */
+  ensure(inputPath: string, opts: AddProjectOptions = {}): EnsuredProject {
+    const path = this.vetPath(inputPath);
+    const existing = this.findByPath(path);
+    if (existing) return { ...existing, created: false };
+    return { ...this.register(path, { allowNonGit: true, ...opts }), created: true };
+  }
+
+  /** Mint and persist a record for an already-vetted path. */
+  private register(path: string, opts: AddProjectOptions): AddedProject {
+    const allowNonGit = opts.allowNonGit ?? true;
     const hint = repoHint(path);
     const inferred = inferProjectNames(path, hint);
     const explicitName = opts.displayName?.trim();
@@ -175,7 +307,7 @@ export class ProjectRegistry {
     if (!resolved) throw new ProjectError('duplicate', 'could not pick a unique name');
 
     const rec: ProjectRecord = {
-      projectId: this.idGen(),
+      projectId: this.idGen(path),
       path,
       displayName: resolved.displayName,
       aliases: resolved.aliases.slice(0, MAX_ALIASES),
@@ -266,18 +398,7 @@ export class ProjectRegistry {
    * match. When roots nest, the deepest matching root wins. Relative paths never match.
    */
   findByPath(candidatePath: string): ProjectRecord | undefined {
-    if (!isAbsolute(candidatePath)) return undefined;
-    let real: string;
-    try {
-      real = realpathNearest(resolve(candidatePath));
-    } catch {
-      return undefined;
-    }
-    let best: ProjectRecord | undefined;
-    for (const rec of this.map.values()) {
-      if (isUnder(real, rec.path) && (!best || rec.path.length > best.path.length)) best = rec;
-    }
-    return best;
+    return projectContaining(this.map.values(), candidatePath);
   }
 
   /**
@@ -287,7 +408,7 @@ export class ProjectRegistry {
   async discover(
     roots: string[],
     opts: ScanOptions = {},
-  ): Promise<ScanRootsResult & { repos: DiscoveredRepo[] }> {
+  ): Promise<Omit<ScanRootsResult, 'repos'> & { repos: DiscoveredRepo[] }> {
     const res = await scanForRepos(roots, { home: this.home, ...opts });
     const registered = new Map(this.list().map((p) => [p.path, p]));
     return {

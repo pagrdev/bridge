@@ -250,8 +250,8 @@ overwrite each other. Your options, in order of preference:
 1. wait for (or stop) the session that holds it — the refusal names its `ses_…`, `pagr sessions`
    shows it;
 2. start the second one **read-only**; read-only sessions may share a tree with a writer;
-3. work in a separate `git worktree` and register it as its own project — different path,
-   different tree, no conflict;
+3. work in a separate `git worktree` and make it its own project (`pagr project use <path>`) —
+   different path, different tree, no conflict;
 4. as a last resort, run the daemon with `PAGR_ALLOW_CONCURRENT_WRITERS=1` and accept the race.
 
 Nesting counts: registering both `~/code/app` and `~/code/app/packages/api` makes them one tree.
@@ -283,7 +283,13 @@ That is a hard requirement, not a preference: the gateway drops any frame over 2
 that does not fit would be resent identically on every reconnect, forever. Anything left out is still
 resumable by id, and `pagr sessions` on the Mac still lists everything.
 
-## Registering lots of projects
+## Reaching lots of projects
+
+You do not have to register a folder before you can use it. `pagr project use [path]` makes any
+folder on your disk reachable on the spot — git repository or not — and hands back its id; running
+it again on the same folder is a no-op that returns the same id. Registering ahead of time is a
+convenience, for naming things and for having them listed. What never changes is that a path only
+becomes an id **here**, on your Mac: the cloud can only ever hand back an id it was given.
 
 `pagr project scan [roots...]` finds git repositories under a few conventional folders (`~/code`,
 `~/src`, `~/Developer`, `~/Projects`, `~/dev`, `~/repos`, `~/git`, `~/work`, `~/Sites`, `~/Desktop`,
@@ -292,7 +298,8 @@ plus the parent of your current directory) — only the ones that exist.
 - It refuses to walk your home directory or `/` outright, never descends into `~/Library`,
   `node_modules`, caches, vendor directories or anything hidden, never follows symlinks, stops at
   each `.git`, and walks at most 3 levels (`--depth`) and 500 repositories (`--limit`).
-- Already-registered repos are skipped, so running it twice changes nothing.
+- Repos already reachable are skipped — including ones `pagr project use` registered implicitly,
+  which keep their id rather than picking up a second one — so running it twice changes nothing.
 - Names come from the folder, plus the GitHub repo name as an alias when it differs — text either.
 - Two folders that would get the same name are qualified with their parent (`two/app`), and an
   alias already claimed by another project is dropped rather than making a word ambiguous.

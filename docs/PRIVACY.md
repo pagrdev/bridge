@@ -37,6 +37,7 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 | --- | --- |
 | `config.json` | `deviceId`, `userId`, gateway URL, pinned server public keys, device name. No secrets. |
 | `projects.json` | project id → **local path** mapping. This is the only place paths live; the cloud sees ids. |
+| `project-id-salt.json` | 32 random bytes (0600) that ids are derived from, so the same folder keeps one id. Salted so an id cannot be tested against a guessed path off this Mac. Never transmitted. |
 | `sessions.json` | session id → provider session id mapping. |
 | `replay.json` | recently seen command nonces (anti-replay). |
 | `policy.json` | the public approval policy synced from your dashboard settings. |
