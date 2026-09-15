@@ -1,7 +1,16 @@
 {
   "name": "@pagr/bridge-core",
   "version": "0.1.0",
+  "description": "Pagr bridge core — the local daemon, IPC server, signed-command guard, gateway transport and project registry behind the `pagr` CLI.",
+  "keywords": [
+    "pagr",
+    "bridge",
+    "daemon",
+    "claude-code",
+    "codex"
+  ],
   "license": "Apache-2.0",
+  "author": "Stagberry Labs LLC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pagrdev/bridge.git",
@@ -14,6 +23,12 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "files": [
     "dist",
     "!dist/**/*.test.*",
@@ -24,6 +39,9 @@
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

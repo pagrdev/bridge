@@ -15,8 +15,11 @@ import {
   type SecretStore,
   sleepMs,
 } from '@pagr/bridge-core';
+import { CLI_VERSION } from './version.js';
 
-export const CLI_VERSION = '0.1.0';
+// Single source of truth for the CLI version: `package.json`, never a literal. Re-exported here
+// because every call site already imports its context from this module.
+export { CLI_VERSION } from './version.js';
 
 /** Synchronous exec used by doctor/launchctl checks. Throws on non-zero exit. */
 export type ExecFn = (file: string, args: string[], opts?: { timeoutMs?: number }) => string;

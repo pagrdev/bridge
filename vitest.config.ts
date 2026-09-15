@@ -6,6 +6,7 @@ export default defineConfig({
       'apps/*/vitest.config.ts',
       'packages/*/vitest.config.ts',
       'integrations/*/vitest.config.ts',
+      'scripts/vitest.config.ts',
     ],
     coverage: { provider: 'v8', reporter: ['text', 'html'] },
   },

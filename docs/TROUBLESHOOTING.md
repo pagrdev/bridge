@@ -2,7 +2,8 @@
 
 Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 0700/0600 permissions), `config.json` and `projects.json` integrity, the secret store (with a real read/write round-trip), the device key, pairing, API reachability, clock skew, the daemon socket, the gateway handshake, gateway reachability, the `codex`/`claude` CLIs and the launch agent — printing a fix for each failure.
 
-- `pagr doctor --json` produces a support-ready report. Every error message in the CLI points here.
+- `pagr doctor` exits **0** on a Mac that simply has not been set up yet. Not paired, no daemon and no launch agent are `warn`/`skip`, each carrying the next command to run; the network checks are skipped entirely until something has actually chosen an API URL. It exits **5** only for a real fault — a Keychain that will not open, a state file that will not parse, a configured API that nothing answers, a daemon that was installed and does not reply.
+- `pagr doctor --json` produces a support-ready report. Every error message in the CLI points here. It carries `"paired"` next to `"ok"`, so a script can tell "healthy but unpaired" from "healthy and paired".
 - `pagr doctor --fix` tightens any file permissions that are too permissive.
 - `pagr doctor --offline` skips the network checks.
 - `pagr status` shows the live picture; `pagr daemon logs -f` streams `~/.pagr/logs/daemon.log`.

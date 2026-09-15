@@ -8,6 +8,10 @@ Run `pagr doctor` and interpret the result for the user.
 Claude Code or Codex is signed in. Its output is already fairly readable, so your job is not to
 repeat it — it is to say which single thing is wrong and what to do about it.
 
+Read the printed checks, not the exit code: `pagr doctor` exits 0 on a machine that is merely not
+set up yet, and only non-zero for a real fault. A `!` line is a step the user has not taken; a `✗`
+line is something broken.
+
 Work through it in this order, because each one makes the next meaningless:
 
 1. **Not installed** — `npm i -g @pagr/cli`.

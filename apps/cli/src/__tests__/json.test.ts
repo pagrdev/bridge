@@ -68,8 +68,10 @@ describe('--json emits one JSON document on stdout and nothing else', () => {
   });
 
   it('doctor', async () => {
-    const { json } = await jsonRun(['doctor', '--json', '--offline']);
-    expect(json).toMatchObject({ ok: false });
+    // A fresh, unpaired home is a healthy install, not a broken one (BR-24).
+    const { code, json } = await jsonRun(['doctor', '--json', '--offline']);
+    expect(code).toBe(EXIT.ok);
+    expect(json).toMatchObject({ ok: true, paired: false, failures: 0 });
     expect(Array.isArray((json as { checks: unknown }).checks)).toBe(true);
   });
 
@@ -171,6 +173,8 @@ describe('--json failures are JSON too', () => {
   }
 
   it('doctor failing prints its report, not a second error document', async () => {
+    // A real fault, not merely an unfinished setup: config.json exists and cannot be parsed.
+    writeFileSync(getPaths(h.home).configFile, '{"deviceId":');
     const { code, json } = await jsonRun(['doctor', '--json', '--offline']);
     expect(code).toBe(EXIT.precondition);
     expect(json).toHaveProperty('checks');

@@ -2,7 +2,15 @@
   "name": "@pagr/protocol",
   "version": "0.1.0",
   "description": "Pagr device protocol — typed, versioned schemas for cloud→bridge commands and bridge→cloud events. Public so anyone can audit exactly what the bridge can be asked to do.",
+  "keywords": [
+    "pagr",
+    "protocol",
+    "claude-code",
+    "codex",
+    "zod"
+  ],
   "license": "Apache-2.0",
+  "author": "Stagberry Labs LLC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pagrdev/bridge.git",
@@ -31,6 +39,9 @@
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

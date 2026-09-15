@@ -27,6 +27,7 @@ afterEach(async () => {
 
 interface Report {
   ok: boolean;
+  paired: boolean;
   home: string;
   failures: number;
   warnings: number;
@@ -60,7 +61,7 @@ const daemonStatus = (over: Record<string, unknown> = {}) => ({
 
 describe('doctor · flags', () => {
   it('accepts `pagr doctor --json`, not only `pagr --json doctor`', async () => {
-    expect(await h.run(['doctor', '--json'])).toBe(EXIT.precondition);
+    expect(await h.run(['doctor', '--json'])).toBe(EXIT.ok);
     expect(() => lastJson(h)).not.toThrow();
   });
 
@@ -243,14 +244,20 @@ describe('doctor · daemon, socket and launchd', () => {
 });
 
 describe('doctor · exit codes and summary', () => {
-  it('exits 5 when anything failed, and points at --json for support', async () => {
+  it('exits 5 when something is genuinely broken, and points at --json for support', async () => {
+    writeFileSync(getPaths(h.home).configFile, '{"deviceId":');
+    expect(await h.run(['doctor', '--offline'])).toBe(EXIT.precondition);
+    const out = plain(h.stdout);
+    expect(out).toMatch(/✗ config\.json/);
+    expect(out).toContain('pagr doctor --json');
+  });
+
+  it('a missing agent CLI is a warning, not a failure', async () => {
     h.execImpl = () => {
       throw new Error('ENOENT');
     };
-    expect(await h.run(['doctor', '--offline'])).toBe(EXIT.precondition);
-    const out = plain(h.stdout);
-    expect(out).toMatch(/✗ paired/);
-    expect(out).toContain('pagr doctor --json');
+    expect(await h.run(['doctor', '--offline'])).toBe(EXIT.ok);
+    expect(check(await report(['--offline']), 'codex')?.status).toBe('warn');
   });
 
   it('exits 0 when only warnings remain and says how many', async () => {
@@ -262,7 +269,6 @@ describe('doctor · exit codes and summary', () => {
     server = await fakeDaemon(h.home, { status: () => daemonStatus() });
     await h.run(['daemon', 'install']);
     h.execImpl = (f) => (f === '/bin/launchctl' ? 'loaded' : '1.0.0');
-    h.nowMs = Date.now(); // agree with the fake API's Date header
     const r = await report();
     expect(r.checks.filter((c) => c.status === 'fail')).toEqual([]);
     h.stdout.length = 0;
@@ -273,6 +279,102 @@ describe('doctor · exit codes and summary', () => {
 
 const readPlistWith = (path: string, from: string, to: string): string =>
   readFileSync(path, 'utf8').replace(from, to);
+
+/**
+ * BR-24. `RELEASING.md` § "Post-release smoke on a clean machine" runs `pagr doctor` straight
+ * after `npm install -g @pagr/cli`, before anything is paired. If that exits non-zero the release
+ * check can never pass, and worse, every new user's first impression of the tool is a red report
+ * about a machine that is in exactly the state it should be in.
+ */
+describe('doctor · a fresh, unpaired install', () => {
+  /** No PAGR_API_URL: nothing has chosen a stack, because `pagr connect` has not run. */
+  const unconfigured = () => {
+    const { PAGR_API_URL: _drop, ...rest } = h.overrides.env ?? {};
+    h.overrides.env = rest;
+  };
+
+  it('passes and says how to pair instead of failing', async () => {
+    unconfigured();
+    expect(await h.run(['doctor'])).toBe(EXIT.ok);
+    const out = plain(h.stdout);
+    expect(out).toContain('not paired yet — run `pagr connect`');
+    expect(out).toContain('all checks passed');
+    expect(out).not.toContain('check(s) failed');
+  });
+
+  it('reports `paired` as a warning carrying the next command', async () => {
+    unconfigured();
+    const c = check(await report(), 'paired');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('not paired yet');
+    expect(c?.fix).toContain('pagr connect');
+  });
+
+  it('skips the network checks when no API URL has been configured', async () => {
+    unconfigured();
+    const r = await report();
+    expect(check(r, 'api')?.status).toBe('skip');
+    expect(check(r, 'api')?.detail).toContain('no API URL configured');
+    expect(check(r, 'clock')?.status).toBe('skip');
+    expect(check(r, 'gateway')?.status).toBe('skip');
+    expect(r.failures).toBe(0);
+  });
+
+  it('treats a daemon that was never installed as a warning', async () => {
+    unconfigured();
+    const c = check(await report(), 'daemon');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('not installed yet');
+    expect(c?.fix).toContain('pagr connect');
+  });
+
+  it('reports `paired: false` in --json so a smoke test can assert it', async () => {
+    unconfigured();
+    const r = await report();
+    expect(r.paired).toBe(false);
+    expect(r.ok).toBe(true);
+  });
+
+  it('a running-but-unpaired daemon is a warning, not a broken gateway link', async () => {
+    unconfigured();
+    server = await fakeDaemon(h.home, {
+      status: () => daemonStatus({ paired: false, transport: 'unpaired' }),
+    });
+    const r = await report();
+    expect(check(r, 'gateway link')?.status).toBe('warn');
+    expect(check(r, 'gateway link')?.detail).toContain('not paired yet');
+    expect(r.failures).toBe(0);
+  });
+});
+
+describe('doctor · genuine faults still fail on an unpaired machine', () => {
+  it('a broken Keychain', async () => {
+    h.store = failingKeychain('Keychain is locked (-25629)');
+    expect(await h.run(['doctor', '--offline'])).toBe(EXIT.precondition);
+  });
+
+  it('an unparsable config.json', async () => {
+    writeFileSync(getPaths(h.home).configFile, 'not json');
+    expect(await h.run(['doctor', '--offline'])).toBe(EXIT.precondition);
+  });
+
+  it('a configured API URL that nothing answers', async () => {
+    h.overrides.env = { ...h.overrides.env, PAGR_API_URL: 'http://127.0.0.1:1' };
+    expect(await h.run(['doctor'])).toBe(EXIT.precondition);
+    expect(check(await report(), 'api')?.status).toBe('fail');
+  });
+
+  it('a paired machine whose daemon does not answer', async () => {
+    writeFileSync(
+      getPaths(h.home).configFile,
+      JSON.stringify({ deviceId: DEV, gatewayUrl: 'wss://gw.example' }),
+      { mode: 0o600 },
+    );
+    const r = await report(['--offline']);
+    expect(check(r, 'daemon')?.status).toBe('fail');
+    expect(check(r, 'daemon')?.fix).toContain('pagr daemon install');
+  });
+});
 
 describe('doctor · Claude Code live steering', () => {
   it('says follow-ups are queued when channel mode is off', async () => {

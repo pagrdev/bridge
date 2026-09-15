@@ -25,7 +25,7 @@ import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, ipc, socketPath } from '../ipc.js';
 import { bad, bold, dim, ok, printJson, warn } from '../output.js';
-import { resolveApiUrl } from '../urls.js';
+import { configuredApiUrl } from '../urls.js';
 import { LAUNCH_COMMAND, MCP_CONFIG_FILE, MCP_SERVER_KEY } from './claude.js';
 
 export interface Check {
@@ -47,6 +47,14 @@ const NODE_MIN_MAJOR = 22;
 /**
  * Every user-visible failure mode has a check here, because every error message in the CLI
  * points at `pagr doctor`. A check that cannot be run reports `skip`, never a false `ok`.
+ *
+ * `fail` means *broken*, not *unfinished*. A Mac that has just installed `@pagr/cli` and has not
+ * run `pagr connect` yet is in a correct state: it has no device id, no gateway URL, no API URL
+ * and no daemon, and every one of those reports `warn`/`skip` with the next command to run. That
+ * is what makes `pagr doctor` usable as the post-install smoke test (packaging/RELEASING.md §
+ * "Post-release smoke on a clean machine") and why it exits 0 there. A broken Keychain, an
+ * unparsable `config.json`, a gateway URL that was paired and no longer resolves, a daemon that
+ * was installed and does not answer — those still fail.
  */
 export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Promise<Check[]> {
   const checks: Check[] = [];
@@ -175,20 +183,31 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
   }
 
   // ---- pairing ------------------------------------------------------------
+  // Not a failure: a fresh install is *supposed* to be unpaired. Everything downstream that needs
+  // a pairing (API URL, gateway, daemon) reads this flag and skips rather than failing too.
+  const paired = Boolean(config.deviceId);
   add({
     name: 'paired',
-    status: config.deviceId ? 'ok' : 'fail',
-    detail: config.deviceId
+    status: paired ? 'ok' : 'warn',
+    detail: paired
       ? `${config.deviceId} (${config.deviceName ?? ''})`
-      : 'no device id in config.json',
-    ...(config.deviceId ? {} : { fix: 'run `pagr connect`' }),
+      : 'not paired yet — run `pagr connect`',
+    ...(paired ? {} : { fix: 'run `pagr connect`' }),
   });
 
   // ---- API + clock --------------------------------------------------------
-  const apiUrl = resolveApiUrl(ctx.env, undefined, config);
+  // Only ever probed against a URL somebody chose (--api-url / PAGR_API_URL / a paired
+  // config.json). With none of those there is nothing to be reachable, so both checks skip: an
+  // unpaired Mac is not "offline", and reporting it as such sends people chasing a network fault
+  // that does not exist.
+  const apiUrl = configuredApiUrl(ctx.env, undefined, config);
   if (opts.offline) {
     add({ name: 'api', status: 'skip', detail: '--offline' });
     add({ name: 'clock', status: 'skip', detail: '--offline' });
+  } else if (!apiUrl) {
+    const why = 'no API URL configured yet — run `pagr connect`';
+    add({ name: 'api', status: 'skip', detail: why });
+    add({ name: 'clock', status: 'skip', detail: 'needs a configured API to compare against' });
   } else {
     const probe = await probeApi(ctx, apiUrl);
     add({
@@ -223,17 +242,24 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
   // ---- daemon -------------------------------------------------------------
   const status = await daemonStatus(ctx);
   const lock = readDaemonLock(ctx.paths.lockFile);
+  // A lock file means a daemon was started and is not answering — that is broken whatever the
+  // pairing says. No lock and no pairing just means `pagr daemon install` has not been run yet.
+  const daemonExpected = Boolean(lock) || paired;
   add({
     name: 'daemon',
-    status: status ? 'ok' : 'fail',
+    status: status ? 'ok' : daemonExpected ? 'fail' : 'warn',
     detail: status
       ? `pid ${status.pid}, transport ${status.transport}`
       : lock
         ? `no answer on ${socketPath(ctx)} (lock file holds pid ${lock.pid})`
-        : `no socket at ${socketPath(ctx)}`,
+        : paired
+          ? `no socket at ${socketPath(ctx)}`
+          : 'not installed yet',
     ...(status
       ? {}
-      : { fix: 'run `pagr daemon install` (or `pagr daemon run`), then `pagr daemon logs`' }),
+      : daemonExpected
+        ? { fix: 'run `pagr daemon install` (or `pagr daemon run`), then `pagr daemon logs`' }
+        : { fix: 'run `pagr connect`, then `pagr daemon install`' }),
   });
 
   const sock = socketPath(ctx);
@@ -251,8 +277,12 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
   if (status)
     add({
       name: 'gateway link',
-      status: status.transport === 'connected' ? 'ok' : 'fail',
-      detail: status.transport,
+      // `unpaired` is the daemon correctly reporting that it has no account to dial — the daemon
+      // runs and serves IPC in that state by design, so it is a warning, not a fault.
+      status:
+        status.transport === 'connected' ? 'ok' : status.transport === 'unpaired' ? 'warn' : 'fail',
+      detail:
+        status.transport === 'unpaired' ? 'not paired yet — run `pagr connect`' : status.transport,
       ...(status.transport === 'connected'
         ? {}
         : {
@@ -290,7 +320,7 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
       });
     }
   } else {
-    add({ name: 'gateway', status: 'skip', detail: 'not paired' });
+    add({ name: 'gateway', status: 'skip', detail: 'not paired yet — run `pagr connect`' });
   }
 
   // ---- agent CLIs ---------------------------------------------------------
@@ -457,9 +487,11 @@ export async function runDoctor(ctx: CliContext, opts: DoctorOptions = {}): Prom
   const checks = await runChecks(ctx, opts);
   const failures = checks.filter((c) => c.status === 'fail');
   const warnings = checks.filter((c) => c.status === 'warn');
+  const paired = checks.find((c) => c.name === 'paired')?.status === 'ok';
   if (ctx.json) {
     printJson(ctx, {
       ok: failures.length === 0,
+      paired,
       home: ctx.home,
       bridgeVersion: ctx.bridgeVersion,
       node: process.versions.node,
@@ -494,6 +526,8 @@ export async function runDoctor(ctx: CliContext, opts: DoctorOptions = {}): Prom
     );
     if (failures.length > 0)
       ctx.out(dim('  `pagr doctor --json` produces a report you can send to support'));
+    else if (!paired)
+      ctx.out(dim('  this Mac is not paired yet — run `pagr connect` to finish setup'));
   }
   if (failures.length > 0) throw new CliError('', EXIT.precondition, { code: 'doctor_failed' });
 }

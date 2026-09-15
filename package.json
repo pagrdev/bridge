@@ -1,13 +1,23 @@
 {
   "name": "pagr-bridge",
-  "private": true,
   "version": "0.1.0",
+  "private": true,
   "description": "Pagr bridge — open-source macOS daemon that lets Pagr's cloud drive your local Claude Code and Codex sessions through typed, signed commands. No remote shell.",
   "license": "Apache-2.0",
-  "packageManager": "pnpm@10.14.0",
+  "author": "Stagberry Labs LLC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pagrdev/bridge.git"
+  },
+  "homepage": "https://github.com/pagrdev/bridge#readme",
+  "bugs": {
+    "url": "https://github.com/pagrdev/bridge/issues"
+  },
+  "type": "module",
   "engines": {
     "node": ">=22"
   },
+  "packageManager": "pnpm@10.14.0",
   "scripts": {
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
@@ -24,7 +34,6 @@
     "vitest": "^4.1.0",
     "@vitest/coverage-v8": "^4.1.0"
   },
-  "type": "module",
   "pnpm": {
     "overrides": {
       "vite": "^7.3.0"
