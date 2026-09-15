@@ -16,6 +16,18 @@ export * from './identity.js';
 export * from './ipc.js';
 export * from './jsonFile.js';
 export * from './keychain.js';
+// `daemon.js` already re-exports the older half of this module, so the new symbols are listed
+// explicitly rather than star-exported twice.
+export {
+  DAEMON_EXIT,
+  DEFAULT_THROTTLE_SECONDS,
+  type LaunchctlOptions,
+  nodeLauncherPath,
+  renderNodeLauncher,
+  startLaunchAgent,
+  stopLaunchAgent,
+  writeNodeLauncher,
+} from './launchAgent.js';
 export * from './logging.js';
 export * from './pairing.js';
 export * from './paths.js';

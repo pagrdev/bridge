@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type {
   AdapterEvent,
@@ -58,6 +60,12 @@ export interface CodexAdapterOptions {
   healthyUptimeMs?: number;
   /** Extra environment for the spawned app-server (tests; `CODEX_HOME` isolation). */
   env?: NodeJS.ProcessEnv;
+  /** Where `codex login` keeps its credentials. Default `$CODEX_HOME` or `~/.codex`. */
+  codexHome?: string;
+  /** How long a `codex --version` answer is reused before forking again. 0 disables caching. */
+  versionCacheMs?: number;
+  /** Idle time before the shared app-server is stopped. 0 keeps it up forever. */
+  idleShutdownMs?: number;
   /** Disable file logging (tests). */
   log?: boolean;
 }
@@ -111,6 +119,19 @@ const CAPABILITIES = {
 
 const INSTALL_HINT = 'Install Codex: npm i -g @openai/codex, then run `codex login`';
 
+/** How long `codex --version` is trusted before forking again. */
+const VERSION_CACHE_MS = 5 * 60_000;
+
+/** "Codex is not installed" is cached for much less: installing it should be noticed quickly. */
+const MISSING_CACHE_MS = 30_000;
+
+/**
+ * How long the shared `codex app-server` may sit with nothing to do before it is stopped. The
+ * next command starts a fresh one and `ensureLoaded` resumes the thread, so the only cost of
+ * being wrong is one spawn.
+ */
+const IDLE_SHUTDOWN_MS = 5 * 60_000;
+
 /**
  * Codex adapter over the local `codex app-server` (stdio JSON-RPC). One app-server process is
  * shared by all sessions; each cloud session maps to one Codex thread.
@@ -131,6 +152,10 @@ export class CodexAdapter implements CodingAgentAdapter {
   private restartAttempts = 0;
   /** When the current app-server finished its handshake; null while none is up. */
   private startedAtMs: number | null = null;
+  /** Memoised `codex --version`, so a gateway reconnect storm does not fork per connect. */
+  private versionCache: { value: string | null; atMs: number } | null = null;
+  /** Armed whenever the app-server has nothing left to do. */
+  private idleTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly opts: CodexAdapterOptions) {
     this.logger = new FileLogger(
@@ -153,6 +178,13 @@ export class CodexAdapter implements CodingAgentAdapter {
     return this.client?.running === true;
   }
 
+  /**
+   * Cheap and side-effect free, because the daemon probes on EVERY gateway connect. It used to
+   * call `ensureClient()`, so any Mac with `codex` on its PATH carried a permanent extra
+   * `codex app-server` process from the first connect onwards, and every reconnect re-forked
+   * `codex --version`. Now: the version is memoised, auth is read off disk, and the app-server
+   * is consulted only when a session already has one running.
+   */
   async probe(): Promise<AgentConnectionStatus> {
     const version = await this.codexVersion();
     if (!version) {
@@ -165,29 +197,56 @@ export class CodexAdapter implements CodingAgentAdapter {
         detail: INSTALL_HINT,
       };
     }
-    let authStatus: AgentConnectionStatus['authStatus'] = 'unknown';
-    let detail: string | undefined;
-    try {
-      const client = await this.ensureClient();
-      const acct = await client.request<GetAccountResponse>(METHODS.accountRead, {});
-      if (acct.account) authStatus = 'authenticated';
-      else if (acct.requiresOpenaiAuth) {
-        authStatus = 'unauthenticated';
-        detail = 'Run `codex login` to sign in to Codex';
-      }
-    } catch (err) {
-      detail = `Codex app-server unavailable: ${(err as Error).message}`;
-    }
+    const auth = await this.authStatus();
     const status: AgentConnectionStatus = {
       provider: 'codex',
       mode: 'app-server',
       installed: true,
       providerVersion: version,
-      authStatus,
+      authStatus: auth.authStatus,
       capabilities: { ...CAPABILITIES },
     };
-    if (detail) status.detail = detail;
+    if (auth.detail) status.detail = auth.detail;
     return status;
+  }
+
+  /** `codex login` writes `$CODEX_HOME/auth.json` (default `~/.codex`). */
+  private codexAuthFile(): string {
+    const home =
+      this.opts.codexHome ??
+      this.opts.env?.CODEX_HOME ??
+      process.env.CODEX_HOME ??
+      path.join(os.homedir(), '.codex');
+    return path.join(home, 'auth.json');
+  }
+
+  /**
+   * Authoritative when an app-server is already up (one RPC, no new process); inferred from
+   * `auth.json` / `OPENAI_API_KEY` otherwise. Never starts anything.
+   */
+  private async authStatus(): Promise<{
+    authStatus: AgentConnectionStatus['authStatus'];
+    detail?: string;
+  }> {
+    if (this.client?.running) {
+      try {
+        const acct = await this.client.request<GetAccountResponse>(METHODS.accountRead, {});
+        if (acct.account) return { authStatus: 'authenticated' };
+        if (acct.requiresOpenaiAuth)
+          return { authStatus: 'unauthenticated', detail: 'Run `codex login` to sign in to Codex' };
+        return { authStatus: 'unknown' };
+      } catch (err) {
+        return { authStatus: 'unknown', detail: `Codex app-server: ${(err as Error).message}` };
+      }
+    }
+    const file = this.codexAuthFile();
+    if (existsSync(file)) return { authStatus: 'authenticated' };
+    const key = this.opts.env?.OPENAI_API_KEY ?? process.env.OPENAI_API_KEY;
+    if (key) return { authStatus: 'authenticated' };
+    return {
+      authStatus: 'unauthenticated',
+      detail: `No Codex credentials at ${file} — run \`codex login\``,
+    };
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -349,10 +408,12 @@ export class CodexAdapter implements CodingAgentAdapter {
     });
     const live = this.sessions.get(p.sessionId);
     if (live && !this.hasPendingFor(p.sessionId)) this.setStatus(live, 'working');
+    this.armIdleShutdown();
   }
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.clearIdleTimer();
     if (this.restartTimer) clearTimeout(this.restartTimer);
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
@@ -409,17 +470,85 @@ export class CodexAdapter implements CodingAgentAdapter {
       updatedAt: live.summary.updatedAt,
     });
     this.emit({ kind: 'session', session: live.summary });
+    this.armIdleShutdown();
   }
 
-  private codexVersion(): Promise<string | null> {
+  // ---- idle app-server ----
+
+  /** A turn in flight, a queued follow-up or an approval waiting on a human all count as busy. */
+  private get busy(): boolean {
+    if (this.pending.size > 0) return true;
+    for (const s of this.sessions.values()) if (s.activeTurnId || s.queued.length > 0) return true;
+    return false;
+  }
+
+  private clearIdleTimer(): void {
+    if (!this.idleTimer) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  /**
+   * Stop the shared app-server once nothing needs it. One idle `codex app-server` per Mac,
+   * forever, is what `probe()` used to leave behind; keeping one alive after the last turn has
+   * the same cost, just later.
+   */
+  private armIdleShutdown(): void {
+    this.clearIdleTimer();
+    const ms = this.opts.idleShutdownMs ?? IDLE_SHUTDOWN_MS;
+    if (ms <= 0 || this.shuttingDown || this.busy || !this.client?.running) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      void this.stopIdleAppServer();
+    }, ms);
+    this.idleTimer.unref();
+  }
+
+  private async stopIdleAppServer(): Promise<void> {
+    const client = this.client;
+    if (!client?.running || this.busy || this.shuttingDown || this.starting) return;
+    this.logger.log('info', 'app-server idle; stopping it until the next command');
+    // Drop the reference BEFORE stopping: the `exit` handler sees an expected exit and must not
+    // find a client it would try to restart.
+    this.client = null;
+    this.startedAtMs = null;
+    // A fresh process knows nothing about these threads; they get `thread/resume`d on next use.
+    for (const s of this.sessions.values()) s.loaded = false;
+    await client.stop().catch(() => {});
+  }
+
+  /**
+   * `codex --version`, memoised. The daemon probes on every gateway connect, and a flapping
+   * network turned that into one fork per reconnect. The TTL is short enough that installing
+   * (or removing) Codex is still noticed within a few minutes.
+   */
+  private async codexVersion(): Promise<string | null> {
+    const cached = this.versionCache;
+    const ttl =
+      this.opts.versionCacheMs ?? (cached?.value === null ? MISSING_CACHE_MS : VERSION_CACHE_MS);
+    if (cached && ttl > 0 && Date.now() - cached.atMs < ttl) return cached.value;
+    const value = await this.forkCodexVersion();
+    this.versionCache = { value, atMs: Date.now() };
+    return value;
+  }
+
+  private forkCodexVersion(): Promise<string | null> {
     const [bin, ...rest] = this.opts.codexCommand ?? ['codex'];
     if (!bin) return Promise.resolve(null);
     return new Promise((resolve) => {
-      execFile(bin, [...rest, '--version'], { timeout: 10_000 }, (err, stdout) => {
-        if (err) return resolve(null);
-        const m = /(\d+\.\d+\.\d+)/.exec(stdout);
-        resolve(m?.[1] ?? (stdout.trim() || null));
-      });
+      execFile(
+        bin,
+        [...rest, '--version'],
+        {
+          timeout: 10_000,
+          ...(this.opts.env ? { env: { ...process.env, ...this.opts.env } } : {}),
+        },
+        (err, stdout) => {
+          if (err) return resolve(null);
+          const m = /(\d+\.\d+\.\d+)/.exec(stdout);
+          resolve(m?.[1] ?? (stdout.trim() || null));
+        },
+      );
     });
   }
 
@@ -429,6 +558,8 @@ export class CodexAdapter implements CodingAgentAdapter {
    * replaced the first, orphaning its threads — so this memoises the in-flight spawn.
    */
   private ensureClient(): Promise<AppServerClient> {
+    // Somebody wants the app-server: it is not idle any more.
+    this.clearIdleTimer();
     if (this.client?.running) return Promise.resolve(this.client);
     if (this.shuttingDown) return Promise.reject(new Error('adapter is shut down'));
     if (this.starting) return this.starting;

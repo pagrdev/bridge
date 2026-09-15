@@ -1,15 +1,22 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  DAEMON_EXIT,
   installLaunchAgent,
   LAUNCH_AGENT_LABEL,
   LaunchAgentError,
   launchAgentPlistPath,
   launchAgentStaleReason,
+  nodeLauncherPath,
   readPlistFacts,
+  renderNodeLauncher,
   renderPlist,
+  startLaunchAgent,
+  stopLaunchAgent,
   uninstallLaunchAgent,
+  writeNodeLauncher,
 } from './launchAgent.js';
 import { useTempHome } from './testUtil.js';
 
@@ -187,6 +194,190 @@ describe('launch agent · install', () => {
     } finally {
       chmodSync(join(dir, 'LaunchAgents'), 0o700);
     }
+  });
+});
+
+describe('launch agent · restart policy', () => {
+  const t = useTempHome('pagr-agent-');
+
+  it('does not restart the daemon after a non-zero exit, and backs off between restarts', () => {
+    const xml = renderPlist(opts(t.home));
+    // A plain `<key>KeepAlive</key><true/>` is what made launchd relaunch a daemon that could
+    // not start every ~10 seconds forever, re-raising a Keychain dialog on each attempt.
+    expect(xml).not.toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>/);
+    expect(xml).toMatch(/<key>SuccessfulExit<\/key>\s*<true\/>/);
+    expect(xml).toMatch(/<key>Crashed<\/key>\s*<true\/>/);
+    expect(xml).toMatch(/<key>ThrottleInterval<\/key>\s*<integer>30<\/integer>/);
+  });
+
+  it('honours a custom throttle interval', () => {
+    expect(renderPlist(opts(t.home, { throttleIntervalSeconds: 90 }))).toContain(
+      '<integer>90</integer>',
+    );
+  });
+
+  it('the exit-code contract the daemon must follow is a shared constant', () => {
+    expect(DAEMON_EXIT).toEqual({ ok: 0, unrecoverable: 78 });
+  });
+});
+
+describe('launch agent · node launcher', () => {
+  const t = useTempHome('pagr-agent-');
+
+  it('is a valid shell script that never hard-codes one Node as the only option', () => {
+    const file = writeNodeLauncher(t.home, '/opt/homebrew/Cellar/node/22.11.0/bin/node');
+    expect(file).toBe(nodeLauncherPath(t.home));
+    const text = readFileSync(file, 'utf8');
+    execFileSync('/bin/sh', ['-n', file]); // throws if the generated script does not parse
+    // The version-qualified path the installer happened to run under is a LAST resort, after
+    // $PAGR_NODE, the PATH and the stable absolute locations.
+    expect(text.indexOf('command -v node')).toBeLessThan(
+      text.indexOf('/opt/homebrew/Cellar/node/22.11.0/bin/node'),
+    );
+    expect(text).toContain('/opt/homebrew/bin/node');
+    expect(text).toContain(`exit ${DAEMON_EXIT.unrecoverable}`);
+    expect(statSync(file).mode & 0o777).toBe(0o700);
+  });
+
+  it('execs the Node it is pointed at, passing the arguments through', () => {
+    const file = writeNodeLauncher(t.home, process.execPath);
+    const out = execFileSync(file, ['-e', 'process.stdout.write("hi:" + process.argv[1])'], {
+      encoding: 'utf8',
+      env: { ...process.env, PAGR_NODE: process.execPath },
+    });
+    expect(out).toContain('hi:');
+  });
+
+  it('works with no fallback at all', () => {
+    expect(() => execFileSync('/bin/sh', ['-c', ':'])).not.toThrow();
+    const text = renderNodeLauncher();
+    expect(text).toContain('#!/bin/sh');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('a plist whose interpreter was deleted by a Node upgrade is reported stale', () => {
+    writeFileSync(join(t.home, 'bin.js'), '');
+    mkdirSync(join(t.home, 'LaunchAgents'), { recursive: true });
+    const plist = launchAgentPlistPath(join(t.home, 'LaunchAgents'));
+    writeFileSync(
+      plist,
+      renderPlist(
+        opts(t.home, {
+          // exactly what `brew upgrade node` leaves behind in an older plist
+          programArguments: [
+            '/opt/homebrew/Cellar/node/22.11.0/bin/node',
+            join(t.home, 'bin.js'),
+            'daemon',
+            'run',
+          ],
+        }),
+      ),
+    );
+    expect(launchAgentStaleReason(plist, { programArguments: [] })).toMatch(
+      /no longer exists \(a Node upgrade/,
+    );
+  });
+});
+
+describe('launch agent · start and stop', () => {
+  const t = useTempHome('pagr-agent-');
+  const dir = () => join(t.home, 'LaunchAgents');
+
+  it('stop unloads the job but KEEPS the plist, so it comes back at login', () => {
+    const calls: string[][] = [];
+    installLaunchAgent(opts(t.home, { exec: () => {} }));
+    const result = stopLaunchAgent({
+      launchAgentsDir: dir(),
+      uid: 501,
+      exec: (f, a) => void calls.push([f, ...a]),
+    });
+    expect(result).toBe('stopped');
+    expect(calls).toEqual([['/bin/launchctl', 'bootout', `gui/501/${LAUNCH_AGENT_LABEL}`]]);
+    expect(existsSync(launchAgentPlistPath(dir()))).toBe(true);
+  });
+
+  it('stopping something that is not loaded is not an error', () => {
+    installLaunchAgent(opts(t.home, { exec: () => {} }));
+    expect(
+      stopLaunchAgent({
+        launchAgentsDir: dir(),
+        uid: 501,
+        exec: () => {
+          throw Object.assign(new Error('x'), { stderr: 'Boot-out failed: 3: No such process' });
+        },
+      }),
+    ).toBe('not_loaded');
+    expect(existsSync(launchAgentPlistPath(dir()))).toBe(true);
+  });
+
+  it('stop says so when nothing is installed', () => {
+    expect(stopLaunchAgent({ launchAgentsDir: dir(), uid: 501, exec: () => {} })).toBe(
+      'not_installed',
+    );
+  });
+
+  it('stop surfaces a real launchctl refusal instead of pretending it worked', () => {
+    installLaunchAgent(opts(t.home, { exec: () => {} }));
+    const err = (() => {
+      try {
+        stopLaunchAgent({
+          launchAgentsDir: dir(),
+          uid: 501,
+          exec: () => {
+            throw Object.assign(new Error('x'), { stderr: 'Boot-out failed: 9: Bad file' });
+          },
+        });
+      } catch (e) {
+        return e;
+      }
+    })() as LaunchAgentError;
+    expect(err.code).toBe('bootout');
+    expect(err.detail).toContain('Bad file');
+  });
+
+  it('start bootstraps the installed plist without rewriting it', () => {
+    installLaunchAgent(opts(t.home, { exec: () => {} }));
+    const before = readFileSync(launchAgentPlistPath(dir()), 'utf8');
+    const calls: string[][] = [];
+    expect(
+      startLaunchAgent({
+        launchAgentsDir: dir(),
+        uid: 501,
+        exec: (f, a) => void calls.push([f, ...a]),
+      }),
+    ).toBe('started');
+    expect(calls[0]?.[1]).toBe('bootstrap');
+    expect(readFileSync(launchAgentPlistPath(dir()), 'utf8')).toBe(before);
+  });
+
+  it('start kickstarts a job that is already loaded', () => {
+    installLaunchAgent(opts(t.home, { exec: () => {} }));
+    const calls: string[] = [];
+    expect(
+      startLaunchAgent({
+        launchAgentsDir: dir(),
+        uid: 501,
+        exec: (_f, a) => {
+          calls.push(a.join(' '));
+          if (a[0] === 'bootstrap')
+            throw Object.assign(new Error('x'), { stderr: 'Load failed: 37: already loaded' });
+        },
+      }),
+    ).toBe('restarted');
+    expect(calls.some((c) => c.startsWith('kickstart'))).toBe(true);
+  });
+
+  it('start refuses clearly when there is no launch agent to start', () => {
+    const err = (() => {
+      try {
+        startLaunchAgent({ launchAgentsDir: dir(), uid: 501, exec: () => {} });
+      } catch (e) {
+        return e;
+      }
+    })() as LaunchAgentError;
+    expect(err.code).toBe('not_installed');
+    expect(err.hint).toMatch(/pagr daemon install/);
   });
 });
 

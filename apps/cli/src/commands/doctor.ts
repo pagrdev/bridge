@@ -26,6 +26,13 @@ import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, ipc, socketPath } from '../ipc.js';
+import {
+  agentEnvGaps,
+  describeEnvGaps,
+  ENV_GAP_FIX,
+  installedAgentEnv,
+  launchAgentPlan,
+} from '../launchd.js';
 import { bad, bold, dim, ok, printJson, warn } from '../output.js';
 import { configuredApiUrl } from '../urls.js';
 import { LAUNCH_COMMAND, MCP_CONFIG_FILE, MCP_SERVER_KEY } from './claude.js';
@@ -415,8 +422,9 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
       });
     } else {
       const loaded = launchAgentLoadedSafely(ctx);
+      const plan = launchAgentPlan(ctx);
       const stale = launchAgentStaleReason(plist, {
-        programArguments: [process.execPath, ctx.binPath, 'daemon', 'run'],
+        programArguments: plan.programArguments,
         env: { PAGR_HOME: ctx.home },
       });
       add({
@@ -428,12 +436,46 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
             ? 'loaded'
             : `${plist} present but not loaded`,
         ...(stale || !loaded
-          ? { fix: 'run `pagr daemon install` to rewrite and re-bootstrap it' }
+          ? {
+              fix: stale
+                ? 'run `pagr daemon install` to rewrite and re-bootstrap it (it resolves Node at launch, so a Node upgrade cannot break it again)'
+                : 'run `pagr daemon start` (or `pagr daemon install` to rewrite and re-bootstrap it)',
+            }
           : {}),
       });
     }
+    addAgentEnvCheck(ctx, add, plist);
   }
   return checks;
+}
+
+/**
+ * The "works in my terminal, not from my phone" check. launchd hands a launch agent a minimal
+ * environment, so an agent that is authenticated by a variable in `.zshrc` looks signed out to
+ * the daemon. Pagr never copies these into the plist (a plist is world-readable and the bridge
+ * does not touch provider credentials) — it names them here so the state is at least explicable.
+ */
+function addAgentEnvCheck(ctx: CliContext, add: (c: Check) => void, plist: string): void {
+  const agentEnv = installedAgentEnv(plist);
+  if (agentEnv === null) {
+    add({ name: 'agent env', status: 'skip', detail: 'no launch agent installed yet' });
+    return;
+  }
+  const gaps = agentEnvGaps(ctx.env, agentEnv);
+  const secrets = gaps.filter((g) => g.secret);
+  add({
+    name: 'agent env',
+    status: gaps.length === 0 ? 'ok' : 'warn',
+    detail:
+      gaps.length === 0
+        ? 'the daemon sees the same agent settings as this shell'
+        : `${describeEnvGaps(gaps)} set here but not for the daemon${
+            secrets.length > 0
+              ? ' — an agent authenticated this way will look signed out to Pagr'
+              : ''
+          }`,
+    ...(gaps.length === 0 ? {} : { fix: ENV_GAP_FIX }),
+  });
 }
 
 /** Does this project's `.mcp.json` carry the Pagr channel server? Never throws. */

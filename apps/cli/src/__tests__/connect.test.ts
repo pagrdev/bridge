@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getPaths, PRIVATE_KEY_SECRET, readConfig } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -325,7 +325,163 @@ describe('connect · local state', () => {
     expect(secondKey).not.toBe(firstKey); // revoked key material is never reused
     expect(body.publicKey).not.toBe('');
     expect(readConfig(getPaths(h.home).configFile).deviceId).toBe(other);
-    expect(all()).toContain('removed the old device key');
+    // The new key is only announced once it is actually in the store.
+    expect(all()).toContain('replacement device key minted');
+  });
+
+  describe('--force that never completes leaves the working pairing alone', () => {
+    /** Pair once, then try to re-pair against an API that fails in some way. */
+    const pairThenForce = async (
+      o: { start?: Reply[]; status?: Reply[] },
+      args: string[] = [],
+    ): Promise<{ code: number; firstKey: string | null }> => {
+      expect(await connect()).toBe(EXIT.ok);
+      const firstKey = await h.store.get(PRIVATE_KEY_SECRET);
+      await api?.close();
+      h.stdout.length = 0;
+      h.stderr.length = 0;
+      api = await FakeApi.start(o);
+      const code = await h.run([
+        'connect',
+        '--api-url',
+        api.url,
+        '--wait',
+        '0',
+        '--force',
+        ...args,
+      ]);
+      return { code, firstKey };
+    };
+
+    /** The whole point of BR-8: the Mac is still the device it was, key and config agreeing. */
+    const expectUnchanged = async (firstKey: string | null) => {
+      expect(await h.store.get(PRIVATE_KEY_SECRET)).toBe(firstKey);
+      expect(readConfig(getPaths(h.home).configFile).deviceId).toBe(DEV_ID);
+      // and the CLI still treats this Mac as paired, with the identity it started with
+      h.stdout.length = 0;
+      expect(await h.run(['--json', 'status'])).toBe(EXIT.ok);
+      expect((lastJson(h) as { deviceId: string }).deviceId).toBe(DEV_ID);
+    };
+
+    it('when the API 500s before a code is issued', async () => {
+      const { code, firstKey } = await pairThenForce({
+        start: [{ status: 500, json: { error: 'boom' } }],
+      });
+      expect(code).toBe(EXIT.network);
+      await expectUnchanged(firstKey);
+    });
+
+    it('when the user declines the request in the dashboard', async () => {
+      const { code, firstKey } = await pairThenForce({
+        status: [{ json: { status: 'rejected' } }],
+      });
+      expect(code).toBe(EXIT.pairing);
+      expect(err()).toContain('declined');
+      await expectUnchanged(firstKey);
+    });
+
+    it('when nobody ever approves and the wait times out', async () => {
+      const { code, firstKey } = await pairThenForce({ status: [statusPending()] }, [
+        '--timeout',
+        '0.05',
+      ]);
+      expect(code).toBe(EXIT.pairing);
+      expect(err()).toContain('nobody approved');
+      await expectUnchanged(firstKey);
+    });
+
+    it('when the approval is interrupted with Ctrl-C', async () => {
+      expect(await connect()).toBe(EXIT.ok);
+      const firstKey = await h.store.get(PRIVATE_KEY_SECRET);
+      await api?.close();
+      api = await FakeApi.start({ status: [statusPending()] });
+      h.overrides.sleep = async (ms) => {
+        h.nowMs += Math.max(ms, h.clockStepMs);
+        h.interrupt();
+      };
+      expect(await h.run(['connect', '--api-url', api.url, '--wait', '0', '--force'])).toBe(
+        EXIT.interrupted,
+      );
+      await expectUnchanged(firstKey);
+    });
+
+    it('when the Keychain refuses to store the replacement key after approval', async () => {
+      expect(await connect()).toBe(EXIT.ok);
+      const firstKey = await h.store.get(PRIVATE_KEY_SECRET);
+      await api?.close();
+      h.stdout.length = 0;
+      h.stderr.length = 0;
+      // Reads keep working (so the old key is still there); only the write fails.
+      const store = h.store;
+      h.store = {
+        kind: store.kind,
+        get: (k) => store.get(k),
+        set: () =>
+          Promise.reject(new Error('keychain write failed: User interaction is not allowed')),
+        delete: (k) => store.delete(k),
+      };
+      api = await FakeApi.start({
+        status: [statusCompleted({ deviceId: `dev_${'c'.repeat(32)}` })],
+      });
+      expect(await h.run(['connect', '--api-url', api.url, '--wait', '0', '--force'])).toBe(
+        EXIT.secretStore,
+      );
+      expect(err()).toContain('still paired as');
+      h.store = store;
+      await expectUnchanged(firstKey);
+    });
+
+    it('when config.json cannot be written after approval, the old key is put back', async () => {
+      expect(await connect()).toBe(EXIT.ok);
+      const firstKey = await h.store.get(PRIVATE_KEY_SECRET);
+      const before = readFileSync(getPaths(h.home).configFile, 'utf8');
+      await api?.close();
+      h.stdout.length = 0;
+      h.stderr.length = 0;
+      api = await FakeApi.start({
+        status: [statusPending(), statusCompleted({ deviceId: `dev_${'c'.repeat(32)}` })],
+      });
+      // Take away write access AFTER the writability probe, mid-poll — the narrow window in
+      // which `connect` has a new pairing and cannot record it.
+      h.overrides.sleep = async (ms) => {
+        h.nowMs += Math.max(ms, h.clockStepMs);
+        chmodSync(h.home, 0o500);
+      };
+      try {
+        expect(await h.run(['connect', '--api-url', api.url, '--wait', '0', '--force'])).toBe(
+          EXIT.state,
+        );
+      } finally {
+        chmodSync(h.home, 0o700);
+      }
+      expect(err()).toContain('could not be written');
+      expect(err()).toContain('previous device key was put back');
+      expect(await h.store.get(PRIVATE_KEY_SECRET)).toBe(firstKey);
+      expect(readFileSync(getPaths(h.home).configFile, 'utf8')).toBe(before);
+    });
+
+    it('a second --force after a failed one is clean', async () => {
+      const { code, firstKey } = await pairThenForce({
+        start: [{ status: 500, json: { error: 'boom' } }],
+      });
+      expect(code).toBe(EXIT.network);
+      await api?.close();
+      h.stdout.length = 0;
+      h.stderr.length = 0;
+      const other = `dev_${'c'.repeat(32)}`;
+      api = await FakeApi.start({ status: [statusCompleted({ deviceId: other })] });
+      expect(await h.run(['connect', '--api-url', api.url, '--wait', '0', '--force'])).toBe(
+        EXIT.ok,
+      );
+      const body = api.requests[0]?.body as Record<string, unknown>;
+      // still replacing the ORIGINAL device: the failed attempt registered nothing
+      expect(body.replacesDeviceId).toBe(DEV_ID);
+      const finalKey = await h.store.get(PRIVATE_KEY_SECRET);
+      expect(finalKey).not.toBe(firstKey);
+      expect(readConfig(getPaths(h.home).configFile).deviceId).toBe(other);
+      // exactly one identity is left behind, and it signs for the device in config.json
+      expect(finalKey).toMatch(/PRIVATE KEY/);
+    });
   });
 
   it('warns loudly when the approval lands on a different Pagr account', async () => {

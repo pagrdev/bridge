@@ -19,6 +19,11 @@
 import { appendFileSync } from 'node:fs';
 import readline from 'node:readline';
 
+// FAKE_CODEX_TRACE=<file> records every invocation (one line of argv per process), so a test can
+// prove how many times the adapter forked `codex` and whether it started an app-server at all.
+if (process.env.FAKE_CODEX_TRACE)
+  appendFileSync(process.env.FAKE_CODEX_TRACE, `${process.argv.slice(2).join(' ')}\n`);
+
 if (process.argv.includes('--version')) {
   process.stdout.write('codex-cli 0.149.1\n');
   process.exit(0);

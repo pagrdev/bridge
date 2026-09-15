@@ -60,6 +60,8 @@ describe('help is available for every command', () => {
     ['daemon'],
     ['daemon', 'run'],
     ['daemon', 'install'],
+    ['daemon', 'start'],
+    ['daemon', 'stop'],
     ['daemon', 'uninstall'],
     ['daemon', 'status'],
     ['daemon', 'logs'],
@@ -184,10 +186,87 @@ describe('daemon', () => {
     expect(await h.run(['daemon', 'logs', '--follow', '--json'])).toBe(EXIT.usage);
   });
 
-  it('stop is an alias for uninstall', async () => {
+  it('stop stops the daemon and LEAVES the launch agent installed', async () => {
     await h.run(['daemon', 'install']);
+    const plist = join(h.launchAgentsDir, 'dev.pagr.bridge.plist');
+    h.execCalls.length = 0;
+    h.stdout.length = 0;
     expect(await h.run(['daemon', 'stop'])).toBe(EXIT.ok);
+    // `stop` used to be an alias for `uninstall`: "stopping" the daemon deleted the launch agent
+    // and nothing ever started again at login.
+    expect(existsSync(plist)).toBe(true);
+    const uid = process.getuid?.() ?? 501;
+    expect(h.execCalls).toEqual([['/bin/launchctl', 'bootout', `gui/${uid}/dev.pagr.bridge`]]);
+    expect(out()).toContain('still installed');
+  });
+
+  it('stop then start brings it back without rewriting the plist', async () => {
+    await h.run(['daemon', 'install']);
+    const plist = join(h.launchAgentsDir, 'dev.pagr.bridge.plist');
+    const before = readFileSync(plist, 'utf8');
+    expect(await h.run(['daemon', 'stop'])).toBe(EXIT.ok);
+    h.execCalls.length = 0;
+    expect(await h.run(['daemon', 'start'])).toBe(EXIT.ok);
+    expect(h.execCalls[0]).toEqual([
+      '/bin/launchctl',
+      'bootstrap',
+      `gui/${process.getuid?.() ?? 501}`,
+      plist,
+    ]);
+    expect(readFileSync(plist, 'utf8')).toBe(before);
+  });
+
+  it('start without an install says what to run instead', async () => {
+    expect(await h.run(['daemon', 'start'])).toBe(EXIT.precondition);
+    expect(err()).toContain('pagr daemon install');
+  });
+
+  it('start and stop say what to do when there is no launchd at all', async () => {
+    await h.run(['daemon', 'install']);
+    h.launchctl = false;
+    expect(await h.run(['daemon', 'stop'])).toBe(EXIT.precondition);
+    expect(err()).toContain('pagr daemon run');
+    expect(await h.run(['daemon', 'start'])).toBe(EXIT.precondition);
+    expect(err()).toContain('pagr daemon run');
+  });
+
+  it('stop on a machine with no launch agent is not an error', async () => {
+    expect(await h.run(['daemon', 'stop'])).toBe(EXIT.ok);
+    expect(out()).toContain('no launch agent installed');
+  });
+
+  it('uninstall says what it is about to remove, and removes it', async () => {
+    await h.run(['daemon', 'install']);
+    h.stdout.length = 0;
+    expect(await h.run(['daemon', 'uninstall'])).toBe(EXIT.ok);
     expect(existsSync(join(h.launchAgentsDir, 'dev.pagr.bridge.plist'))).toBe(false);
+    const text = out();
+    expect(text).toContain('removing the launch agent');
+    expect(text).toContain('will NOT start at login');
+    expect(text).toContain('pagr daemon install');
+  });
+
+  it('the plist runs a launcher that resolves node at launch time, not a baked node path', async () => {
+    await h.run(['daemon', 'install']);
+    const plist = readFileSync(join(h.launchAgentsDir, 'dev.pagr.bridge.plist'), 'utf8');
+    const launcher = join(h.home, 'bin', 'pagr-node');
+    expect(plist).toContain(`<string>${launcher}</string>`);
+    expect(plist).not.toContain(process.execPath);
+    expect(existsSync(launcher)).toBe(true);
+    expect(readFileSync(launcher, 'utf8')).toContain('command -v node');
+  });
+
+  it('daemon install warns when the agents are authenticated only in this shell', async () => {
+    h.overrides.env = { ...h.overrides.env, ANTHROPIC_API_KEY: 'sk-ant-secret' };
+    expect(await h.run(['daemon', 'install'])).toBe(EXIT.ok);
+    const text = `${out()}\n${err()}`;
+    expect(text).toContain('ANTHROPIC_API_KEY');
+    expect(text).toContain('set in this shell but not for the daemon');
+    // never the value
+    expect(text).not.toContain('sk-ant-secret');
+    expect(readFileSync(join(h.launchAgentsDir, 'dev.pagr.bridge.plist'), 'utf8')).not.toContain(
+      'sk-ant-secret',
+    );
   });
 });
 

@@ -1,6 +1,6 @@
 # Troubleshooting the Pagr bridge
 
-Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 0700/0600 permissions), `config.json` and `projects.json` integrity, the secret store (with a real read/write round-trip), the device key, pairing, API reachability, clock skew, the daemon socket, the gateway handshake, gateway reachability, the device approval floor, the `codex`/`claude` CLIs and the launch agent — printing a fix for each failure.
+Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 0700/0600 permissions), `config.json` and `projects.json` integrity, the secret store (with a real read/write round-trip), the device key, pairing, API reachability, clock skew, the daemon socket, the gateway handshake, gateway reachability, the device approval floor, the `codex`/`claude` CLIs, the launch agent (including a plist whose Node was deleted by an upgrade) and the agent environment the daemon actually gets — printing a fix for each failure.
 
 - `pagr doctor` exits **0** on a Mac that simply has not been set up yet. Not paired, no daemon and no launch agent are `warn`/`skip`, each carrying the next command to run; the network checks are skipped entirely until something has actually chosen an API URL. It exits **5** only for a real fault — a Keychain that will not open, a state file that will not parse, a configured API that nothing answers, a daemon that was installed and does not reply.
 - `pagr doctor --json` produces a support-ready report. Every error message in the CLI points here. It carries `"paired"` next to `"ok"`, so a script can tell "healthy but unpaired" from "healthy and paired".
@@ -15,6 +15,9 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 070
 | `pairing failed: pairing code expired` | more than a few minutes passed before approving in the browser | run `pagr connect` again for a fresh code |
 | macOS asks for your login password / "pagr wants to use the keychain" | the device key lives in the login Keychain | click **Always Allow**; see below |
 | Codex sessions fail immediately | Codex CLI not logged in | `codex login` |
+| an agent works in your terminal but Pagr reports it signed out | it is authenticated by a variable in your shell profile, which launchd does not pass on | `pagr doctor` → **agent env**; see *"It works in my terminal but not from my phone"* |
+| the daemon stops and never comes back after a reboot | `pagr daemon uninstall` (or an old `pagr daemon stop`) removed the launch agent | `pagr daemon install` |
+| launchd retries the daemon every few seconds, re-prompting for the Keychain | an older bridge restarted on any failure | update; a non-zero exit is no longer restarted — read `pagr daemon logs -n 50`, fix, `pagr daemon start` |
 | Claude approvals never reach your phone | session not started by Pagr, or the daemon lost the gateway | see below |
 | daemon logs `auth failed` or `device revoked` | this device was revoked from the dashboard | `pagr logout && pagr connect` |
 | `connect` prints an HTML excerpt / "returned an HTML page, not JSON" | a captive portal or proxy is intercepting HTTPS, or `--api-url` points at the website | join the network properly, or fix `--api-url` / `PAGR_API_URL` |
@@ -38,7 +41,7 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 070
 
 `connect` runs in six visible steps: check this Mac → prepare the device key → contact Pagr → approve in the browser → save the pairing → verify the gateway handshake. It only reports success once the daemon has actually connected to the gateway, and it is safe to run twice: on an already-paired Mac it changes nothing and exits 0.
 
-**Nothing is written until the approval completes.** Ctrl-C at any point before that leaves no config, no plist and no half-state (exit 130).
+**Nothing is written until the approval completes.** Ctrl-C at any point before that leaves no config, no plist and no half-state (exit 130) — and with `--force`, the device key you are already using is left exactly as it is (see below).
 
 | What you see | What happened | What to do |
 | --- | --- | --- |
@@ -60,7 +63,7 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 070
 
 Transient trouble does **not** abort the flow: a connection reset or a 5xx mid-poll is retried (up to five consecutive failures), and `pair/start` retries 5xx twice before giving up. `PAGR_HTTP_TIMEOUT_MS` caps each individual HTTP request if your network hangs rather than fails.
 
-`pagr connect --force` re-pairs cleanly: it **deletes the old device key from the Keychain and mints a new one**, and tells the server which device this pairing replaces. Revoked key material is never reused. Revoke the old device in the dashboard as well.
+`pagr connect --force` re-pairs **atomically**: the replacement key is minted in memory, the pairing is completed with it, and only then is the stored identity swapped — key first, `config.json` immediately after. The old key stays in the Keychain, untouched and working, for the whole of that. If anything fails on the way (a 5xx, a declined or expired approval, a timeout, Ctrl-C, a locked Keychain, a full disk) nothing is changed and this Mac stays paired as the device it already was; if the config write is the thing that fails, the previous key is put back. Revoked key material is never reused, and a device that got as far as being approved in the cloud is named in the error so you can revoke it in the dashboard. Running `--force` again after a failure is always safe.
 
 ## Keychain prompt
 
@@ -84,6 +87,8 @@ pagr status          # codex line should show installed
 ```
 
 If `codex` is installed but `pagr doctor` says *not found on PATH*, it lives somewhere the launch agent cannot see (e.g. a shell-only `PATH` entry). Symlink it into `/usr/local/bin` or re-run `pagr daemon install` from a shell where `which codex` works.
+
+The `codex app-server` process is started **only when a session needs it**, is shared by every Codex session, and is stopped again after about five minutes with nothing to do (the next instruction starts a fresh one and resumes the thread). Reporting Codex's status to the cloud — which happens on every gateway connect — starts nothing: the version is cached and the login state is read from `$CODEX_HOME/auth.json`, or from the app-server itself when one is already running for a session.
 
 ## Claude approvals not reaching your phone
 
@@ -143,10 +148,51 @@ dashboard — that is the point of the floor.
 
 ## launchd problems
 
+`pagr daemon` has four verbs and they mean different things:
+
+| Command | What it does | Does it start at login afterwards? |
+| --- | --- | --- |
+| `pagr daemon install` | writes the launch agent and starts it | yes |
+| `pagr daemon start` | starts the installed agent now (kickstarts it if it is already loaded) | yes |
+| `pagr daemon stop` | stops the running daemon, **keeps** the launch agent installed | yes |
+| `pagr daemon uninstall` | stops it **and removes** the launch agent | **no** — `pagr daemon install` puts it back |
+
+`stop` used to be an alias for `uninstall`, so "stopping" the daemon quietly deleted the launch agent and nothing came back after a reboot. It no longer does. Neither command touches your pairing, device key or projects.
+
 - **`/bin/launchctl` missing** (not macOS, or a container) — `connect` says so, keeps the pairing, and tells you to run `pagr daemon run` in the foreground.
 - **`launchctl bootstrap` refused** — the error carries launchctl's own words plus the path of `launchd.err.log`. The pairing is already saved; fix the cause and re-run `pagr daemon install`, not `pagr connect`.
 - **Already loaded** — the job is kickstarted with the freshly written plist instead of failing.
 - **A stale plist** from an older install (a binary that no longer exists, or a different `PAGR_HOME`) is flagged by `pagr doctor`; `pagr daemon install` rewrites it.
+
+### Node upgrades and the launch agent
+
+The plist does **not** name a Node binary. It runs `~/.pagr/bin/pagr-node`, a generated `/bin/sh` shim that resolves Node at every launch: `$PAGR_NODE`, then the `PATH` the launch agent carries, then the usual stable locations (`/opt/homebrew/bin/node`, `/usr/local/bin/node`, `/usr/bin/node`, mise/asdf/volta/nvm shims). A version-qualified path baked into the plist — which is exactly what a Homebrew or nvm Node is — disappears on the next `brew upgrade node` and launchd then retries a binary that no longer exists, forever.
+
+- If Node lives somewhere unusual, set `PAGR_NODE=/path/to/node` in the launch agent (`launchctl setenv PAGR_NODE /path/to/node`, then `pagr daemon start`).
+- An old plist that still names a deleted Node is reported by `pagr doctor` as *stale plist: it runs … which no longer exists (a Node upgrade …)*. `pagr daemon install` rewrites it.
+- With no Node at all the shim exits **78** with one line in `~/.pagr/logs/launchd.err.log`, and launchd does not retry (see below) instead of looping.
+
+### Restart policy
+
+`KeepAlive` is `{ SuccessfulExit: true, Crashed: true }` with `ThrottleInterval` 30, which means:
+
+- exit **0** → restarted (a clean, self-requested restart), no sooner than 30s later;
+- died on a crash signal → restarted;
+- **any non-zero exit → not restarted**. That is reserved for failures a restart cannot fix — a locked or denied Keychain, a missing or unusable device key, an unparsable config, no Node. Those used to be retried every ~10 seconds, and each attempt could raise its own Keychain dialog.
+
+So if the daemon is not running and `pagr daemon status` says the agent is installed but not loaded, read `pagr daemon logs -n 50` (and `~/.pagr/logs/launchd.err.log`) — launchd has deliberately stopped retrying, and `pagr daemon start` is the way back once the cause is fixed.
+
+## "It works in my terminal but not from my phone"
+
+launchd gives a launch agent a **minimal environment**: `PAGR_HOME` and the `PATH` captured when you ran `pagr connect` / `pagr daemon install`, and nothing else. Nothing from `.zshrc`, `.zprofile` or `.bash_profile` reaches it. So an agent that is authenticated by an environment variable in your shell — `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, and the rest — works when you run it yourself and looks signed out to the daemon.
+
+**Pagr does not copy those variables into the launch agent.** The plist is a plain file in `~/Library/LaunchAgents` that every process running as you can read, and the bridge does not touch your provider credentials — that is the point of it. Instead `pagr doctor` has an **agent env** check that names (never prints) every such variable that is set in your shell and missing from the launch agent, and `pagr connect` / `pagr daemon install` say the same thing at install time.
+
+The fixes, in order of preference:
+
+1. **Sign the agent in on disk** so no environment variable is needed: `claude setup-token` (or just `claude` once) and `codex login`. Both store credentials in the user's own config, which the daemon can read. This is the recommended answer.
+2. **Put non-secret settings into launchd's session environment**: `launchctl setenv CODEX_HOME /path`, `launchctl setenv ANTHROPIC_BASE_URL https://…`, then `pagr daemon start`. These survive until logout; add them to a login item to make them permanent.
+3. If you genuinely must hand the daemon a key, edit `~/Library/LaunchAgents/dev.pagr.bridge.plist` yourself, add it under `EnvironmentVariables`, `chmod 600` the file and re-run `pagr daemon start`. Pagr will overwrite that file on the next `pagr daemon install`, and it will never write a secret there for you.
 
 ## Many projects, many sessions
 
