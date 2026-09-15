@@ -7,9 +7,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeAdapter } from './adapters/fake.js';
 import type { CodingAgentAdapter } from './adapters/types.js';
 import { sha256Hex } from './approvals.js';
-import { Dispatcher, MAX_HELLO_SESSIONS } from './dispatcher.js';
+import { ADOPTED_SESSION_NAME, Dispatcher, MAX_HELLO_SESSIONS } from './dispatcher.js';
 import { ProjectRegistry } from './projects.js';
-import { SessionStore } from './sessions.js';
+import { SessionStore, UNREGISTERED_PROJECT } from './sessions.js';
 import { ids, makeBody } from './testFixtures.js';
 import { useTempHome } from './testUtil.js';
 import { MAX_FRAME_BYTES } from './transport.js';
@@ -645,14 +645,90 @@ describe('Dispatcher', () => {
     ).toBe('stopped');
   });
 
-  it('settings.sync_public_policy stores locally and drives approval timeout', async () => {
-    await d.handle(
-      body('settings.sync_public_policy', {
-        smartApprovalsTierA: true,
-        approvalTimeoutSeconds: 45,
+  /**
+   * An adopted session belongs to the terminal it is running in. Pagr can say it exists and carry
+   * an answer back to a prompt it raised; it cannot take the turn. The cloud refuses these too,
+   * but a limit that only one side enforces is a limit that goes away the day the other side has
+   * a bug — and the failure without this is worse than a refusal: `sendInstruction` would reach
+   * an adapter that has never heard of the session and report a provider error.
+   */
+  it('refuses to steer or stop a session it did not start, and says why', async () => {
+    const adoptedId = ids.ses();
+    sessions.upsert({
+      sessionId: adoptedId,
+      provider: 'claude',
+      projectId,
+      providerSessionId: 'their-claude-session',
+      status: 'idle',
+      adopted: true,
+      cwd: join(t.home, 'home', 'repo'),
+      startedAt: '2026-09-15T00:00:00.000Z',
+      updatedAt: '2026-09-15T00:00:00.000Z',
+    });
+    const steer = await d.handle(
+      body('agent.send_instruction', {
+        sessionId: adoptedId,
+        instruction: 'do the thing',
+        mode: 'auto',
+        attachments: [],
       }),
     );
-    expect(d.policy).toEqual({ smartApprovalsTierA: true, approvalTimeoutSeconds: 45 });
+    expect(steer.payload).toMatchObject({
+      status: 'failed',
+      errorCode: 'capability_unsupported',
+    });
+    expect((steer.payload as { message: string }).message).toMatch(/did not start|your own/i);
+    const stop = await d.handle(body('agent.stop_session', { sessionId: adoptedId }));
+    expect(stop.payload).toMatchObject({
+      status: 'failed',
+      errorCode: 'capability_unsupported',
+    });
+    // Refusing must not rewrite the record: the session is still running in their terminal.
+    expect(sessions.get(adoptedId)?.status).toBe('idle');
+  });
+
+  it('still answers an approval raised by a session it did not start', async () => {
+    // The refusal above is about taking the turn. Relaying an answer is the entire feature and
+    // must keep working for exactly these sessions.
+    const adoptedId = ids.ses();
+    sessions.upsert({
+      sessionId: adoptedId,
+      provider: 'codex',
+      projectId,
+      providerSessionId: 'theirs',
+      status: 'waiting_for_approval',
+      adopted: true,
+      startedAt: '2026-09-15T00:00:00.000Z',
+      updatedAt: '2026-09-15T00:00:00.000Z',
+    });
+    let answered: string | null = null;
+    const rec = d.requestApproval({
+      sessionId: adoptedId,
+      projectId,
+      provider: 'codex',
+      providerRequestId: 'their-req',
+      actionType: 'file_change',
+      preview: 'Write a.ts',
+      onDecision: (decision) => {
+        answered = decision;
+      },
+    });
+    const ack = await d.handle(
+      body('agent.respond_to_approval', {
+        approvalId: rec.approvalId,
+        sessionId: adoptedId,
+        providerRequestId: 'their-req',
+        previewHash: rec.previewHash,
+        decision: 'allow',
+      }),
+    );
+    expect(ack.payload).toMatchObject({ status: 'completed' });
+    expect(answered).toBe('allow');
+  });
+
+  it('settings.sync_public_policy stores locally and drives approval timeout', async () => {
+    await d.handle(body('settings.sync_public_policy', { approvalTimeoutSeconds: 45 }));
+    expect(d.policy).toEqual({ approvalTimeoutSeconds: 45 });
     expect(d.approvalTimeoutMs).toBe(45_000);
     expect(existsSync(join(t.home, 'home', '.pagr', 'policy.json'))).toBe(true);
   });
@@ -833,12 +909,7 @@ describe('Dispatcher', () => {
           readOnly: false,
         }),
       );
-      await d.handle(
-        body('settings.sync_public_policy', {
-          smartApprovalsTierA: false,
-          approvalTimeoutSeconds: 30,
-        }),
-      );
+      await d.handle(body('settings.sync_public_policy', { approvalTimeoutSeconds: 30 }));
       const approvalId = ids.apr();
       codex.push({
         kind: 'approval_requested',
@@ -1035,6 +1106,48 @@ describe('device.hello is bounded (BR-3, BR-4)', () => {
     const hello = await dispatcher().probe();
     expect(hello.sessions[0]?.sessionId).toBe(liveId);
     expect(hello.sessions.length).toBe(MAX_HELLO_SESSIONS);
+  });
+
+  it('counts adopted sessions against the hello ceiling like any other', async () => {
+    // Adopted sessions come from the store rather than an adapter, so they are the easy thing to
+    // forget when bounding the frame. A person with a busy week of terminal sessions must not be
+    // the reason the hello stops fitting.
+    seed(400, (i) => new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString());
+    for (let i = 0; i < 400; i++)
+      sessions.upsert({
+        sessionId: `ses_${`c${i}`.padStart(32, '0')}`,
+        provider: 'claude',
+        projectId,
+        providerSessionId: `own-${i}`,
+        status: 'idle',
+        adopted: true,
+        startedAt: new Date(Date.UTC(2026, 1, 1, 0, 0, i)).toISOString(),
+        updatedAt: new Date(Date.UTC(2026, 1, 1, 0, 0, i)).toISOString(),
+      });
+    const hello = await dispatcher().probe();
+    expect(hello.sessions.length).toBe(MAX_HELLO_SESSIONS);
+    expect(Buffer.byteLength(JSON.stringify(hello), 'utf8')).toBeLessThan(MAX_FRAME_BYTES);
+    // …and they are labelled, because what the phone can do with one is not what it can do with
+    // a session Pagr started.
+    expect(hello.sessions.some((x) => x.displayName === ADOPTED_SESSION_NAME)).toBe(true);
+  });
+
+  it('never reports an adopted session whose directory is in no registered project', async () => {
+    sessions.upsert({
+      sessionId: `ses_${'d'.repeat(32)}`,
+      provider: 'claude',
+      projectId: UNREGISTERED_PROJECT,
+      providerSessionId: 'own-x',
+      status: 'idle',
+      adopted: true,
+      cwd: '/Users/jane/scratch',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const hello = await dispatcher().probe();
+    // A SessionSummary has to name a proj_ id, and there is no honest one to give.
+    expect(hello.sessions).toEqual([]);
+    expect(JSON.stringify(hello)).not.toContain('/Users/jane/scratch');
   });
 
   it('sheds sessions, then projects, rather than building a frame that cannot be sent', async () => {

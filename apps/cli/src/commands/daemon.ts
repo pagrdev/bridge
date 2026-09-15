@@ -16,6 +16,7 @@ import {
 } from '@pagr/bridge-core';
 import type { Provider } from '@pagr/protocol';
 import type { Command } from 'commander';
+import { installHookForUser, removeHookForUser } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, socketPath } from '../ipc.js';
@@ -105,6 +106,11 @@ export function runDaemonInstall(ctx: CliContext): string {
   const plan = launchAgentPlan(ctx);
   const plist = installAgent(ctx, paths.logsDir);
   const gaps = agentEnvGaps(ctx.env, plan.env);
+  // The hook is what makes prompts from the person's OWN `claude` sessions reachable. Installed
+  // here as well as in `connect` so that a Mac set up before this existed picks it up.
+  const hook = installHookForUser(ctx, (l) => {
+    if (!ctx.json) ctx.out(l);
+  });
   if (ctx.json) {
     printJson(ctx, {
       installed: true,
@@ -113,6 +119,8 @@ export function runDaemonInstall(ctx: CliContext): string {
       logsDir: paths.logsDir,
       launcher: plan.launcherPath,
       shellOnlyAgentEnv: gaps.map((g) => g.name),
+      claudeHook: hook.action,
+      ...(hook.report ? { claudeHookSettings: hook.report.settingsPath } : {}),
     });
     return plist;
   }
@@ -198,8 +206,18 @@ export function runDaemonUninstall(ctx: CliContext): boolean {
     exec: (f, a) => void ctx.exec(f, a),
     ...(ctx.launchAgentsDir ? { launchAgentsDir: ctx.launchAgentsDir } : {}),
   });
+  // Our entry in their Claude Code settings goes with the daemon that answered it. Leaving it
+  // behind would mean every prompt waiting 540 s for a socket that is not there.
+  const hook = removeHookForUser(ctx, (l) => {
+    if (!ctx.json) ctx.out(l);
+  });
   if (ctx.json) {
-    printJson(ctx, { removed, plist, label: LAUNCH_AGENT_LABEL });
+    printJson(ctx, {
+      removed,
+      plist,
+      label: LAUNCH_AGENT_LABEL,
+      claudeHookRemoved: hook.removed.length > 0,
+    });
     return removed;
   }
   ctx.out(removed ? ok('launch agent removed') : warn('launch agent was not installed'));

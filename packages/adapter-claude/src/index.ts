@@ -20,9 +20,35 @@ export {
   type ClaudeProcessOptions,
   DEFAULT_SETTING_SOURCES,
   READ_ONLY_DISALLOWED_TOOLS,
+  SEALED_MODE_ENV,
+  SEALED_SETTING_SOURCES,
+  sealedModeEnabled,
 } from './claude-process.js';
 export { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
-export { bundledHookPath, hookSettings, installHooks } from './hooks/install.js';
+export {
+  bundledHookPath,
+  claudeHookState,
+  type HookInstallReport,
+  type HookRemovalReport,
+  type HookState,
+  hookSettings,
+  installClaudeHook,
+  installedHookPath,
+  installHooks,
+  SETTINGS_BACKUP_SUFFIX,
+  uninstallClaudeHook,
+} from './hooks/install.js';
+export {
+  ClaudeSettingsUnreadableError,
+  claudeUserSettingsPath,
+  HOOK_TIMEOUT_SECONDS,
+  isPagrHookCommand,
+  PERMISSION_REQUEST_EVENT,
+  pagrHookCommand,
+  pagrHookGroup,
+  planHookInstall,
+  planHookRemoval,
+} from './hooks/settings.js';
 export { MockClaudeAdapter, type MockClaudeOptions } from './mock.js';
 export {
   actionTypeForTool,

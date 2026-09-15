@@ -23,6 +23,7 @@ import {
   usesShortSocketFallback,
 } from '@pagr/bridge-core';
 import type { Command } from 'commander';
+import { hookState } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, ipc, socketPath } from '../ipc.js';
@@ -365,6 +366,40 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
       add({ name: bin, status: 'warn', detail: 'not found on PATH', fix: hint });
     }
   }
+
+  // ---- Claude Code permission hook ----------------------------------------
+  // The headline capability: prompts raised by the person's OWN `claude` sessions reach their
+  // phone. Installed at user scope, so it covers every session they start — terminal, IDE
+  // extension, desktop app — and it fires only when a decision is actually needed.
+  const hook = hookState(ctx);
+  add({
+    name: 'claude hook',
+    status: hook.problem
+      ? 'fail'
+      : hook.entryInstalled
+        ? hook.scriptInstalled
+          ? 'ok'
+          : 'fail'
+        : 'warn',
+    detail: hook.problem
+      ? hook.problem
+      : hook.entryInstalled
+        ? hook.scriptInstalled
+          ? `${hook.settingsPath} runs ${hook.hookPath} when Claude Code needs a decision`
+          : `${hook.settingsPath} points at ${hook.hookPath}, which is missing`
+        : hook.conflict.length > 0
+          ? `not installed; you have a PermissionRequest hook of your own (${hook.conflict.join(', ')}) in ${hook.settingsPath}`
+          : `not installed in ${hook.settingsPath} — prompts from your own \`claude\` stay in the terminal`,
+    ...(hook.problem
+      ? { fix: `fix the JSON in ${hook.settingsPath}, then run \`pagr claude hook-install\`` }
+      : hook.entryInstalled && hook.scriptInstalled
+        ? {}
+        : hook.conflict.length > 0
+          ? {
+              fix: 'two PermissionRequest hooks race over who answers; run `pagr claude hook-install --force` to add Pagr’s anyway',
+            }
+          : { fix: 'run `pagr daemon install` (or `pagr claude hook-install`)' }),
+  });
 
   // ---- Claude Code live steering ------------------------------------------
   // Two separate truths, reported separately, because "configured" and "actually able to steer"

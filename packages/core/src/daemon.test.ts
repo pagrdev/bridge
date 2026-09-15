@@ -24,7 +24,7 @@ import { IpcClient } from './ipc.js';
 import { MemorySecretStore, SecretStoreError } from './keychain.js';
 import { DAEMON_EXIT } from './launchAgent.js';
 import { PagrHomeError } from './paths.js';
-import { DEFAULT_SESSION_RETENTION_MS } from './sessions.js';
+import { DEFAULT_SESSION_RETENTION_MS, UNREGISTERED_PROJECT } from './sessions.js';
 import { FakeServerSigner, ids, makeBody } from './testFixtures.js';
 import { useTempHome } from './testUtil.js';
 
@@ -272,6 +272,115 @@ describe('daemon', () => {
     expect(acks()[0]?.payload).toMatchObject({ status: 'completed' });
     await c.call('projects.remove', { projectId: proj.projectId });
     expect(await c.call('projects.list')).toEqual([]);
+  });
+
+  /**
+   * Adoption. A permission hook fires inside somebody's own `claude`, in a directory the bridge
+   * never started anything in. That session is real whether or not its directory happens to be a
+   * registered project, and the point of the hook is that Pagr works for sessions it did not
+   * start — so the daemon records it either way.
+   */
+  it('adopts a provider session it did not start, recording provider, cwd and first-seen', async () => {
+    await until(() => daemon.transport?.state === 'connected');
+    const c = new IpcClient(daemon.paths.socketPath);
+    const repo = join(t.home, 'adopt-repo');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    const proj = await c.call<{ projectId: string }>('projects.add', { path: repo });
+    const claudeSessionId = '11111111-2222-3333-4444-555555555555';
+    const pending = c.call<{ approvalId: string }>(
+      'approval.request',
+      {
+        sessionId: null,
+        claudeSessionId,
+        cwd: repo,
+        provider: 'claude',
+        providerRequestId: 'adopt-1',
+        actionType: 'tool_use',
+        preview: 'Read x',
+      },
+      5000,
+    );
+    await until(() =>
+      received.some((f) => f.kind === 'event' && f.event.type === 'approval.requested'),
+    );
+    const rec = daemon.sessions.list().find((r) => r.providerSessionId === claudeSessionId);
+    expect(rec).toMatchObject({
+      provider: 'claude',
+      projectId: proj.projectId,
+      providerSessionId: claudeSessionId,
+      adopted: true,
+      cwd: repo,
+    });
+    expect(Date.parse(rec?.adoptedAt ?? '')).not.toBeNaN();
+    // Adopted sessions are counted separately in the status the user sees, because what Pagr can
+    // do with one is not what it can do with a session it started.
+    expect(daemon.status().adoptedSessions).toBe(1);
+    void pending.catch(() => {});
+  });
+
+  it('adopts a session whose directory is in no registered project, and still answers no decision', async () => {
+    await until(() => daemon.transport?.state === 'connected');
+    const c = new IpcClient(daemon.paths.socketPath);
+    const elsewhere = join(t.home, 'not-a-project');
+    mkdirSync(elsewhere, { recursive: true });
+    const claudeSessionId = '99999999-8888-7777-6666-555555555555';
+    // The hook treats an error as "no decision" and prints nothing, so the terminal prompt this
+    // person is looking at behaves exactly as it would with no Pagr installed.
+    await expect(
+      c.call('approval.request', {
+        sessionId: null,
+        claudeSessionId,
+        cwd: elsewhere,
+        provider: 'claude',
+        providerRequestId: 'adopt-2',
+        actionType: 'tool_use',
+        preview: 'Read x',
+      }),
+    ).rejects.toMatchObject({ code: 'unknown_project' });
+    // …but the session is real, so it is recorded and reportable locally.
+    const rec = daemon.sessions.list().find((r) => r.providerSessionId === claudeSessionId);
+    expect(rec).toMatchObject({
+      provider: 'claude',
+      projectId: UNREGISTERED_PROJECT,
+      adopted: true,
+      cwd: elsewhere,
+      status: 'idle',
+    });
+    expect(await c.call<unknown[]>('sessions.list')).toHaveLength(1);
+    expect(daemon.status().adoptedSessions).toBe(1);
+    // Nothing about it went to the cloud: a SessionSummary has to name a project.
+    expect(
+      received.filter((f) => f.kind === 'event' && f.event.type === 'session.updated'),
+    ).toHaveLength(0);
+  });
+
+  it('tells the cloud about an adopted session in a registered project, in device.hello', async () => {
+    await until(() => daemon.transport?.state === 'connected');
+    const c = new IpcClient(daemon.paths.socketPath);
+    const repo = join(t.home, 'hello-repo');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    const proj = await c.call<{ projectId: string }>('projects.add', { path: repo });
+    const pending = c.call<unknown>(
+      'approval.request',
+      {
+        sessionId: null,
+        claudeSessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        cwd: repo,
+        provider: 'claude',
+        providerRequestId: 'hello-1',
+        actionType: 'tool_use',
+        preview: 'Read x',
+      },
+      5000,
+    );
+    await until(() =>
+      received.some((f) => f.kind === 'event' && f.event.type === 'approval.requested'),
+    );
+    const hello = await daemon.dispatcher.probe();
+    const adopted = hello.sessions.find((x) => x.projectId === proj.projectId);
+    expect(adopted).toBeTruthy();
+    expect(adopted?.provider).toBe('claude');
+    void pending.catch(() => {});
   });
 
   it('IPC approval.request with sessionId=null + cwd maps to a project and a synthetic session (finding 12)', async () => {

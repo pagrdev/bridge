@@ -1,4 +1,10 @@
-import { isLiveStatus, type ProjectRecord, type SessionRecord } from '@pagr/bridge-core';
+import {
+  isAdopted,
+  isLiveStatus,
+  type ProjectRecord,
+  type SessionRecord,
+  UNREGISTERED_PROJECT,
+} from '@pagr/bridge-core';
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { daemonDownError } from '../errors.js';
@@ -60,15 +66,34 @@ export async function runSessions(ctx: CliContext, opts: SessionsOptions = {}): 
         s.sessionId,
         s.provider,
         isLiveStatus(s.status) ? bold(s.status) : s.status,
-        nameOf.get(s.projectId) ?? s.projectId,
+        // A session with no registered project is still real; naming its directory makes the fix
+        // obvious instead of leaving an empty cell.
+        s.projectId === UNREGISTERED_PROJECT
+          ? dim(s.cwd ?? 'no registered project')
+          : (nameOf.get(s.projectId) ?? s.projectId),
+        isAdopted(s) ? 'yours' : dim('pagr'),
         dim(s.updatedAt),
       ]),
-      ['SESSION', 'AGENT', 'STATUS', 'PROJECT', 'UPDATED'],
+      ['SESSION', 'AGENT', 'STATUS', 'PROJECT', 'STARTED BY', 'UPDATED'],
     ),
   );
   const live = list.filter((s) => isLiveStatus(s.status)).length;
+  const adopted = list.filter(isAdopted);
+  const unregistered = adopted.filter((s) => s.projectId === UNREGISTERED_PROJECT);
   ctx.out('');
   ctx.out(dim(`${list.length} session(s), ${live} live`));
+  if (adopted.length > 0)
+    ctx.out(
+      dim(
+        `${adopted.length} started by you, not by Pagr: it can relay approvals only — no instructions, no stop, no resume`,
+      ),
+    );
+  for (const s of unregistered)
+    ctx.out(
+      dim(
+        `  ${s.cwd ?? 'that directory'} is in no registered project, so its prompts stay in the terminal — \`pagr projects add ${s.cwd ?? '<dir>'}\``,
+      ),
+    );
 }
 
 export function registerSessions(program: Command, getCtx: () => CliContext): void {

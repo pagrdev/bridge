@@ -17,7 +17,8 @@ there is no command for it (`packages/protocol/src/schemas.ts`). It cannot name 
 resolves only to a folder something running on this Mac put in the registry, and an id the
 registry does not know is refused without the filesystem being touched. It cannot relay its own `allow` for anything this Mac classified as high risk
 (below). It cannot lift that classification: no command changes it, and there is no command that
-can. It never sees your device private key, and the bridge never reads your provider credentials.
+can. It cannot make the bridge answer a prompt for you — there is no such code path at all. It
+never sees your device private key, and the bridge never reads your provider credentials.
 
 **The device-side floor** (`packages/core/src/deviceFloor.ts`) is what makes the second paragraph
 true. Every permission prompt is classified *on this Mac*, from the command string and the paths
@@ -38,7 +39,7 @@ class blocked it and how to opt in:
 **Lifting it is a local act, and only a local act.** Either edit `~/.pagr/device-policy.json`:
 
 ```json
-{ "version": 1, "allow": ["network"], "allowedHosts": ["api.github.com"], "tierAAutoApprove": true }
+{ "version": 1, "allow": ["network"], "allowedHosts": ["api.github.com"] }
 ```
 
 …or start the daemon with `PAGR_DEVICE_FLOOR=network,destructive` (or `PAGR_DEVICE_FLOOR=all`).
@@ -48,12 +49,26 @@ unrecognised class name is ignored rather than guessed at — a typo can never w
 corrupt or wrong-shaped policy file reads as the strict default, never as "allow". `pagr doctor`
 prints the floor and reports `warn` when any class has been lifted, so a lift is never invisible.
 
-**`smartApprovalsTierA`.** The dashboard setting is synced by `settings.sync_public_policy` and is
-now actually read. When it is on, the bridge answers `allow` itself for an action it classified as
-carrying **no** risk class at all *and* which is not a shell command — a shell line always waits for
-a person. Tier A therefore grants the cloud nothing it could not already have had by answering the
-prompt itself. Set `"tierAAutoApprove": false` in `device-policy.json` to pin it off locally
-regardless of what the dashboard says.
+**The floor is not a second opinion about risk.** This distinction matters, because the two are
+easy to confuse and only one of them is defensible:
+
+| | Who decides | Can the cloud change it? |
+| --- | --- | --- |
+| *Which actions need a decision at all* | Claude Code / Codex, from **your** settings | n/a — Pagr is not in that decision |
+| *Who answers a prompt that was raised* | You, on your phone or in your terminal | n/a — Pagr relays, it never answers |
+| *Whether a cloud `allow` is carried out* | This Mac's device floor | **no**, and there is no command that can |
+
+The bridge has **no path by which it answers a permission prompt on your behalf**. An earlier
+version did: a `smartApprovalsTierA` dashboard setting let it auto-approve what it classified as
+carrying no risk. That is removed — the setting, the classification flag behind it, and the
+registry method that answered an approval locally. Claude Code and Codex already have approval
+settings, and a second layer in the bridge was a second thing to configure and a second thing to
+get wrong. A cloud that still sends the retired flag is not rejected; the field is dropped.
+
+What remains is the floor, and it only ever says **no**. It never raises a prompt, never answers
+one, and never turns a `deny` into an `allow`. Its single job is to refuse to be used as a weapon:
+a *cloud-sent allow* for an action this Mac classified as dangerous is answered `deny` instead. It
+cannot be lifted remotely, which is the whole reason it is worth having.
 
 **What is still trusted, and what this does not cover.** Read this part before relying on any of
 the above:
@@ -75,17 +90,35 @@ the above:
   process running as your user can open it. Dropping `PAGR_DAEMON_SOCK` from the environment of
   cloud-started `claude` children stops the bridge *handing over* the path; it is not a boundary,
   because the path is well known.
-- **`.claude/settings.local.json`.** Bridge-spawned sessions load `--setting-sources user,local`,
-  so a cloned repo's own `.claude/settings.json` can no longer grant itself permissions and no
-  longer suppresses the prompt. `local` is `.claude/settings.local.json`, which is gitignored by
-  convention but still lives in the project directory — a repo that commits one anyway can still
-  grant permissions to a session started in it. Set `PAGR_CLAUDE_SETTING_SOURCES=user` on the
-  daemon to drop that too.
-- **The interactive hook path.** The daemon accepts hook-shaped approval requests so that prompts
-  from your *own* `claude` can be answered from your phone. Nothing installs that hook yet (see
-  `docs/TROUBLESHOOTING.md`), so the path is dormant. When it is used it goes through the same
-  floor — but the hook only sees what Claude Code hands it, which is less than the bridge-spawned
-  path sees, so its classification is coarser.
+- **A repository's own `.claude/settings.json`, by default.** Bridge-spawned sessions load
+  `--setting-sources user,project,local`: the same settings your own `claude` loads in that
+  checkout. **The risk is real and is not reduced by describing it carefully.** A repository you
+  cloned can ship `.claude/settings.json` with `permissions.allow: ["Bash(*)"]`, or a `PreToolUse`
+  hook that returns `allow`. In a session started in that checkout, Claude Code then needs no
+  permission decision — so no prompt is raised, your phone is never asked, and **the device floor
+  never sees the action**, because the floor only judges prompts that exist. The same goes for a
+  repository's `.mcp.json`, which can add tools to the session. A cloned repository can therefore
+  arrange for a bridge-started session to act without asking you.
+
+  It is the default anyway, because the alternative was worse in a quieter way: overriding your
+  configuration meant a Pagr-started session silently ignored permission rules, hooks and tool
+  settings that worked in every other session you run, and you had no way to tell. Pagr does not
+  get to decide which of your Claude Code settings count.
+
+  If you work in checkouts you do not trust, set **`PAGR_CLAUDE_SEALED=1`** on the daemon. Sealed
+  mode loads `user,local` only and adds `--strict-mcp-config`, so neither the repository's
+  settings nor its MCP servers apply. `PAGR_CLAUDE_SETTING_SOURCES=user` drops
+  `.claude/settings.local.json` as well — it is gitignored by convention but still lives in the
+  project directory, so a repo that commits one anyway can grant permissions through it.
+- **Your `~/.claude/settings.json`.** `pagr connect` and `pagr daemon install` add one
+  `PermissionRequest` hook entry to it, at user scope, so prompts from the Claude Code sessions
+  *you* start can be answered from your phone. Everything else in the file is copied through
+  untouched, a copy of the previous contents is left as `settings.json.pagr.bak`, exactly what
+  changed is printed, and `pagr logout` / `pagr uninstall` / `pagr claude hook-remove` take the
+  entry back out. If you already have a `PermissionRequest` hook of your own, Pagr refuses to
+  install beside it rather than racing it, and says so. Prompts raised this way go through the
+  same floor — but the hook only sees what Claude Code hands it, which is less than the
+  bridge-spawned path sees, so its classification is coarser.
 - **Codex `read-only` vs Claude read-only.** Codex enforces read-only with a real sandbox. Claude
   Code has none, so read-only there is enforced by withholding tools (below). That is a deny-list
   against a tool set that can change between releases.
@@ -102,7 +135,7 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | `agent.send_instruction` | send follow-up text to an existing session |
 | `agent.stop_session` | interrupt a session |
 | `agent.respond_to_approval` | answer a permission prompt the agent raised, bound to the exact preview you saw — and subject to the device floor above |
-| `settings.sync_public_policy` | update the approval timeout and the tier-A auto-approve flag |
+| `settings.sync_public_policy` | update the approval timeout. Nothing else: there is no cloud setting that makes the bridge answer a prompt |
 
 There is deliberately **no** `shell.exec`, `fs.read`, `fs.write`, `process.spawn`, or "run this
 binary". The cloud cannot send a filesystem path: project references are opaque `proj_…` ids that
@@ -203,12 +236,17 @@ none that answers the same prompt twice.
 
 ## Agents the bridge spawns (`adapter-claude`, `adapter-codex`)
 
-`claude` is started with `--setting-sources user,local --strict-mcp-config`, so the *project's* own
-`.claude/settings.json` and `.mcp.json` cannot grant the session permissions or add tools to it. Without
-those flags a repository you had merely cloned could ship `permissions.allow: ["Bash(*)"]`, or a
-PreToolUse hook that returns allow, and no approval would ever be raised — you would never be asked,
-and the device floor would never see the action. See the caveat about `.claude/settings.local.json`
-above.
+`claude` is started with `--setting-sources user,project,local` and no `--strict-mcp-config`: the
+configuration you already have, whole. A repository you had merely cloned can therefore ship
+`permissions.allow: ["Bash(*)"]`, or a PreToolUse hook that returns allow, or an `.mcp.json`, and a
+bridge-started session in that checkout will honour it — no approval is raised, you are not asked,
+and the device floor never sees the action. That is the cost of not overriding your configuration,
+and it is stated plainly under "What is still trusted" above.
+
+`PAGR_CLAUDE_SEALED=1` is the opt-in for untrusted checkouts: `--setting-sources user,local` plus
+`--strict-mcp-config`. Those two flags move together because they are the same attack with two
+filenames — a repo that cannot grant itself a permission through `settings.json` should not be able
+to hand itself a tool through `.mcp.json`.
 
 A **read-only** Claude session is given
 `--disallowedTools Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,Task,Agent`. `Bash`

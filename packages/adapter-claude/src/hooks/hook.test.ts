@@ -83,10 +83,12 @@ describe('permission.mjs hook', () => {
     });
     await d.close();
     expect(code).toBe(0);
+    // Shape re-verified against the Claude Code hooks reference (2026-09-15):
+    // `hookSpecificOutput.decision.behavior`, with `message` documented as deny-only.
     expect(JSON.parse(stdout)).toEqual({
       hookSpecificOutput: {
         hookEventName: 'PermissionRequest',
-        decision: { behavior: 'allow', message: 'Approved by the user via Pagr' },
+        decision: { behavior: 'allow' },
       },
     });
     expect(d.seen).toHaveLength(1);
@@ -114,15 +116,49 @@ describe('permission.mjs hook', () => {
     });
   });
 
-  it('prints a deny decision', async () => {
+  it('prints a deny decision, with the message Claude Code shows the model', async () => {
     const d = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
     const { stdout } = await runHook(
       { ...stdinPayload, tool_use_id: 'toolu_x' },
       { PAGR_DAEMON_SOCK: sock },
     );
     await d.close();
-    expect(JSON.parse(stdout).hookSpecificOutput.decision.behavior).toBe('deny');
+    expect(JSON.parse(stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: 'PermissionRequest',
+        decision: { behavior: 'deny', message: 'Denied by the user via Pagr' },
+      },
+    });
     expect(d.seen[0]?.params.providerRequestId).toBe('toolu_x');
+  });
+
+  /**
+   * The safety property the whole design rests on: when Pagr cannot answer, Claude Code must
+   * behave exactly as if the hook were not installed. Exit 0 with no output is documented as
+   * "no decision", so the ordinary permission flow takes over. Never an allow, never a deny.
+   */
+  it('never invents a decision when the daemon says something unexpected', async () => {
+    for (const reply of [
+      { result: {} },
+      { result: { decision: 'maybe' } },
+      { result: { decision: null } },
+      { result: 'allow' },
+    ]) {
+      const d = fakeDaemon(sock, () => reply as { result: unknown });
+      const r = await runHook(stdinPayload, { PAGR_DAEMON_SOCK: sock });
+      await d.close();
+      expect(r).toEqual({ stdout: '', code: 0 });
+    }
+  });
+
+  it('exits 0 on garbage stdin rather than failing the tool call', async () => {
+    const child = await new Promise<{ stdout: string; code: number }>((resolve) => {
+      const c = execFile('node', [HOOK], { env: { ...process.env } }, (err, stdout) =>
+        resolve({ stdout: String(stdout), code: (err as { code?: number } | null)?.code ?? 0 }),
+      );
+      c.stdin?.end('not json at all');
+    });
+    expect(child).toEqual({ stdout: '', code: 0 });
   });
 
   it('prints nothing (no decision) on timeout, daemon error, or missing socket', async () => {

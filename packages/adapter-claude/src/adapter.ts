@@ -13,7 +13,7 @@ import type {
   StartSessionInput,
 } from '@pagr/bridge-core';
 import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.js';
-import { ClaudeProcess } from './claude-process.js';
+import { ClaudeProcess, sealedModeEnabled } from './claude-process.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 import { FileLogger } from './logger.js';
 import { type PersistedSession, SessionMap } from './session-map.js';
@@ -551,8 +551,10 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     session: { kind: 'new'; id: string } | { kind: 'resume'; id: string },
   ): void {
     live.lastActivityMs = Date.now();
+    const env = this.opts.env ?? process.env;
     const settingSources =
       this.opts.env?.PAGR_CLAUDE_SETTING_SOURCES ?? process.env.PAGR_CLAUDE_SETTING_SOURCES;
+    const sealed = sealedModeEnabled(env);
     const proc = new ClaudeProcess({
       command: this.opts.claudeCommand ?? ['claude'],
       cwd: live.projectPath,
@@ -564,6 +566,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       session,
       readOnly: live.readOnly,
       ...(settingSources ? { settingSources } : {}),
+      sealed,
       logger: this.logger,
     });
     live.proc = proc;

@@ -40,9 +40,7 @@ const flagValue = (name) => {
 const sessionId = flagValue('--session-id') ?? flagValue('--resume') ?? 'fake-session';
 const resumed = argv.includes('--resume');
 const out = (o) => process.stdout.write(`${JSON.stringify({ ...o, session_id: sessionId })}\n`);
-// Assert the flags the adapter must pass. `--setting-sources` and `--strict-mcp-config` are load
-// bearing: without them `claude -p` reads the cloned repo's own .claude/settings.json and
-// .mcp.json, which can auto-allow tools so no approval is ever raised (SEC-3).
+// Assert the flags the adapter must pass.
 for (const req of [
   '-p',
   '--input-format',
@@ -50,16 +48,28 @@ for (const req of [
   '--permission-prompt-tool',
   '--permission-mode',
   '--setting-sources',
-  '--strict-mcp-config',
 ]) {
   if (!argv.includes(req)) {
     process.stderr.write(`fake-claude: missing required flag ${req}\n`);
     process.exit(2);
   }
 }
+// In sealed mode `--setting-sources` and `--strict-mcp-config` are load bearing together: without
+// them `claude -p` reads the cloned repo's own .claude/settings.json and .mcp.json, which can
+// auto-allow tools so no approval is ever raised (SEC-3). Outside sealed mode the person's own
+// configuration is honoured in full, which is the default and is a deliberate choice.
 const settingSources = (flagValue('--setting-sources') ?? '').split(',').map((s) => s.trim());
-if (settingSources.includes('project')) {
-  process.stderr.write('fake-claude: --setting-sources must not include "project"\n');
+if (process.env.PAGR_CLAUDE_SEALED === '1') {
+  if (settingSources.includes('project')) {
+    process.stderr.write('fake-claude: sealed mode must not include "project"\n');
+    process.exit(2);
+  }
+  if (!argv.includes('--strict-mcp-config')) {
+    process.stderr.write('fake-claude: sealed mode must pass --strict-mcp-config\n');
+    process.exit(2);
+  }
+} else if (argv.includes('--strict-mcp-config')) {
+  process.stderr.write('fake-claude: --strict-mcp-config outside sealed mode\n');
   process.exit(2);
 }
 if (process.env.FAKE_CLAUDE_ARGS_FILE) {

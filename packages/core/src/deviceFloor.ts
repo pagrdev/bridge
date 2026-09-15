@@ -98,11 +98,6 @@ export interface LocalRiskAssessment {
   risks: DeviceRiskKind[];
   /** Network hosts the action would reach, lowercased. Empty when none could be named. */
   hosts: string[];
-  /**
-   * True when nothing at all was flagged AND this is not a shell command. Only such actions are
-   * eligible for `smartApprovalsTierA` auto-approval: a shell line always gets a human.
-   */
-  tierA: boolean;
 }
 
 // ---------- classification (runs on the Mac, on local data only) ----------
@@ -207,12 +202,7 @@ export function classifyLocally(facts: ApprovalFacts): LocalRiskAssessment {
   )
     risks.add('destructive');
 
-  const ordered = DEVICE_RISK_KINDS.filter((k) => risks.has(k));
-  return {
-    risks: ordered,
-    hosts: hostsIn(haystack),
-    tierA: ordered.length === 0 && facts.actionType !== 'command_execution',
-  };
+  return { risks: DEVICE_RISK_KINDS.filter((k) => risks.has(k)), hosts: hostsIn(haystack) };
 }
 
 const stripDollar = (preview: string): string => preview.replace(/^\s*\$\s*/, '');
@@ -233,6 +223,9 @@ const RiskKind = z.enum(DEVICE_RISK_KINDS);
 /**
  * `~/.pagr/device-policy.json`. Owned by the user, read at daemon start; no command can write it
  * (contrast `policy.json`, which the cloud syncs). Absent or unparseable means the safe default.
+ *
+ * A file left over from an older bridge may still carry `tierAAutoApprove`. That setting is gone
+ * along with the auto-approval it governed; unknown keys are dropped, so the file still reads.
  */
 export const DevicePolicy = z.object({
   version: z.literal(1).default(1),
@@ -240,11 +233,6 @@ export const DevicePolicy = z.object({
   allow: z.array(z.union([RiskKind, z.literal('all')])).default([]),
   /** Hosts that are not "a new host" for the `network` class. Exact match, case-insensitive. */
   allowedHosts: z.array(z.string()).default([]),
-  /**
-   * Whether the cloud's `smartApprovalsTierA` setting may auto-approve zero-risk, non-shell
-   * actions. Set false to pin tier-A auto-approval off no matter what the dashboard says.
-   */
-  tierAAutoApprove: z.boolean().default(true),
 });
 export type DevicePolicy = z.infer<typeof DevicePolicy>;
 
@@ -300,6 +288,13 @@ export interface DeviceFloorRefusal {
 /**
  * The floor itself. Holds no cloud state: the policy comes from disk and the environment, and
  * `check` is a pure function of the local classification.
+ *
+ * **What the floor is, and what it is not.** It is not the bridge's opinion about whether an
+ * action is a good idea, and it never decides which prompts to raise or answer — Claude Code and
+ * Codex do that, with the person's own settings. It is a one-way refusal: a *cloud-sent allow*
+ * for an action this Mac classified as dangerous is not relayed. That is the only thing standing
+ * between a compromised Pagr server and this machine, which is why it is local-only and cannot be
+ * lifted by any command the cloud can send.
  */
 export class DeviceFloor {
   readonly policy: DevicePolicy;
@@ -318,11 +313,6 @@ export class DeviceFloor {
 
   static fromFile(file?: string, env: NodeJS.ProcessEnv = process.env): DeviceFloor {
     return new DeviceFloor(readDevicePolicy(file, env));
-  }
-
-  /** True when the cloud's tier-A setting is allowed to auto-approve on this Mac. */
-  get tierAAutoApprove(): boolean {
-    return this.policy.tierAAutoApprove;
   }
 
   /** Risk classes this Mac has lifted, in declaration order. */

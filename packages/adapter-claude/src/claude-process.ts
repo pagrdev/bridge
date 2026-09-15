@@ -16,25 +16,49 @@ export interface ClaudeProcessOptions {
   /** New session: `--session-id`; resumed: `--resume`. */
   session: { kind: 'new'; id: string } | { kind: 'resume'; id: string };
   readOnly: boolean;
-  /** Overrides `DEFAULT_SETTING_SOURCES`; see `PAGR_CLAUDE_SETTING_SOURCES`. */
+  /** Overrides whichever list the mode below would pick; see `PAGR_CLAUDE_SETTING_SOURCES`. */
   settingSources?: string;
+  /** Opt-in sealed mode for untrusted checkouts; see `SEALED_SETTING_SOURCES`. */
+  sealed?: boolean;
   logger: FileLogger;
 }
 
 /**
  * Setting sources a bridge-spawned session loads (`--setting-sources`).
  *
- * `project` is deliberately absent. `claude -p` otherwise reads the *repository's own*
- * `.claude/settings.json`, so a repo you cloned could ship `permissions.allow: ["Bash(*)"]`, or a
- * PreToolUse hook that returns `allow`, and no permission prompt would ever be raised — the phone
- * would never be asked, and the device floor would never see the action.
+ * All three, which is what the person's own `claude` loads. Pagr does not get to pick which of
+ * someone's Claude Code settings count: a project's `.claude/settings.json` is a file their team
+ * wrote and they chose to check out, and a session the bridge starts in that project should
+ * behave the way the same session started in their terminal does. Overriding it meant a bridge
+ * session silently ignored permission rules, hooks and tool settings that worked everywhere else.
  *
- * `local` (`.claude/settings.local.json`) is kept because it is where a user puts their own
- * per-checkout settings, and it is gitignored by convention. It still lives inside the project
- * directory, so a repo that commits one anyway can grant itself permissions: set
- * `PAGR_CLAUDE_SETTING_SOURCES=user` on the daemon to drop it too. See docs/SECURITY.md.
+ * The cost is real and is not hidden: see `SEALED_SETTING_SOURCES` and docs/SECURITY.md.
  */
-export const DEFAULT_SETTING_SOURCES = 'user,local';
+export const DEFAULT_SETTING_SOURCES = 'user,project,local';
+
+/**
+ * Sealed mode (`PAGR_CLAUDE_SEALED=1`): what to load in a checkout you do not trust.
+ *
+ * `project` is dropped, so the repository's own `.claude/settings.json` cannot ship
+ * `permissions.allow: ["Bash(*)"]`, or a PreToolUse hook that returns `allow`, and have a
+ * bridge-started session act on it with no prompt ever raised. `--strict-mcp-config` rides the
+ * same switch, because a repo that cannot grant itself a permission through `settings.json`
+ * should not be able to hand itself a tool through `.mcp.json` either — they are the same attack
+ * with two filenames, so they are one setting.
+ *
+ * `local` (`.claude/settings.local.json`) is kept: it is where a person puts their own
+ * per-checkout settings and it is gitignored by convention. It still lives inside the project
+ * directory, so a repo that commits one anyway can grant permissions to a session started in it —
+ * set `PAGR_CLAUDE_SETTING_SOURCES=user` to drop that too.
+ */
+export const SEALED_SETTING_SOURCES = 'user,local';
+
+export const SEALED_MODE_ENV = 'PAGR_CLAUDE_SEALED';
+
+/** Sealed mode is off unless the operator set `PAGR_CLAUDE_SEALED=1`. */
+export function sealedModeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[SEALED_MODE_ENV] === '1';
+}
 
 /**
  * Tools a read-only session may not use.
@@ -94,6 +118,7 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
   start(): void {
     const [bin, ...rest] = this.opts.command;
     if (!bin) throw new Error('claude command is empty');
+    const sealed = this.opts.sealed ?? false;
     const args = [
       ...rest,
       '-p',
@@ -106,14 +131,14 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       'default',
       '--permission-prompt-tool',
       'stdio',
-      // The project's own `.claude/settings.json` must not be able to grant permissions to a
-      // session the cloud started (see DEFAULT_SETTING_SOURCES).
+      // Their configuration, not ours — unless they asked for sealed mode, which drops the
+      // project's own settings and its MCP servers together (see SEALED_SETTING_SOURCES).
       '--setting-sources',
-      this.opts.settingSources ?? DEFAULT_SETTING_SOURCES,
-      // …and the project's `.mcp.json` must not be able to add tools to it either. With no
-      // `--mcp-config`, this leaves a bridge-spawned session with no MCP servers at all.
-      '--strict-mcp-config',
+      this.opts.settingSources ?? (sealed ? SEALED_SETTING_SOURCES : DEFAULT_SETTING_SOURCES),
     ];
+    // With no `--mcp-config` alongside it, this leaves a sealed session with no MCP servers at
+    // all. Outside sealed mode the person's own servers load exactly as they do in their terminal.
+    if (sealed) args.push('--strict-mcp-config');
     if (this.opts.session.kind === 'new') args.push('--session-id', this.opts.session.id);
     else args.push('--resume', this.opts.session.id);
     // `--disallowedTools` is variadic, so it stays last: anything after it would be swallowed.

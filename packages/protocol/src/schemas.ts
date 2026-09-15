@@ -161,7 +161,6 @@ export const CommandPayloads = {
     decision: z.enum(['allow', 'deny']),
   }),
   'settings.sync_public_policy': z.object({
-    smartApprovalsTierA: z.boolean().default(false),
     approvalTimeoutSeconds: z.number().int().min(30).max(3600).default(600),
   }),
 } as const;

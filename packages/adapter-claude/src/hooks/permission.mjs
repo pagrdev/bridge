@@ -6,20 +6,32 @@
 // Sessions the bridge spawns itself do not use this hook; they use the stdio permission-prompt
 // protocol instead.
 //
-// Doc basis (https://code.claude.com/docs/en/hooks, fetched 2026-08-24):
-//   stdin:  {"session_id","cwd","permission_mode","hook_event_name":"PermissionRequest",
-//            "tool_name","tool_input",("tool_use_id"),"permission_suggestions"}
-//           NOTE: Claude Code 2.1.220 did not include `tool_use_id` in practice; we fall back to
-//           `prompt_id`, then a random id.
+// Doc basis (https://code.claude.com/docs/en/hooks, re-verified 2026-09-15):
+//   stdin:  {"session_id","transcript_path","cwd","permission_mode",
+//            "hook_event_name":"PermissionRequest","tool_name","tool_input",
+//            "permission_suggestions"}
+//           "PermissionRequest hooks receive tool_name and tool_input fields like PreToolUse
+//           hooks, but WITHOUT tool_use_id." We therefore fall back to `prompt_id`, then to a
+//           random id, so every request still has a stable handle to answer.
 //   stdout: {"hookSpecificOutput":{"hookEventName":"PermissionRequest",
-//            "decision":{"behavior":"allow"|"deny","message":"…"}}}
-//   "Exit 0 with no output: The hook has no decision; normal permission flow applies."
-//   "Exit code 2 is not honored for PermissionRequest."
-//   Default hook timeout is 600 s; a timed-out hook "renders no decision".
+//            "decision":{"behavior":"allow"|"deny",…}}}
+//           `message` is documented as deny-only ("tells Claude why the permission was denied"),
+//           so nothing is attached to an allow.
+//   "Exit code 0 with no output means the hook has no decision to report, so the tool call
+//    continues through the normal permission flow. The hook can deny the call, but staying
+//    silent doesn't approve it."
+//   "Exit code 2 isn't honored for this event and the permission flow proceeds unchanged."
+//   Default `command` hook timeout is 600 s.
+//   Caveats worth knowing: in a session that cannot show a prompt (a `-p` run, a background
+//   subagent) Claude Code denies when no hook returns a decision — the fallback is the session's
+//   own, not ours. Claude Code also does not run this event for a sandboxed command's network
+//   request. And hooks from any settings file, this one included, are held back in an interactive
+//   session until the workspace trust dialog for that folder has been accepted.
 //
 // Safety: talks ONLY to the local daemon Unix socket. Prints nothing (=> no decision, native
 // Claude Code prompt stays in control) on timeout, socket error, or any unexpected reply.
-// Never auto-allows.
+// Never auto-allows, never auto-denies: a daemon that is down, a phone that is off and a person
+// who does not answer all end in the prompt the terminal would have shown anyway.
 
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
@@ -222,11 +234,12 @@ export function askDaemon(params, { sockPath = SOCK, timeoutMs = TIMEOUT_MS } = 
   });
 }
 
+/** `message` is deny-only per the hooks reference; an allow carries the decision and nothing else. */
 export function hookOutput(decision, message) {
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PermissionRequest',
-      decision: { behavior: decision, message },
+      decision: decision === 'deny' ? { behavior: 'deny', message } : { behavior: 'allow' },
     },
   });
 }
@@ -241,8 +254,7 @@ async function main() {
   if (hook?.hook_event_name !== 'PermissionRequest') return;
   const params = buildRequest(hook);
   const decision = await askDaemon(params);
-  if (decision === 'allow')
-    process.stdout.write(hookOutput('allow', 'Approved by the user via Pagr'));
+  if (decision === 'allow') process.stdout.write(hookOutput('allow'));
   else if (decision === 'deny')
     process.stdout.write(hookOutput('deny', 'Denied by the user via Pagr'));
   // else: print nothing → native permission flow stays in control

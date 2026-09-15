@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { DeviceEvent, EventPayload, Provider, SessionSummary } from '@pagr/protocol';
+import type {
+  DeviceEvent,
+  EventPayload,
+  Provider,
+  SessionStatus,
+  SessionSummary,
+} from '@pagr/protocol';
 import { z } from 'zod';
 import type { CodingAgentAdapter } from './adapters/types.js';
 import type { FetchLike } from './attachments.js';
@@ -9,7 +15,7 @@ import { SessionGuard } from './concurrency.js';
 import { type BridgeConfig, inspectConfig, readConfig, updateConfig } from './config.js';
 import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
 import type { LocalActionDetail } from './deviceFloor.js';
-import { Dispatcher } from './dispatcher.js';
+import { ADOPTED_SESSION_NAME, Dispatcher } from './dispatcher.js';
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, InvalidDeviceKeyError, loadOrCreateIdentity } from './identity.js';
 import {
@@ -27,10 +33,13 @@ import { ProjectError, ProjectRegistry } from './projects.js';
 import { type ReconciledSession, reconcileSessions } from './reconcile.js';
 import { ReplayCache } from './replay.js';
 import {
+  DEFAULT_ADOPTED_RETENTION_MS,
   DEFAULT_MAX_SESSION_RECORDS,
   DEFAULT_SESSION_RETENTION_MS,
+  isAdopted,
   type SessionRecord,
   SessionStore,
+  UNREGISTERED_PROJECT,
 } from './sessions.js';
 import { GatewayClient } from './transport.js';
 
@@ -55,6 +64,8 @@ export interface CreateDaemonOptions {
   sessionRetentionMs?: number;
   /** Hard ceiling on rows in `sessions.json` (default 500). */
   maxSessionRecords?: number;
+  /** How long an adopted session survives without news. Defaults to `DEFAULT_ADOPTED_RETENTION_MS`. */
+  adoptedRetentionMs?: number;
   /** Environment for security checks (`PAGR_ENV`, `PAGR_ALLOW_INSECURE_WS`); defaults to process.env. */
   env?: NodeJS.ProcessEnv;
   /**
@@ -74,6 +85,14 @@ export interface DaemonStatus {
   bufferedEvents: number;
   projects: number;
   sessions: number;
+  /**
+   * How many of `sessions` the bridge did not start. Reported separately because what Pagr can do
+   * with one differs: it can relay their approvals and say they exist, but it cannot send them an
+   * instruction, stop them, or resume them.
+   */
+  adoptedSessions: number;
+  /** Adopted sessions whose directory is in no registered project, so the cloud never sees them. */
+  unregisteredSessions: number;
   pendingApprovals: number;
   socketPath: string;
   pid: number;
@@ -372,6 +391,9 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     bufferedEvents: transport?.bufferedCount ?? 0,
     projects: registry.list().length,
     sessions: sessions.list().length,
+    adoptedSessions: sessions.list().filter(isAdopted).length,
+    unregisteredSessions: sessions.list().filter((r) => r.projectId === UNREGISTERED_PROJECT)
+      .length,
     pendingApprovals: dispatcher.approvals.list().length,
     socketPath: paths.socketPath,
     pid: process.pid,
@@ -425,6 +447,46 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     })),
   );
   ipc.registerMethod('approvals.list', () => dispatcher.approvals.list());
+  /**
+   * Record a provider session the bridge did not start, so that it exists as far as this Mac is
+   * concerned: which agent, which directory, which provider session id, and when we first saw it.
+   *
+   * `projectId` may be `UNREGISTERED_PROJECT`. That is not a failure — somebody really is running
+   * `claude` in that directory — it only means the cloud cannot be told about it, because a
+   * `SessionSummary` has to name a `proj_…` id. Such a session is listed locally (`pagr sessions`,
+   * `pagr status`) with the directory, so the fix (`pagr projects add <dir>`) is obvious.
+   */
+  function adoptSession(p: {
+    provider: Provider;
+    projectId: string;
+    providerSessionId: string | null;
+    cwd: string | null;
+    status: SessionStatus;
+  }): SessionRecord {
+    const sessionId = syntheticSessionId(p.provider, p.providerSessionId ?? undefined);
+    const existing = sessions.get(sessionId);
+    const ts = now().toISOString();
+    const rec = sessions.upsert({
+      sessionId,
+      provider: p.provider,
+      projectId: p.projectId,
+      providerSessionId: p.providerSessionId ?? sessionId,
+      status: p.status,
+      adopted: true,
+      adoptedAt: existing?.adoptedAt ?? ts,
+      ...(p.cwd ? { cwd: p.cwd } : existing?.cwd ? { cwd: existing.cwd } : {}),
+      startedAt: existing?.startedAt ?? ts,
+      updatedAt: ts,
+    });
+    if (!existing)
+      logger.info('adopted a session this bridge did not start', {
+        sessionId,
+        provider: p.provider,
+        project: p.projectId === UNREGISTERED_PROJECT ? 'none' : p.projectId,
+      });
+    return rec;
+  }
+
   ipc.registerMethod('approval.request', (params) => {
     const p = ApprovalRequestParams.parse(params);
     let projectId: string;
@@ -433,8 +495,23 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       projectId = p.projectId;
     } else if (p.cwd) {
       const rec = registry.findByPath(p.cwd);
-      if (!rec)
-        throw new IpcMethodError('unknown_project', 'cwd is not inside a registered project');
+      if (!rec) {
+        // No project contains this directory, so the prompt cannot be relayed — the cloud has no
+        // id to route it to. The session is still adopted, and the hook is told "no decision", so
+        // the prompt in their terminal behaves exactly as it does with Pagr uninstalled.
+        if (!p.sessionId)
+          adoptSession({
+            provider: p.provider,
+            projectId: UNREGISTERED_PROJECT,
+            providerSessionId: p.claudeSessionId ?? null,
+            cwd: p.cwd,
+            status: 'idle',
+          });
+        throw new IpcMethodError(
+          'unknown_project',
+          `cwd is not inside a registered project; run \`pagr projects add ${p.cwd}\` to relay its prompts`,
+        );
+      }
       projectId = rec.projectId;
     } else {
       throw new IpcMethodError('invalid_params', 'projectId or cwd is required');
@@ -444,18 +521,14 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     else {
       // Interactive (hook) path: mint a stable local session so cloud approvals can be bound
       // and routed. Deterministic per provider session id so repeated prompts share it.
-      sessionId = syntheticSessionId(p.provider, p.claudeSessionId ?? undefined);
-      const existing = sessions.get(sessionId);
-      const ts = now().toISOString();
-      const rec = sessions.upsert({
-        sessionId,
+      const rec = adoptSession({
         provider: p.provider,
         projectId,
-        providerSessionId: p.claudeSessionId ?? sessionId,
+        providerSessionId: p.claudeSessionId ?? null,
+        cwd: p.cwd ?? null,
         status: 'waiting_for_approval',
-        startedAt: existing?.startedAt ?? ts,
-        updatedAt: ts,
       });
+      sessionId = rec.sessionId;
       emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
     }
     return new Promise<{
@@ -502,7 +575,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       ...(displayName ? { displayName } : {}),
     };
   }
-  const interactive = (rec: SessionRecord) => summaryOf(rec, 'Interactive session');
+  /** Adopted sessions carry one label everywhere, so the phone can tell them from Pagr's own. */
+  const interactive = (rec: SessionRecord) => summaryOf(rec, ADOPTED_SESSION_NAME);
   /**
    * Local helpers (the Claude hook, the channel server) push progress for sessions the daemon is
    * already tracking. The socket is uid-checked, so this is a same-user boundary, not a trust
@@ -583,8 +657,14 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
           .map((s) => s.sessionId),
       ensureSession: ({ projectId, sessionId }) => {
         if (sessionId && sessions.has(sessionId)) return sessionId;
-        // One stable local session per project for the user's own channel-attached Claude Code,
-        // mirroring the hook path in `approval.request`.
+        // One stable local session per project for the user's own channel-attached Claude Code.
+        //
+        // Deliberately NOT `adopted`, even though the bridge did not spawn this one either.
+        // `adopted` is read as "approvals only" — the cloud refuses to steer or stop such a
+        // session, and so does `Dispatcher.assertOurSession`. A channel-attached session is the
+        // one exception: the channel exists precisely so it CAN be steered, so marking it would
+        // ship a limit that is not true. If the channel ever detaches, what is left is a session
+        // nothing can steer, which is what its `idle` status already says.
         const id = sessionId ?? syntheticSessionId('claude', `channel:${projectId}`);
         const existing = sessions.get(id);
         const ts = now().toISOString();
@@ -659,6 +739,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       sessions.prune({
         retentionMs: o.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION_MS,
         maxEntries: o.maxSessionRecords ?? DEFAULT_MAX_SESSION_RECORDS,
+        adoptedRetentionMs: o.adoptedRetentionMs ?? DEFAULT_ADOPTED_RETENTION_MS,
       });
       // No process outlived the daemon, so nothing in the store may still claim to be working.
       await daemon.reconcile();
@@ -670,6 +751,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         sessions.prune({
           retentionMs: o.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION_MS,
           maxEntries: o.maxSessionRecords ?? DEFAULT_MAX_SESSION_RECORDS,
+          adoptedRetentionMs: o.adoptedRetentionMs ?? DEFAULT_ADOPTED_RETENTION_MS,
         });
       }, 3600_000);
       cleanupTimer.unref();
