@@ -2,7 +2,14 @@
   "name": "@pagr/claude-channel",
   "version": "0.1.0",
   "description": "Pagr channel server for Claude Code — pushes phone messages into a running Claude Code session and relays permission prompts. Research preview, dev-flag only (ADR 0001 `approved-channel`).",
+  "keywords": [
+    "pagr",
+    "claude-code",
+    "mcp",
+    "channel"
+  ],
   "license": "Apache-2.0",
+  "author": "Stagberry Labs LLC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pagrdev/bridge.git",

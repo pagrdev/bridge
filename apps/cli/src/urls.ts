@@ -8,18 +8,33 @@ export const DEV_WEB_URL = 'http://localhost:3000';
 export const isDev = (env: NodeJS.ProcessEnv): boolean =>
   env.PAGR_ENV === 'development' || env.NODE_ENV === 'development' || env.PAGR_DEV === '1';
 
+/**
+ * The API URL only if somebody actually chose one: `--api-url` → `PAGR_API_URL` → `config.json`
+ * (written by `pagr connect`). `null` means we would be falling back to the compiled-in default,
+ * i.e. this machine has never been paired and nobody has pointed it at a stack.
+ *
+ * `pagr doctor` needs that distinction: failing a network probe against a host the user never
+ * asked for turns a fresh, correct install into a red report.
+ */
+export function configuredApiUrl(
+  env: NodeJS.ProcessEnv,
+  flag?: string,
+  config?: BridgeConfig,
+): string | null {
+  const chosen = flag || env.PAGR_API_URL || config?.apiUrl;
+  return chosen ? chosen.replace(/\/$/, '') : null;
+}
+
 /** `--api-url` → `PAGR_API_URL` → config → dev/prod default. */
 export function resolveApiUrl(
   env: NodeJS.ProcessEnv,
   flag?: string,
   config?: BridgeConfig,
 ): string {
-  return (
-    flag ||
-    env.PAGR_API_URL ||
-    config?.apiUrl ||
-    (isDev(env) ? DEV_API_URL : PROD_API_URL)
-  ).replace(/\/$/, '');
+  return (configuredApiUrl(env, flag, config) ?? (isDev(env) ? DEV_API_URL : PROD_API_URL)).replace(
+    /\/$/,
+    '',
+  );
 }
 
 /**

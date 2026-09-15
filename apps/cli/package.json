@@ -2,7 +2,15 @@
   "name": "@pagr/cli",
   "version": "0.1.0",
   "description": "pagr — connect your Mac's Claude Code and Codex sessions to Pagr",
+  "keywords": [
+    "pagr",
+    "cli",
+    "claude-code",
+    "codex",
+    "macos"
+  ],
   "license": "Apache-2.0",
+  "author": "Stagberry Labs LLC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pagrdev/bridge.git",
@@ -18,6 +26,12 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "files": [
     "dist"
   ],

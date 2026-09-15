@@ -1,7 +1,15 @@
 {
   "name": "@pagr/bridge-adapter-codex",
   "version": "0.1.0",
+  "description": "Codex adapter for the Pagr bridge — drives `codex app-server` threads and relays their approval requests as typed approvals.",
+  "keywords": [
+    "pagr",
+    "bridge",
+    "adapter",
+    "codex"
+  ],
   "license": "Apache-2.0",
+  "author": "Stagberry Labs LLC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pagrdev/bridge.git",
@@ -25,6 +33,9 @@
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

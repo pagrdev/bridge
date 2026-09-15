@@ -1,7 +1,15 @@
 {
   "name": "@pagr/bridge-adapter-claude",
   "version": "0.1.0",
+  "description": "Claude Code adapter for the Pagr bridge — drives headless `claude` sessions and relays their permission prompts as typed approvals.",
+  "keywords": [
+    "pagr",
+    "bridge",
+    "adapter",
+    "claude-code"
+  ],
   "license": "Apache-2.0",
+  "author": "Stagberry Labs LLC",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pagrdev/bridge.git",
@@ -25,6 +33,9 @@
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/hooks && cp src/hooks/permission.mjs dist/hooks/permission.mjs",

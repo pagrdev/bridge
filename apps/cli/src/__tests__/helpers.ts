@@ -58,7 +58,11 @@ export function harness(extra: ContextOverrides = {}): Harness {
     browserOpens: true,
     launchctl: true,
     clockStepMs: 1000,
-    nowMs: Date.parse('2026-08-25T12:00:00.000Z'),
+    // Starts at the real clock, never a calendar date: `pagr doctor` measures skew between
+    // `ctx.now()` and the live `Date:` header a fake API server sends, so a frozen literal here
+    // would silently turn into a "clock is wrong" failure the moment real time drifted past
+    // MAX_TOLERABLE_CLOCK_SKEW_MS. Tests that need a specific instant assign `h.nowMs`.
+    nowMs: Date.now(),
     interrupt: () => {
       for (const fn of [...interruptHandlers]) fn();
     },

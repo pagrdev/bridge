@@ -1,12 +1,8 @@
 # Releasing the Pagr bridge
 
 Everything in this repo ships as npm packages under the `@pagr` scope, plus a Homebrew formula
-that wraps the CLI tarball. There is no CI: every step below runs on a maintainer's Mac.
-
-> **Before the first release**, replace the placeholder repository URL
-> (`https://github.com/pagrdev/bridge`) in every `package.json` and in
-> `packaging/homebrew/pagr.rb` with the real one. npm renders it on the package page and
-> Homebrew audit checks it.
+that wraps the CLI tarball. There is no CI: every step below runs on a maintainer's Mac, and
+`scripts/release.mjs` is the gate that CI would otherwise be.
 
 ## What ships
 
@@ -19,13 +15,19 @@ that wraps the CLI tarball. There is no CI: every step below runs on a maintaine
 | `@pagr/cli` | `apps/cli` | The `pagr` binary. This is what users install. |
 | `@pagr/claude-channel` | `integrations/claude-channel` | **Optional.** Research-preview Claude Code channel server. Nothing else depends on it at runtime. |
 
-The root `pagr-bridge` package is `private: true` and is never published.
+The root `pagr-bridge` package is `private: true` and is never published. `integrations/claude-code-plugin`
+has no `package.json`: it is a Claude Code plugin, distributed through a plugin marketplace, not npm.
+
+Every publishable package carries `license`, `author`, `repository` (with `directory`), `homepage`,
+`bugs`, `files`, `main`/`types`/`exports`, `engines.node >= 22` and `publishConfig.access: public`.
+Those fields are asserted by `scripts/release.test.mjs`, so `pnpm gate` fails if one goes missing —
+they are not a checklist item here.
 
 ## Publish order
 
-`pnpm publish -r` walks the workspace in topological order and rewrites `workspace:*` ranges into
-the real version numbers it is publishing, so a single command is enough — but the order it
-produces matters if a publish fails halfway, so it is written out here:
+`scripts/release.mjs` publishes one package at a time, in the topological order it derives from the
+workspace's own `dependencies`, so a run that dies halfway can be resumed by re-running it (already
+published versions are skipped, never republished):
 
 1. `@pagr/protocol`
 2. `@pagr/bridge-core` (depends on 1)
@@ -33,62 +35,64 @@ produces matters if a publish fails halfway, so it is written out here:
 4. `@pagr/cli` (depends on 1–3)
 5. `@pagr/claude-channel` (depends on 1, 2, and `@pagr/bridge-adapter-claude`)
 
-If a publish fails partway, re-run `pnpm publish -r`: pnpm skips versions already on the registry.
+Cross-package dependencies are all `workspace:*`. `pnpm publish` rewrites that to the exact version
+being published (`"@pagr/protocol": "0.2.0"`, not a range), which is why every package has to move
+together — see the next step.
 
 ## Steps
 
-### 1. Gate
+### 1. Bump versions
 
-```bash
-pnpm install
-pnpm biome check --write .
-pnpm typecheck
-pnpm vitest run
-```
-
-All three must be clean. Nothing below is safe on a red tree.
-
-### 2. Bump versions
-
-Every package moves together — a mixed-version workspace makes `workspace:*` rewriting hard to
-reason about, and the CLI reports a single `bridgeVersion` to the gateway.
+Every package moves together: a mixed-version workspace makes the `workspace:*` rewrite ambiguous,
+and the CLI reports a single `bridgeVersion` to the gateway.
 
 ```bash
 pnpm -r --filter='!pagr-bridge' exec npm version <new-version> --no-git-tag-version
+git commit -am "release: v<new-version>"
 ```
 
-Then update `CLI_VERSION` in `apps/cli/src/context.ts` to match — it is the version the CLI
-prints and the `bridgeVersion` the gateway sees, and it is not read from `package.json`.
+Nothing else to edit. `apps/cli/src/version.ts` reads the version out of `apps/cli/package.json` at
+run time — `pagr --version` and the `bridgeVersion` the gateway sees can no longer disagree with
+what npm shipped, and `apps/cli/src/__tests__/version.test.ts` asserts it.
 
-### 3. Build and inspect the tarballs
+Commit before releasing: `scripts/release.mjs` refuses a dirty tree, because a tarball that matches
+no commit is not something anyone can audit afterwards.
+
+### 2. Dry run
 
 ```bash
-pnpm build
-pnpm -r --filter='!pagr-bridge' exec npm pack --dry-run
+node scripts/release.mjs
 ```
+
+That is the whole release, minus the publish. It:
+
+- refuses a dirty working tree;
+- refuses a workspace whose publishable packages disagree about their version;
+- refuses a package missing any of the metadata listed above;
+- runs `pnpm gate` (lint + typecheck + tests) and stops if it is red;
+- wipes `dist/` and rebuilds, so the tarballs are reproducible;
+- checks `dist/bin.js` is still executable (Homebrew installs it as-is; a lost `+x` is EACCES for
+  every Homebrew user and nobody else);
+- asks the registry which versions already exist, and stops if there is nothing left to publish;
+- prints `npm pack --dry-run` for each package.
 
 Check the reported file counts and sizes against the last release. Reference figures at 0.1.0:
 
 | Package | Packed | Unpacked | Files |
 | --- | --- | --- | --- |
-| `@pagr/protocol` | 18.2 kB | 239.6 kB | 9 |
-| `@pagr/bridge-core` | 77.8 kB | 329.1 kB | 97 |
-| `@pagr/bridge-adapter-codex` | 32.9 kB | 143.7 kB | 37 |
-| `@pagr/bridge-adapter-claude` | 36.2 kB | 143.6 kB | 42 |
-| `@pagr/cli` | 31.7 kB | 129.9 kB | 65 |
-| `@pagr/claude-channel` | 13.7 kB | 45.9 kB | 22 |
+| `@pagr/protocol` | 18.2 kB | 239.8 kB | 9 |
+| `@pagr/bridge-core` | 117.1 kB | 487.7 kB | 109 |
+| `@pagr/bridge-adapter-codex` | 36.3 kB | 155.2 kB | 37 |
+| `@pagr/bridge-adapter-claude` | 40.1 kB | 156.2 kB | 42 |
+| `@pagr/cli` | 59.6 kB | 241.6 kB | 69 |
+| `@pagr/claude-channel` | 13.7 kB | 46.0 kB | 22 |
 
 `@pagr/protocol` and `@pagr/bridge-core` compile their tests into `dist` (their tsconfigs do not
 exclude `*.test.ts`, so `pnpm typecheck` covers test files too). Their `files` arrays carry
 negation patterns — `"!dist/**/*.test.*"`, `"!dist/testUtil.*"`, `"!dist/testFixtures.*"` — to
-keep that out of the tarball. A sudden jump usually means one of those was dropped, or `dist`
-was not cleaned before building. `rm -rf packages/*/dist apps/*/dist integrations/*/dist && pnpm build`
-gives a reproducible tree.
+keep that out of the tarball. A sudden jump usually means one of those was dropped.
 
-Also confirm the CLI tarball still contains `dist/bin.js` with its executable bit — `pagr`'s
-`bin` entry points at it.
-
-### 4. Re-run the compliance checklist
+### 3. Re-run the compliance checklist
 
 ADR 0001 §Consequences: the Claude Code compliance checklist (handoff §09.16) must be re-run
 before **every** public release. In particular re-read
@@ -96,15 +100,23 @@ before **every** public release. In particular re-read
 carve-out still stands. If it does not, `cli-hooks` degrades to API-key-only via config and that
 change ships *before* the release, not after.
 
-### 5. Publish
+### 4. Publish
 
 ```bash
 npm whoami                       # must be a maintainer of the @pagr scope
-pnpm publish -r --access public  # rewrites workspace:* → real versions
+node scripts/release.mjs --yes
 ```
 
-`publishConfig.access: public` is set on every package, so `--access public` is belt and braces
-for a first-time scoped publish.
+`--yes` is the only thing that makes this script run `npm publish`; without it every run above is a
+dry run. There is no interactive confirmation on purpose — an irreversible action should not be one
+stray newline away.
+
+Useful variants:
+
+```bash
+node scripts/release.mjs --yes --tag next          # pre-release dist-tag
+node scripts/release.mjs --yes --only @pagr/cli    # resume a partial release
+```
 
 Verify:
 
@@ -113,32 +125,15 @@ npm view @pagr/cli version
 npx --yes @pagr/cli@<new-version> --version
 ```
 
-### 6. Tag and cut the GitHub release
+### 5. Homebrew formula
 
-```bash
-git commit -am "release: v<new-version>"
-git tag -a v<new-version> -m "v<new-version>"
-git push && git push --tags
-gh release create v<new-version> --generate-notes
-```
+`node scripts/release.mjs --yes` downloads the published `@pagr/cli` tarball and rewrites
+`packaging/homebrew/pagr.rb` for you: the `version` line, and the `sha256` line (which is an
+all-zero placeholder in git, because the digest cannot exist before the tarball does). The `url`
+interpolates `version`, so it is never edited by hand.
 
-### 7. Bump the Homebrew formula
-
-`packaging/homebrew/pagr.rb` is a template: `url`, `version`, and `sha256` are placeholders.
-
-```bash
-V=<new-version>
-curl -fsSLO "https://registry.npmjs.org/@pagr/cli/-/cli-$V.tgz"
-shasum -a 256 "cli-$V.tgz"
-```
-
-Replace, in the formula:
-
-- `url` → `https://registry.npmjs.org/@pagr/cli/-/cli-$V.tgz`
-- `version` → `$V`
-- `sha256` → the digest printed above
-
-Then copy it into the tap repository (`Formula/pagr.rb`) and verify locally before pushing:
+Commit the formula, then copy it into the tap repository (`Formula/pagr.rb`) and verify before
+pushing:
 
 ```bash
 brew install --build-from-source ./pagr.rb
@@ -150,7 +145,16 @@ brew uninstall pagr
 `@pagr/claude-channel` is deliberately **not** in the formula. It is a research-preview add-on;
 users who want it run `npm i -g @pagr/claude-channel` and then `pagr claude channel-setup`.
 
-### 8. Post-release smoke on a clean machine
+### 6. Tag and cut the GitHub release
+
+```bash
+git commit -am "release: v<new-version> (homebrew)"
+git tag -a v<new-version> -m "v<new-version>"
+git push && git push --tags
+gh release create v<new-version> --generate-notes
+```
+
+### 7. Post-release smoke on a clean machine
 
 ```bash
 npm install -g @pagr/cli
@@ -158,5 +162,13 @@ pagr --version
 pagr doctor
 ```
 
-`pagr doctor` exercises the local checks (binaries, launch agent, socket) without needing a
-paired account.
+`pagr doctor` must exit **0** here. An unpaired Mac is a correct install, not a broken one: the
+pairing, API, gateway and daemon checks report `warn`/`skip` with the next command to run, and the
+report ends with `not paired yet — run \`pagr connect\``. `pagr doctor --json` carries
+`"paired": false` alongside `"ok": true`, which is the pair a scripted smoke test should assert.
+
+Only real faults fail: a Keychain that will not open, a `config.json` that will not parse, a
+configured API URL that nothing answers, or a daemon that was installed and does not reply. Note
+that the network checks are skipped entirely unless something actually chose an API URL
+(`--api-url`, `PAGR_API_URL`, or a `config.json` written by `pagr connect`), so this smoke test
+needs no network.

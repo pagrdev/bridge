@@ -19,6 +19,7 @@ import { DaemonAlreadyRunningError } from './daemonLock.js';
 import { verifyRaw } from './identity.js';
 import { IpcClient } from './ipc.js';
 import { MemorySecretStore } from './keychain.js';
+import { DEFAULT_SESSION_RETENTION_MS } from './sessions.js';
 import { FakeServerSigner, ids, makeBody } from './testFixtures.js';
 import { useTempHome } from './testUtil.js';
 
@@ -486,16 +487,30 @@ describe('daemon startup reconciliation', () => {
     );
   };
 
-  const rec = (over: Record<string, unknown> = {}) => ({
-    sessionId: ids.ses(),
-    provider: 'codex',
-    projectId: ids.proj(),
-    providerSessionId: 'thr_1',
-    status: 'working',
-    startedAt: '2026-08-20T00:00:00.000Z',
-    updatedAt: '2026-08-20T00:00:00.000Z',
-    ...over,
-  });
+  /**
+   * Seed timestamps are always relative to *now*.
+   *
+   * `daemon.start()` prunes terminal sessions older than `DEFAULT_SESSION_RETENTION_MS` before it
+   * reconciles, so a hard-coded calendar date here quietly stops testing anything once it drifts
+   * past the retention window — the `completed` row is deleted instead of kept, and the assertion
+   * that it survives starts failing on a date nobody chose. Anything seeded for reconciliation
+   * must therefore be younger than the retention window by construction.
+   */
+  const agoIso = (ms: number) => new Date(Date.now() - ms).toISOString();
+
+  const rec = (over: Record<string, unknown> = {}) => {
+    const at = agoIso(1000);
+    return {
+      sessionId: ids.ses(),
+      provider: 'codex',
+      projectId: ids.proj(),
+      providerSessionId: 'thr_1',
+      status: 'working',
+      startedAt: at,
+      updatedAt: at,
+      ...over,
+    };
+  };
 
   it('never leaves a session claiming to work after a restart', async () => {
     const home = join(t.home, 'pagr');
@@ -515,6 +530,31 @@ describe('daemon startup reconciliation', () => {
       expect(d.sessions.get(waiting.sessionId as string)?.status).toBe('stopped');
       expect(d.sessions.get(done.sessionId as string)?.status).toBe('completed');
       expect(d.dispatcher.activeSessionCount()).toBe(0);
+    } finally {
+      await d.stop();
+    }
+  });
+
+  it('prunes terminal sessions past the retention window at startup, keeps fresh ones', async () => {
+    const home = join(t.home, 'pagr');
+    const stale = rec({
+      status: 'completed',
+      updatedAt: agoIso(DEFAULT_SESSION_RETENTION_MS + 1000),
+    });
+    const fresh = rec({
+      status: 'completed',
+      updatedAt: agoIso(DEFAULT_SESSION_RETENTION_MS - 60_000),
+    });
+    seed(home, [stale, fresh]);
+    const d = await createDaemon({
+      home,
+      adapters: new Map<Provider, CodingAgentAdapter>([['codex', new FakeAdapter('codex')]]),
+      secretStore: new MemorySecretStore(),
+    });
+    await d.start();
+    try {
+      expect(d.sessions.get(stale.sessionId as string)).toBeNull();
+      expect(d.sessions.get(fresh.sessionId as string)?.status).toBe('completed');
     } finally {
       await d.stop();
     }

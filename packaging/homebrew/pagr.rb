@@ -1,10 +1,17 @@
 # typed: false
 # frozen_string_literal: true
 
-# Homebrew formula TEMPLATE for the Pagr bridge CLI.
+# Homebrew formula for the Pagr bridge CLI.
 #
-# This file is a template: `version`, `url`, and `sha256` are placeholders and MUST be replaced
-# on every release. See ../RELEASING.md § "Bump the Homebrew formula" for the exact commands.
+# Two lines below are rewritten mechanically on every release by `node scripts/release.mjs`
+# (see ../RELEASING.md § "Bump the Homebrew formula"):
+#
+#   * `version "..."` — set to the version just published to npm. `url` interpolates it, so the
+#     URL itself is real and never needs editing by hand.
+#   * `sha256 "..."`  — the digest of that published tarball. The all-zero value checked in here
+#     is a deliberate placeholder: the digest cannot exist until the tarball is on the registry,
+#     and `brew install` refuses a mismatched digest, so the placeholder can never install
+#     anything. The release script substitutes the real one.
 #
 # The formula installs the published npm tarball of `@pagr/cli` with Homebrew's bundled Node,
 # which is why there is no build step here and no lockfile to keep in sync. `pagr` is a pure
@@ -13,10 +20,12 @@
 class Pagr < Formula
   desc "Connect your Mac's Claude Code and Codex sessions to Pagr"
   homepage "https://github.com/pagrdev/bridge"
-  # RELEASE: replace VERSION with the published @pagr/cli version (no leading `v`).
-  url "https://registry.npmjs.org/@pagr/cli/-/cli-VERSION.tgz"
-  version "VERSION"
-  # RELEASE: shasum -a 256 of the tarball above.
+  # RELEASE: `scripts/release.mjs` rewrites this line. Declared before `url` so the interpolation
+  # below resolves; no leading `v`.
+  version "0.1.0"
+  url "https://registry.npmjs.org/@pagr/cli/-/cli-#{version}.tgz"
+  # RELEASE: `scripts/release.mjs` rewrites this line with `shasum -a 256` of the tarball above.
+  # All zeros = not yet released.
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Apache-2.0"
 
@@ -44,7 +53,9 @@ class Pagr < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/pagr --version")
-    # `doctor` runs entirely locally and exits non-zero when unpaired; just prove it runs.
+    # `pagr doctor` exits 0 on an unpaired machine, but it probes the login Keychain, which
+    # `brew test`'s sandbox has no session for. `--help` is the part that is safe to assert here;
+    # the unpaired `doctor` run is covered by RELEASING.md § "Post-release smoke".
     system bin/"pagr", "--help"
   end
 end
