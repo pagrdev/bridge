@@ -468,7 +468,10 @@ export function registerConnect(program: Command, getCtx: () => CliContext): voi
   program
     .command('connect')
     .description('pair this Mac with your Pagr account and install the background daemon')
-    .option('--api-url <url>', 'Pagr API base URL (default: $PAGR_API_URL or https://api.pagr.dev)')
+    .option(
+      '--api-url <url>',
+      'Pagr API base URL (default: $PAGR_API_URL; required — this build has no hosted default)',
+    )
     .option('--gateway-url <url>', 'override the gateway WebSocket URL returned by pairing')
     .option('--name <deviceName>', 'device name shown in the dashboard (default: hostname)')
     .option('--no-daemon', 'do not install the launchd agent')

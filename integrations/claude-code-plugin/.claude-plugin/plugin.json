@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "author": {
     "name": "Stagberry Labs LLC",
-    "url": "https://pagr.dev"
+    "url": "https://github.com/pagrdev/bridge"
   },
-  "homepage": "https://pagr.dev/docs/claude-code",
+  "homepage": "https://github.com/pagrdev/bridge#readme",
   "repository": "https://github.com/pagrdev/bridge",
   "license": "Apache-2.0",
   "keywords": ["pagr", "remote", "mobile", "approvals", "coding-agents", "setup"],

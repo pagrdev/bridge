@@ -71,7 +71,7 @@ The fix is the setup sequence above, not anything in the assistant.
 
 ## Where to send people
 
-- Setup after connecting from an assistant: https://pagr.dev/from-claude
-- Connector and tool reference: https://pagr.dev/docs/mcp
-- Security model: https://pagr.dev/security
-- Support: support@pagr.dev
+- Setup after connecting from an assistant: `<your Pagr web URL>/from-claude`
+- Connector and tool reference: `<your Pagr web URL>/docs/mcp`
+- Security model: https://github.com/pagrdev/bridge/blob/main/docs/SECURITY.md
+- Support: https://github.com/pagrdev/bridge/issues

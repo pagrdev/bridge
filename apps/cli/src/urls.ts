@@ -1,9 +1,32 @@
 import type { BridgeConfig } from '@pagr/bridge-core';
+import { CliError, EXIT } from './errors.js';
 
-export const PROD_API_URL = 'https://api.pagr.dev';
-export const PROD_WEB_URL = 'https://app.pagr.dev';
+/**
+ * The hosted deployment this build points at when the user has not chosen one.
+ *
+ * Both are deliberately `null`: Stagberry Labs does not own a production domain yet, and the
+ * previous values (`api.pagr.dev` / `app.pagr.dev`) belong to an unrelated company. A published
+ * CLI carrying them would have sent every customer's pairing request — device name, public key,
+ * platform — to a stranger's server. Failing loudly is the only safe default until the domain
+ * exists.
+ *
+ * To point this build at a deployment, set BOTH constants here and nothing else: every other
+ * module resolves through `resolveApiUrl` / `resolveWebUrl`. Until then users pass `--api-url`
+ * or `PAGR_API_URL`, which has always taken precedence anyway.
+ */
+export const PROD_API_URL: string | null = null;
+export const PROD_WEB_URL: string | null = null;
 export const DEV_API_URL = 'http://localhost:4000';
 export const DEV_WEB_URL = 'http://localhost:3000';
+
+/** Raised instead of silently contacting a host nobody chose. */
+export const noApiUrlError = (): CliError =>
+  new CliError('no Pagr API URL is configured', EXIT.usage, {
+    code: 'no_api_url',
+    hint: 'pass `--api-url https://<your-pagr-api>` or set `PAGR_API_URL`',
+    detail:
+      'this build has no default hosted API. Ask whoever runs your Pagr deployment for its URL.',
+  });
 
 export const isDev = (env: NodeJS.ProcessEnv): boolean =>
   env.PAGR_ENV === 'development' || env.NODE_ENV === 'development' || env.PAGR_DEV === '1';
@@ -31,10 +54,9 @@ export function resolveApiUrl(
   flag?: string,
   config?: BridgeConfig,
 ): string {
-  return (configuredApiUrl(env, flag, config) ?? (isDev(env) ? DEV_API_URL : PROD_API_URL)).replace(
-    /\/$/,
-    '',
-  );
+  const chosen = configuredApiUrl(env, flag, config) ?? (isDev(env) ? DEV_API_URL : PROD_API_URL);
+  if (!chosen) throw noApiUrlError();
+  return chosen.replace(/\/$/, '');
 }
 
 /**
@@ -58,5 +80,26 @@ export function resolveWebUrl(
       // fall through
     }
   }
-  return isDev(env) ? DEV_WEB_URL : PROD_WEB_URL;
+  const fallback = isDev(env) ? DEV_WEB_URL : PROD_WEB_URL;
+  if (!fallback) throw noApiUrlError();
+  return fallback;
+}
+
+/**
+ * `resolveWebUrl`, but `null` instead of throwing when no dashboard URL can be worked out.
+ *
+ * For places where the URL is a courtesy rather than the point of the command — `pagr logout`
+ * naming the page where you can also revoke the device, for instance. Those must still do their
+ * real work on a machine that was never pointed at a deployment.
+ */
+export function tryResolveWebUrl(
+  env: NodeJS.ProcessEnv,
+  config?: BridgeConfig,
+  flag?: string,
+): string | null {
+  try {
+    return resolveWebUrl(env, config, flag);
+  } catch {
+    return null;
+  }
 }

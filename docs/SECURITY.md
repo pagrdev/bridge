@@ -230,6 +230,8 @@ repository.
 
 ## Reporting a vulnerability
 
-Email **security@pagr.dev** with a description and reproduction. Please do not open a public issue for
+Report privately through GitHub Security Advisories at
+https://github.com/pagrdev/bridge/security/advisories/new, with a description and reproduction.
+Please do not open a public issue for
 anything exploitable. We aim to acknowledge within 2 business days and to ship a fix, with credit if you
 want it, before public disclosure.
