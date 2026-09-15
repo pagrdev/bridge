@@ -45,7 +45,7 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 070
 
 | What you see | What happened | What to do |
 | --- | --- | --- |
-| `cannot resolve api.pagr.dev` | DNS | check the network; `--api-url` / `PAGR_API_URL` for a local stack |
+| `cannot resolve <your api host>` | DNS | check the network; `--api-url` / `PAGR_API_URL` for a local stack |
 | `… refused the connection` | nothing listening at that URL | fix `--api-url` / `PAGR_API_URL` |
 | `… did not respond (connection timed out)` | outbound TLS blocked | the bridge only needs outbound 443; check VPN/proxy |
 | `… returned an HTML page, not JSON` | captive portal / proxy / wrong URL | see the table above |

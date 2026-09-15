@@ -1,6 +1,6 @@
 # Pagr plugin for Claude Code
 
-Two commands and a skill that make setting up and troubleshooting [Pagr](https://pagr.dev)
+Two commands and a skill that make setting up and troubleshooting [Pagr](https://github.com/pagrdev/bridge)
 something you can do without leaving Claude Code.
 
 > Pagr is a paid product from Stagberry Labs. This plugin is not affiliated with or endorsed by

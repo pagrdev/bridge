@@ -6,7 +6,7 @@ Walk the user through connecting this Mac to Pagr. Do the steps in order and sto
 that fails — later steps depend on earlier ones.
 
 Pagr is a separate paid product from Stagberry Labs. It is not affiliated with or endorsed by
-Anthropic. If the user does not have an account, point them at https://pagr.dev and stop; do not
+Anthropic. If the user does not have an account, point them at your Pagr deployment's sign-up page and stop; do not
 attempt to create one.
 
 **1. Is the CLI installed?**

@@ -5,7 +5,7 @@ import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, socketPath } from '../ipc.js';
 import { bold, dim, ok, printJson, warn } from '../output.js';
-import { resolveWebUrl } from '../urls.js';
+import { tryResolveWebUrl } from '../urls.js';
 
 export interface LogoutResult {
   deviceId: string | null;
@@ -43,12 +43,14 @@ export async function runLogout(
   // Only clear a stale socket: a daemon still answering (e.g. a foreground `daemon run`) keeps it.
   const sock = socketPath(ctx);
   if (existsSync(sock) && !(await daemonStatus(ctx))) rmSync(sock, { force: true });
+  const revokeBase = tryResolveWebUrl(ctx.env, config);
   const result: LogoutResult = {
     deviceId: config.deviceId ?? null,
     launchAgentRemoved: removedAgent,
     storeKind: store.kind,
     removed,
-    revokeUrl: config.deviceId ? `${resolveWebUrl(ctx.env, config)}/app/devices` : null,
+    // A courtesy link, not the job: a Mac that was never pointed at a deployment still logs out.
+    revokeUrl: revokeBase && config.deviceId ? `${revokeBase}/app/devices` : null,
   };
   if (!report) return result;
   if (ctx.json) {
@@ -66,10 +68,16 @@ export async function runLogout(
         : `config removed ${dim('(projects kept; use --purge to drop them)')}`,
     ),
   );
-  if (result.revokeUrl) {
+  // Logging out only clears this Mac. The device is still registered on the account until it is
+  // revoked, so say so even when we cannot work out the dashboard's URL to link to.
+  if (config.deviceId) {
     ctx.out('');
     ctx.out(
-      warn(`also revoke ${bold(config.deviceId ?? '')} from the dashboard: ${result.revokeUrl}`),
+      warn(
+        result.revokeUrl
+          ? `also revoke ${bold(config.deviceId)} from the dashboard: ${result.revokeUrl}`
+          : `also revoke ${bold(config.deviceId)} from your Pagr dashboard, under Devices`,
+      ),
     );
   }
   return result;
