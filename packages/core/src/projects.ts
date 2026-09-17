@@ -460,6 +460,35 @@ function realpathNearest(p: string): string {
 }
 
 /**
+ * The nearest enclosing git working tree, or null when there is none above `startPath`.
+ *
+ * Used for a directory nobody has registered: somebody running `claude` three folders deep inside
+ * a repository is working on that repository, so the session is reported under the repository's
+ * id rather than under a different id for every subdirectory they happen to `cd` into. Walks up
+ * with `existsSync` — no git subprocess, and it stops at the filesystem root and at the user's
+ * home, because neither is a project.
+ *
+ * `.git` may be a directory (a clone) or a file (a worktree or submodule); both count, and both
+ * are the tree that is actually being edited.
+ */
+export function nearestGitRoot(startPath: string, opts: { home?: string } = {}): string | null {
+  let cur: string;
+  try {
+    cur = realpathNearest(resolve(startPath));
+  } catch {
+    return null;
+  }
+  const stopAt = safeRealpath(opts.home ?? homedir());
+  for (;;) {
+    if (cur === stopAt) return null;
+    if (existsSync(join(cur, '.git'))) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+/**
  * Read `.git/config` (no git subprocess) to extract remote origin host/name and the default
  * branch (from `.git/refs/remotes/origin/HEAD` or `init.defaultBranch`).
  */

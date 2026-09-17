@@ -414,6 +414,17 @@ export function mapToolKind(toolName: string): ToolKind {
   }
 }
 
+/**
+ * Dedupe key for one block of one line.
+ *
+ * A line read twice — over stdio and again out of the transcript, or after a rotation sent the
+ * tailer back to the start of a file — must produce the frame once. Claude gives no per-block id,
+ * so the line's own `uuid` plus the block's position is what says "the same block", and both
+ * readers derive it the same way so their frames collide in the journal instead of doubling up.
+ */
+export const blockFrameId = (uuid: string | undefined, index: number): string | undefined =>
+  uuid ? `${uuid}:${index}` : undefined;
+
 export function filePathsOf(input: Record<string, unknown>): string[] {
   return ['file_path', 'notebook_path', 'path'].flatMap((k) =>
     typeof input[k] === 'string' ? [input[k] as string] : [],

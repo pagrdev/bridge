@@ -78,6 +78,53 @@ export {
   type UserBlock,
   userMessageLine,
 } from './stream-json.js';
+export {
+  type ClaudeProcessInfo,
+  ClaudeProcessWatch,
+  type ClaudeProcessWatchOptions,
+  cwdOfTranscript,
+  type DiscoveryEvent,
+  isProcessAlive,
+  ORPHAN_WINDOW_MS,
+  readPidFile,
+} from './transcript/discovery.js';
+export {
+  ClaudeMirror,
+  type ClaudeMirrorOptions,
+  originOf,
+  syntheticClaudeSessionId,
+} from './transcript/mirror.js';
+export {
+  encodeProjectDir as encodeClaudeProjectDir,
+  isLiveTranscriptName,
+  pidOfSessionFile,
+  projectDirFor,
+  projectsDir,
+  sessionFile,
+  sessionIdOfTranscript,
+  sessionsDir,
+  spillDir,
+  subagentIdOfFile,
+  subagentMetaFile,
+  subagentsDir,
+} from './transcript/paths.js';
+export {
+  IGNORED_RECORD_TYPES,
+  parseSubagentMeta,
+  parseTranscriptRecord,
+  readSpilledOutput,
+  type SubagentMeta,
+  type TranscriptBody,
+  type TranscriptRecord,
+  UnknownRecordTypes,
+} from './transcript/records.js';
+export {
+  type TailedRecord,
+  type TailerFileState,
+  TailerStateStore,
+  TranscriptTailer,
+  type TranscriptTailerOptions,
+} from './transcript/tailer.js';
 
 export interface CreateClaudeAdapterOptions extends Partial<Omit<ClaudeAdapterOptions, 'home'>> {
   home?: string;

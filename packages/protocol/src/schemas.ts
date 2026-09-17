@@ -437,6 +437,16 @@ export const SessionSummaryV2 = SessionSummary.extend({
   projectStatus: ProjectStatus.optional(),
   /** Highest frame sequence the bridge has journaled for this session. */
   lastSeq: z.number().int().nonnegative().optional(),
+  /**
+   * Only on a session whose `projectStatus` is `unregistered`: the `rh_…` handle that
+   * `project.register_handle` turns into a project.
+   *
+   * It is what makes "somebody is running Claude in a folder Pagr does not know about" an
+   * actionable card instead of a dead end — one tap registers the folder and the session starts
+   * producing frames. It is a handle, not a path, it only resolves on the Mac that offered it,
+   * and it expires with the rest of them (`repoScan.ts`).
+   */
+  repoHandle: RepoHandle.optional(),
 });
 export type SessionSummaryV2 = z.infer<typeof SessionSummaryV2>;
 

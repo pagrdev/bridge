@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { DiffHunk, FrameBody } from '@pagr/bridge-core';
+import { encodeProjectDir, sessionFile } from './transcript/paths.js';
 
 /**
  * Diffs and terminal output for Claude's frames — from Claude's own record of what it did.
@@ -287,19 +288,15 @@ export function readPersistedOutput(
 // ---------- transcript fallback ----------
 
 /**
- * Claude's directory name for a working tree: `/`, space and `.` all become `-`.
- *
- * It is one-way — `-Users-me-my-app` could have been half a dozen paths — so the bridge only ever
- * encodes, never decodes. Verified 2026-09-17: cwd `/private/tmp/mob033-verify` produced
- * `~/.claude/projects/-private-tmp-mob033-verify/<session id>.jsonl`.
+ * Claude's directory-name encoding now lives with the rest of the transcript layout
+ * (`transcript/paths.ts`), which is where the mirror needs it. Re-exported here because callers
+ * of this module have imported it from here since MOB-033.
  */
-export function encodeProjectDir(cwd: string): string {
-  return cwd.replace(/[/ .]/g, '-');
-}
+export { encodeProjectDir };
 
 /** Where a bridge-spawned session's transcript lives. The bridge chose the session id, so it knows. */
 export function transcriptPathFor(home: string, cwd: string, claudeSessionId: string): string {
-  return path.join(home, '.claude', 'projects', encodeProjectDir(cwd), `${claudeSessionId}.jsonl`);
+  return sessionFile(home, cwd, claudeSessionId);
 }
 
 /** How much of the tail of a transcript is scanned for a result. */

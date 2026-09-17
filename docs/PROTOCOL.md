@@ -357,6 +357,57 @@ app-server daemon — are identical; what differs is the session: `controlLevel:
 
 Implementation: `packages/adapter-codex/src/{items,mirror,daemon,approvals}.ts`.
 
+## Control levels
+
+Every v2 `SessionSummary` says how much of the session Pagr may actually drive. It is derived on
+the Mac, from facts the Mac can check, and it is never widened by anything the cloud sends.
+
+| `controlLevel` | What the phone may do | When the bridge says it |
+|---|---|---|
+| `full` | start a turn, steer one, stop it, answer its prompts | a session Pagr started; or a Claude session with a **channel bound to that Claude session id** (opt-in through `pagr claude`, B8) |
+| `approvals_only` | watch, and answer the prompts it raises | a Claude session you started yourself, in a **registered** project, with the permission hook installed |
+| `mirror_only` | watch | a Claude session you started yourself in a registered project with **no hook installed**; a Codex thread owned by another process |
+| `none` | nothing, and no frames are produced at all | the session's working directory is in **no registered project** |
+
+The other two v2 fields go with it. `origin` is `pagr` for a session the bridge started,
+`terminal` for one found in your own shell, `ide` when the Claude process reports an `entrypoint`
+that is not the plain CLI (`claude-vscode` and friends), `unknown` otherwise. `projectStatus` is
+`registered` or `unregistered`.
+
+### Claude sessions you started yourself
+
+Discovery is `~/.claude/sessions/<pid>.json`, which Claude Code writes for every interactive
+process: `{pid, sessionId, cwd, entrypoint, name, version}`. Liveness is `process.kill(pid, 0)`,
+with `EPERM` counted as alive. A transcript touched in the last ten minutes whose pid file has
+gone is reported too, as a session whose liveness is unknown.
+
+The session id is `ses_` + a hash of `claude:<Claude session id>` — the **same** id the permission
+hook's adopted sessions get, so a terminal session that raises a prompt and the same session being
+tailed are one card on the phone, not two.
+
+Frames come from `~/.claude/projects/<encoded cwd>/<session>.jsonl` with `meta.source:
+'transcript'`, through the same mappers the stdio path uses, with the same `providerRecordId`s
+(`<record uuid>:<block index>`, `<tool_use_id>[:result|:terminal|:diff]`) — so a session the bridge
+is ALSO driving over its own pipe produces one frame per record, not two, and a transcript replayed
+after a rotation allocates no new sequence numbers. A subagent's frames carry
+`meta.subagent {id, depth}`, hang off the `Task` call in `meta.parentFrameId`, and have their record
+ids scoped by the subagent so two subagents cannot collide.
+
+`AskUserQuestion` is an ordinary `tool_call` with `toolKind: other` until B7 turns it into a
+`question` event. Adopted sessions still refuse `agent.send_instruction` and `agent.stop`.
+
+### An unregistered working directory
+
+A session in a folder you have not registered is still reported — someone really is running
+`claude` there — but with `controlLevel: 'none'`, `projectStatus: 'unregistered'`, **no frames**,
+a `projectId` derived from the nearest enclosing git root, a `displayName` of that folder's
+basename, and a `repoHandle`. One `project.register_handle` with that handle registers the folder;
+the next refresh re-evaluates the level and the frames start. `PAGR_MIRROR_UNREGISTERED=0` keeps
+the pre-B5 behaviour (the session is not reported at all); `PAGR_MIRROR=0` disables the mirror.
+
+Implementation: `packages/adapter-claude/src/transcript/{paths,records,tailer,discovery,mirror}.ts`
+and `packages/core/src/mirrorBridge.ts`.
+
 ## Approval hints
 
 `hints` are deterministic booleans computed locally by adapters (`touchesOutsideProject`, `networkAccess`,

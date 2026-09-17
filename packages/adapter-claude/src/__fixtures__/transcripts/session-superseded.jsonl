@@ -1,0 +1,2 @@
+{"uuid": "u90", "parentUuid": "u89", "sessionId": "11111111-2222-3333-4444-555555555555", "cwd": "/tmp/pagr-mirror-fixture", "timestamp": "2026-09-17T10:00:09.000Z", "type": "user", "message": {"role": "user", "content": "Earlier attempt"}}
+{"uuid": "u91", "parentUuid": "u90", "sessionId": "11111111-2222-3333-4444-555555555555", "cwd": "/tmp/pagr-mirror-fixture", "timestamp": "2026-09-17T10:00:09.000Z", "type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Starting over."}]}}

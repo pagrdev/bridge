@@ -33,6 +33,7 @@ export {
   writeNodeLauncher,
 } from './launchAgent.js';
 export * from './logging.js';
+export * from './mirrorBridge.js';
 export * from './pairing.js';
 export * from './paths.js';
 export * from './policy.js';

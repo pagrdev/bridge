@@ -1,0 +1,6 @@
+{
+  "agentType": "Explore",
+  "description": "find the other health endpoints",
+  "toolUseId": "toolu_task1",
+  "spawnDepth": 1
+}
