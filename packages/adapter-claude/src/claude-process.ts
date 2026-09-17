@@ -3,8 +3,10 @@ import { EventEmitter } from 'node:events';
 import type { FileLogger } from './logger.js';
 import {
   controlResponseLine,
-  parseStreamLine,
+  legacyEvent,
+  parseStreamRecord,
   type StreamEvent,
+  type StreamRecord,
   userMessageLine,
 } from './stream-json.js';
 
@@ -77,7 +79,15 @@ export const READ_ONLY_DISALLOWED_TOOLS =
   'Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,Task,Agent';
 
 export interface ClaudeProcessEvents {
+  /** The collapsed, one-per-line view every status listener has always read. */
   event: [StreamEvent];
+  /**
+   * The same line with nothing collapsed — every content block, and the `tool_use_result` sidecar.
+   *
+   * Emitted after `event` for the same line, so a listener of both sees the summary it has always
+   * seen before the frames that elaborate on it. Parsed once; the two are two views, not two reads.
+   */
+  record: [StreamRecord];
   exit: [{ code: number | null; signal: NodeJS.Signals | null }];
 }
 
@@ -161,8 +171,11 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       while (i >= 0) {
         const line = this.buf.slice(0, i);
         this.buf = this.buf.slice(i + 1);
-        const ev = parseStreamLine(line);
-        if (ev.type !== 'invalid') this.emit('event', ev);
+        const record = parseStreamRecord(line);
+        if (record.type !== 'invalid') {
+          this.emit('event', legacyEvent(record));
+          this.emit('record', record);
+        }
         i = this.buf.indexOf('\n');
       }
     });

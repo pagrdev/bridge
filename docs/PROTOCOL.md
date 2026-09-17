@@ -219,6 +219,56 @@ how much is waiting).
 Implementation: `packages/core/src/{frames,journal}.ts`, `Dispatcher.emitFrame`,
 `GatewayClient.resume`.
 
+### Frame bodies
+
+The body inside the seal is one of: `assistant {text}`, `thinking {text}`, `user {text, images?}`,
+`tool_call {toolCallId, toolName, toolKind, title, input}`, `tool_result {toolCallId, content,
+isError}`, `diff {path, changeKind: add|update|delete, oldText?, newText?, hunks?, approx?}`,
+`terminal {command, stdout, stderr, exitCode?, interrupted}`, `question {questions[]}`,
+`approval_preview {preview, suggestions?}`, `system {subtype, text}`. Two field names differ from
+the shared contract's table only because a discriminated union cannot carry two `kind`s: the ACP
+tool kind is `toolKind` and the diff's add/update/delete is `changeKind`.
+
+`approx: true` on a diff means the bridge reconstructed the hunks from the replacement strings
+because the agent supplied none: no context lines, and line numbers starting at 1. The phone is
+told rather than shown a patch that looks authoritative and is not.
+
+### Claude Code → frames
+
+One frame per content block, in the order Claude emitted them. `meta.parentFrameId` is the
+`tool_use_id` on the call itself and on everything downstream of it — the result, the command
+output, the patch — which is all the phone needs to group them.
+
+| Claude block / result | Frame | Notes |
+|---|---|---|
+| `thinking` | `thinking` | `signature` dropped; it is a model artefact |
+| `text` | `assistant` | the turn's final text also becomes the `completed` session event, as before |
+| `tool_use` | `tool_call` | every one of them, not just the first in a message |
+| `tool_result` | `tool_result` | `meta.status` is `error` when `is_error` |
+| `tool_result` of a `Bash` call | + `terminal` | streams split from `tool_use_result`; `persistedOutputPath` read in full for the journal, tail-biased on the wire |
+| `tool_result` of an `Edit`/`Write`/`MultiEdit`/`NotebookEdit` call | + `diff` | Claude's own `structuredPatch` + `originalFile` |
+| unrecognised block type | — | no frame; logged once per type, never silently dropped |
+
+`tool_use_result` rides on the stream-json `user` line under `--verbose`, which the bridge already
+passes (verified 2026-09-17 against Claude Code 2.1.220), so diffs and terminal output normally
+cost no file read. When it is absent the same object is in the session transcript
+(`~/.claude/projects/<cwd with /, space and . → ->/<session id>.jsonl`, as `toolUseResult`) and is
+read with a 2 s ceiling; past that the diff is the bridge's own and carries `approx: true`.
+
+`toolName` → `toolKind` (ACP), so a phone never needs a table of Claude's tool names:
+
+| `toolKind` | Claude tools |
+|---|---|
+| `read` | `Read`, `NotebookRead` |
+| `search` | `Glob`, `Grep` |
+| `edit` | `Edit`, `Write`, `MultiEdit`, `NotebookEdit` |
+| `execute` | `Bash`, `BashOutput`, `KillShell` |
+| `fetch` | `WebFetch`, `WebSearch` |
+| `switch_mode` | `ExitPlanMode` |
+| `other` | `Task`/`Agent`, `AskUserQuestion`, `TodoWrite`, every `mcp__*` tool, anything unrecognised |
+
+Implementation: `packages/adapter-claude/src/{stream-json,diffs}.ts` and `ClaudeAdapter.onRecord`.
+
 ## Approval hints
 
 `hints` are deterministic booleans computed locally by adapters (`touchesOutsideProject`, `networkAccess`,

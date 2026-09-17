@@ -24,6 +24,20 @@ export {
   SEALED_SETTING_SOURCES,
   sealedModeEnabled,
 } from './claude-process.js';
+export {
+  asToolUseResult,
+  type ClaudeToolUseResult,
+  diffBodyFor,
+  EDIT_TOOLS,
+  encodeProjectDir,
+  MAX_PERSISTED_OUTPUT_BYTES,
+  normalizeHunks,
+  readPersistedOutput,
+  TranscriptResultLookup,
+  terminalBodyFor,
+  transcriptPathFor,
+  unifiedFromReplace,
+} from './diffs.js';
 export { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 export {
   bundledHookPath,
@@ -51,11 +65,17 @@ export {
 } from './hooks/settings.js';
 export { MockClaudeAdapter, type MockClaudeOptions } from './mock.js';
 export {
+  type AssistantBlock,
   actionTypeForTool,
   controlResponseLine,
+  legacyEvent,
+  mapToolKind,
   parseStreamLine,
+  parseStreamRecord,
   previewForTool,
   type StreamEvent,
+  type StreamRecord,
+  type UserBlock,
   userMessageLine,
 } from './stream-json.js';
 

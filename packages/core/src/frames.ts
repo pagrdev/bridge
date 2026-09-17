@@ -106,6 +106,16 @@ export const FrameBody = z.discriminatedUnion('kind', [
     oldText: z.string().optional(),
     newText: z.string().optional(),
     hunks: z.array(DiffHunk).optional(),
+    /**
+     * True when the bridge computed these hunks itself instead of reading the agent's own.
+     *
+     * Claude records a `structuredPatch` for every edit it makes and that is what a diff frame
+     * normally carries. When it is missing — an older CLI, a tool that does not produce one — the
+     * bridge reconstructs a hunk from the replacement strings alone, which has no surrounding
+     * context and no true line numbers. The phone is told, rather than shown a diff that looks
+     * authoritative and is not.
+     */
+    approx: z.boolean().optional(),
   }),
   z.object({
     kind: z.literal('terminal'),
