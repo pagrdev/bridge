@@ -1,6 +1,7 @@
 import { release } from 'node:os';
 import {
   type AgentConnectionStatus,
+  type ApprovalOption,
   type CommandBody,
   type CommandPayload,
   canonicalize,
@@ -104,6 +105,11 @@ export interface ApprovalRequest extends Omit<PendingApprovalInput, 'onResolve' 
    * on the Mac, into the assessment the device floor judges a cloud `allow` against.
    */
   local?: LocalActionDetail;
+  /**
+   * v2. The agent's own option list, forwarded to the phone as-is. Not stored on the record: the
+   * bridge answers the agent with what the cloud sends back, and never with a remembered option.
+   */
+  options?: ApprovalOption[];
   /** Resolved exactly once. `decision` is null for timeouts / provider-side / shutdown. */
   onDecision: (
     decision: ApprovalDecision | null,
@@ -1081,7 +1087,7 @@ export class Dispatcher {
    * consumed the entry by the time this runs, so a failed relay cannot be answered a second time.
    */
   requestApproval(input: ApprovalRequest): PendingApproval {
-    const { onDecision, local, ...rest } = input;
+    const { onDecision, local, options, ...rest } = input;
     // Classified here, on the Mac, from what the provider asked for — before the cloud has been
     // told this prompt exists, and never from anything the cloud will later echo back.
     const assessment = classifyLocally({
@@ -1132,6 +1138,9 @@ export class Dispatcher {
       previewHash: record.previewHash,
       hints: record.hints,
       expiresAt: record.expiresAt,
+      // v2: the agent's own options travel with the request. A v1 cloud ignores the field and
+      // answers with `decision` alone, which is why it is never the only thing we send.
+      ...(options && options.length > 0 ? { options } : {}),
     });
     // Nothing decides it here. The prompt now waits for the person — on their phone, or in the
     // terminal the agent is running in, whichever answers first. The bridge used to auto-approve
@@ -1202,6 +1211,7 @@ export class Dispatcher {
           preview: e.preview,
           hints: e.hints,
           ...(e.local ? { local: e.local } : {}),
+          ...(e.options && e.options.length > 0 ? { options: e.options } : {}),
           expiresAt: e.expiresAt,
           onDecision: async (decision, _resolution, source) => {
             // The provider already knows when it resolved the request itself. Everything else —
@@ -1217,6 +1227,15 @@ export class Dispatcher {
         });
         return;
       }
+      case 'question_asked':
+        // B7 (MOB-036) owns the question registry and the `question.asked` event; the adapters
+        // already produce the event so that wiring is a dispatcher change and nothing else.
+        this.logger.debug('agent asked a question', {
+          sessionId: e.sessionId,
+          answerable: e.answerable,
+          questions: e.questions.length,
+        });
+        return;
       case 'approval_resolved_locally':
         // The provider already resolved it; do not call back into the adapter.
         await this.approvals.resolveLocally(e.approvalId, e.resolution).then((had) => {
@@ -1224,6 +1243,7 @@ export class Dispatcher {
             this.send('approval.resolved_locally', {
               approvalId: e.approvalId,
               resolution: e.resolution,
+              ...(e.answeredElsewhere ? { answeredElsewhere: true } : {}),
             });
         });
         return;

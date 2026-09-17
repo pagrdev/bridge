@@ -4,10 +4,58 @@ import type { CodingAgentAdapter } from '@pagr/bridge-core';
 import { CodexAdapter, type CodexAdapterOptions } from './adapter.js';
 import { MockCodexAdapter, type MockCodexOptions } from './mock.js';
 
-export { buildInput, CodexAdapter, type CodexAdapterOptions, newApprovalId } from './adapter.js';
-export { AppServerClient, type AppServerOptions } from './app-server.js';
+export {
+  buildInput,
+  CodexAdapter,
+  type CodexAdapterOptions,
+  MIRROR_READ_ONLY,
+  mirrorStatus,
+  newApprovalId,
+} from './adapter.js';
+export {
+  AppServerClient,
+  type AppServerOptions,
+  type AppServerTransportSpec,
+} from './app-server.js';
+export {
+  commandApprovalOptions,
+  decisionForOption,
+  fileChangeApprovalOptions,
+  OPTION_LABELS,
+  permissionsApprovalOptions,
+  scopeForOption,
+} from './approvals.js';
+export {
+  CONTROL_SOCKET_FILE,
+  type CodexMode,
+  codexHomeDir,
+  controlSocketPath,
+  controlSocketPresent,
+  DAEMON_PROBE_TIMEOUT_MS,
+  DAEMON_START_HINT,
+  type DaemonProbeResult,
+  type DoctorLine,
+  daemonDoctorLine,
+  probeDaemon,
+  versionFromUserAgent,
+} from './daemon.js';
 export { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
+export {
+  DeltaCoalescer,
+  framesForItem,
+  framesForTurns,
+  type MappedFrame,
+  parseUnifiedDiff,
+  STREAM_FLUSH_BYTES,
+  STREAM_FLUSH_MS,
+} from './items.js';
 export { classifyLine, encode, LineBuffer } from './jsonrpc.js';
+export {
+  IDLE_UNSUBSCRIBE_MS,
+  type MirroredThread,
+  READ_POLL_INTERVAL_MS,
+  TerminalThreadMirror,
+} from './mirror.js';
 export { MockCodexAdapter, type MockCodexOptions } from './mock.js';
 export * as CodexProtocol from './protocol.js';
 

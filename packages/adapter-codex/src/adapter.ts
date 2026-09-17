@@ -7,16 +7,37 @@ import type {
   AdapterEvent,
   AgentConnectionStatus,
   CodingAgentAdapter,
+  FrameQuestion,
   LocalActionDetail,
   SendInstructionInput,
   SessionSummary,
+  SessionSummaryV2,
   StartSessionInput,
 } from '@pagr/bridge-core';
-import { AppServerClient } from './app-server.js';
+import { syntheticSessionId, UNREGISTERED_PROJECT } from '@pagr/bridge-core';
+import type { ApprovalOption } from '@pagr/protocol';
+import { AppServerClient, type AppServerTransportSpec } from './app-server.js';
+import {
+  commandApprovalOptions,
+  decisionForOption,
+  fileChangeApprovalOptions,
+  permissionsApprovalOptions,
+  scopeForOption,
+} from './approvals.js';
+import {
+  codexHomeDir,
+  controlSocketPath,
+  controlSocketPresent,
+  DAEMON_PROBE_TIMEOUT_MS,
+} from './daemon.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles, relativizePaths } from './heuristics.js';
+import { DeltaCoalescer, framesForItem, framesForTurns, type MappedFrame } from './items.js';
 import { FileLogger } from './logger.js';
+import { type MirroredThread, TerminalThreadMirror } from './mirror.js';
 import {
   type AgentMessageDeltaNotification,
+  type ApprovalDecision,
+  type CommandExecutionOutputDeltaNotification,
   type CommandExecutionRequestApprovalParams,
   type ErrorNotification,
   type FileChangeRequestApprovalParams,
@@ -26,14 +47,20 @@ import {
   NOTIFICATIONS,
   type PermissionsRequestApprovalParams,
   type PermissionsRequestApprovalResponse,
+  type ReasoningTextDeltaNotification,
   type RpcId,
   type RpcNotification,
   type RpcRequest,
   SERVER_REQUESTS,
+  type ThreadReadResponse,
   type ThreadResumeParams,
   type ThreadStartParams,
   type ThreadStartResponse,
+  type ThreadStatus,
   type ThreadStatusChangedNotification,
+  type ToolRequestUserInputParams,
+  type ToolRequestUserInputQuestion,
+  type ToolRequestUserInputResponse,
   type TurnCompletedNotification,
   type TurnStartedNotification,
   type TurnStartResponse,
@@ -68,10 +95,34 @@ export interface CodexAdapterOptions {
   idleShutdownMs?: number;
   /** Disable file logging (tests). */
   log?: boolean;
+
+  // ---- shared daemon (B9) ----
+
+  /** Attach to the user's shared app-server daemon when its control socket is there. Default on. */
+  attachDaemon?: boolean;
+  /** Control socket path. Defaults to `<codexHome>/app-server-control/app-server-control.sock`. */
+  controlSocketPath?: string;
+  /** Mirror terminal threads hosted by the daemon. Default on whenever attached. */
+  mirror?: boolean;
+  /**
+   * Which registered project a directory belongs to. Without it every mirrored thread is
+   * `projectStatus: 'unregistered'` — known locally, never described to the cloud, because a
+   * `SessionSummary` has to name a `proj_…` id.
+   */
+  resolveProject?: (cwd: string) => { projectId: string; projectPath: string } | null;
+  /** Emit transcript frames. Off in tests that only care about session events. */
+  frames?: boolean;
+  /** Budget for the daemon's `initialize` before we fall back to a child. */
+  daemonProbeTimeoutMs?: number;
+  discoveryIntervalMs?: number;
+  readPollIntervalMs?: number;
+  idleUnsubscribeMs?: number;
+  streamFlushMs?: number;
+  streamFlushBytes?: number;
 }
 
 interface LiveSession {
-  summary: SessionSummary;
+  summary: SessionSummaryV2;
   threadId: string;
   projectPath: string;
   readOnly: boolean;
@@ -88,6 +139,13 @@ interface LiveSession {
    * response is still a queued microtask.
    */
   observedTurnIds: Set<string>;
+  /**
+   * This thread belongs to somebody else's terminal. Pagr streams it and may relay its approvals;
+   * it never starts a turn, never steers, never answers a question and never stops it.
+   */
+  mirror?: boolean;
+  /** `commandExecution` item id → the command line, so an output chunk is self-describing. */
+  commands?: Map<string, string>;
 }
 
 /** Enough to cover a coalesced chunk; the set is per session and pruned on every insert. */
@@ -101,9 +159,33 @@ interface PendingApproval {
   kind: 'command' | 'file' | 'permissions';
   timer: NodeJS.Timeout;
   requested: PermissionsRequestApprovalParams['permissions'] | null;
+  /**
+   * The request belongs to a thread we only mirror. Every subscriber received the same request
+   * id and the first answer wins (MOB-043 finding 5), so the bridge writes an answer ONLY when
+   * the phone chose one — never on a timeout, a cancel or a shutdown.
+   */
+  mirror?: boolean;
+}
+
+/** One `item/tool/requestUserInput` waiting for an answer. */
+interface PendingQuestion {
+  rpcId: RpcId;
+  sessionId: string;
+  threadId: string;
+  itemId: string;
+  questions: ToolRequestUserInputQuestion[];
+  answerable: boolean;
 }
 
 export const newApprovalId = (): string => `apr_${randomUUID().replace(/-/g, '')}`;
+
+/** A mirrored thread's status, from the only thing a mirror gets to see. */
+export function mirrorStatus(status: ThreadStatus | undefined): SessionSummary['status'] {
+  if (status?.type !== 'active') return 'idle';
+  if (status.activeFlags.includes('waitingOnApproval')) return 'waiting_for_approval';
+  if (status.activeFlags.includes('waitingOnUserInput')) return 'waiting_for_user';
+  return 'working';
+}
 const now = () => new Date().toISOString();
 
 const TERMINAL = new Set<SessionSummary['status']>(['completed', 'failed', 'stopped']);
@@ -142,6 +224,10 @@ const CAPABILITIES = {
 
 const INSTALL_HINT = 'Install Codex: npm i -g @openai/codex, then run `codex login`';
 
+/** Said out loud rather than silently ignored: a mirrored thread is somebody else's to drive. */
+export const MIRROR_READ_ONLY =
+  'this Codex thread belongs to a terminal session; Pagr mirrors it and relays its approvals, but cannot steer or stop it';
+
 /** How long `codex --version` is trusted before forking again. */
 const VERSION_CACHE_MS = 5 * 60_000;
 
@@ -179,12 +265,32 @@ export class CodexAdapter implements CodingAgentAdapter {
   private versionCache: { value: string | null; atMs: number } | null = null;
   /** Armed whenever the app-server has nothing left to do. */
   private idleTimer: NodeJS.Timeout | null = null;
+  /** Terminal threads hosted by the shared daemon. Null while we run our own child. */
+  private mirror: TerminalThreadMirror | null = null;
+  /** Deltas → streaming frames. One per adapter; keyed internally by item. */
+  private readonly coalescer: DeltaCoalescer;
+  private readonly questions = new Map<string, PendingQuestion>();
 
   constructor(private readonly opts: CodexAdapterOptions) {
     this.logger = new FileLogger(
       opts.log === false ? null : path.join(opts.home, 'logs', 'codex.log'),
     );
     this.map = new SessionMap(path.join(opts.home, 'codex-sessions.json'));
+    this.coalescer = new DeltaCoalescer({
+      emit: (frame, owner) => this.onStreamFrame(owner, frame),
+      ...(opts.streamFlushMs !== undefined ? { flushMs: opts.streamFlushMs } : {}),
+      ...(opts.streamFlushBytes !== undefined ? { flushBytes: opts.streamFlushBytes } : {}),
+    });
+  }
+
+  /** The socket the shared daemon would be listening on, whether or not it is. */
+  private controlSocket(): string {
+    if (this.opts.controlSocketPath) return this.opts.controlSocketPath;
+    const home =
+      this.opts.codexHome ??
+      this.opts.env?.CODEX_HOME ??
+      codexHomeDir(this.opts.env ?? process.env);
+    return controlSocketPath(home);
   }
 
   // ---------- public API ----------
@@ -223,7 +329,9 @@ export class CodexAdapter implements CodingAgentAdapter {
     const auth = await this.authStatus();
     const status: AgentConnectionStatus = {
       provider: 'codex',
-      mode: 'app-server',
+      // Before anything is connected this is still just "the app server": which of the two links
+      // we would get is not known until we try, and probe() never connects.
+      mode: this.client?.running ? this.client.mode : 'app-server',
       installed: true,
       providerVersion: version,
       authStatus: auth.authStatus,
@@ -272,16 +380,21 @@ export class CodexAdapter implements CodingAgentAdapter {
     };
   }
 
-  async listSessions(): Promise<SessionSummary[]> {
+  async listSessions(): Promise<SessionSummaryV2[]> {
     // Bound what we remember before anyone copies it into a `device.hello` (BR-3).
     this.map.prune({ protect: new Set(this.sessions.keys()) });
-    const out = new Map<string, SessionSummary>();
+    const out = new Map<string, SessionSummaryV2>();
     for (const [sid, p] of this.map.entries()) out.set(sid, persistedSummary(sid, p));
-    for (const [sid, s] of this.sessions) out.set(sid, s.summary);
+    for (const [sid, s] of this.sessions) {
+      // A mirrored thread in an unregistered directory has no `proj_…` id to be described by,
+      // so it stays local: it is listed by `pagr sessions`, never by `device.hello`.
+      if (s.mirror && !s.summary.projectId) continue;
+      out.set(sid, s.summary);
+    }
     return [...out.values()];
   }
 
-  async getStatus(sessionId: string): Promise<SessionSummary | null> {
+  async getStatus(sessionId: string): Promise<SessionSummaryV2 | null> {
     const live = this.sessions.get(sessionId);
     if (live) return live.summary;
     const p = this.map.get(sessionId);
@@ -289,7 +402,7 @@ export class CodexAdapter implements CodingAgentAdapter {
     return persistedSummary(sessionId, p);
   }
 
-  async startSession(input: StartSessionInput): Promise<SessionSummary> {
+  async startSession(input: StartSessionInput): Promise<SessionSummaryV2> {
     const client = await this.ensureClient();
     const params: ThreadStartParams = {
       cwd: input.project.path,
@@ -353,6 +466,9 @@ export class CodexAdapter implements CodingAgentAdapter {
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
     const live = await this.requireLive(input.sessionId);
+    // The thread's own process holds its writer lock (openai/codex#44449): a second writer is
+    // refused by Codex itself, and pretending otherwise would lose the user's instruction.
+    if (live.mirror) throw new Error(MIRROR_READ_ONLY);
     const client = await this.ensureClient();
     if (live.activeTurnId) {
       if (input.mode === 'queue') {
@@ -375,6 +491,7 @@ export class CodexAdapter implements CodingAgentAdapter {
   async stopSession(sessionId: string): Promise<void> {
     const live = this.sessions.get(sessionId);
     if (!live) return;
+    if (live.mirror) throw new Error(MIRROR_READ_ONLY);
     live.queued = [];
     if (live.activeTurnId && this.client?.running) {
       try {
@@ -397,6 +514,8 @@ export class CodexAdapter implements CodingAgentAdapter {
     approvalId: string;
     providerRequestId: string;
     decision: 'allow' | 'deny';
+    /** v2. The agent's own option the user picked; `decision` is the v1 truth without it. */
+    optionId?: string;
   }): Promise<void> {
     const p = this.pending.get(input.approvalId);
     if (!p) throw new Error(`unknown or expired approval ${input.approvalId}`);
@@ -405,7 +524,7 @@ export class CodexAdapter implements CodingAgentAdapter {
     }
     this.pending.delete(input.approvalId);
     clearTimeout(p.timer);
-    this.answer(p, input.decision === 'allow' ? 'accept' : 'decline');
+    this.answer(p, decisionForOption(input.optionId, input.decision), input.optionId);
     this.emit({
       kind: 'approval_resolved_locally',
       approvalId: p.approvalId,
@@ -423,7 +542,7 @@ export class CodexAdapter implements CodingAgentAdapter {
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
       this.pending.delete(p.approvalId);
-      this.answer(p, 'decline');
+      this.answer(p, 'decline', undefined, false);
       this.emit({
         kind: 'approval_resolved_locally',
         approvalId: p.approvalId,
@@ -502,6 +621,9 @@ export class CodexAdapter implements CodingAgentAdapter {
     this.clearIdleTimer();
     const ms = this.opts.idleShutdownMs ?? IDLE_SHUTDOWN_MS;
     if (ms <= 0 || this.shuttingDown || this.busy || !this.client?.running) return;
+    // Nothing to reclaim when we are attached to a daemon we did not start — and dropping the
+    // link would stop mirroring the user's terminal threads for no gain at all.
+    if (this.client.mode === 'app-server-daemon') return;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
       void this.stopIdleAppServer();
@@ -573,38 +695,250 @@ export class CodexAdapter implements CodingAgentAdapter {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
-    const [bin, ...rest] = this.opts.codexCommand ?? ['codex'];
-    const client = new AppServerClient({
-      command: [bin ?? 'codex', ...rest, 'app-server'],
-      clientVersion: this.opts.bridgeVersion ?? '0.1.0',
-      logger: this.logger,
-      ...(this.opts.requestTimeoutMs ? { requestTimeoutMs: this.opts.requestTimeoutMs } : {}),
-      ...(this.opts.env ? { env: { ...process.env, ...this.opts.env } } : {}),
-    });
-    client.on('notification', (n) => this.onNotification(n));
-    client.on('request', (r) => this.onServerRequest(r));
-    client.on('exit', (info) => this.onExit(info.expected));
-    this.client = client;
-    this.starting = client
-      .start()
-      .then(() => {
+    this.starting = this.connect()
+      .then((client) => {
         this.startedAtMs = Date.now();
         // Threads must be re-resumed in a fresh process.
         for (const s of this.sessions.values()) s.loaded = false;
+        if (client.mode === 'app-server-daemon') this.startMirror(client);
         return client;
       })
       .catch(async (err: Error) => {
-        // `start()` spawns first and rejects later (initialize timed out, or answered with an
+        // `start()` connects first and rejects later (initialize timed out, or answered with an
         // error). The child is still alive at that point, so dropping the reference without
         // stopping it would leak one `codex app-server` per attempt.
-        if (this.client === client) this.client = null;
-        await client.stop().catch(() => {});
+        const client = this.client;
+        this.client = null;
+        await client?.stop().catch(() => {});
         throw err;
       })
       .finally(() => {
         this.starting = null;
       });
     return this.starting;
+  }
+
+  /**
+   * Attach to the user's shared daemon if there is one; otherwise spawn our own child.
+   *
+   * The bridge never runs `codex app-server daemon start`: that command only works for the
+   * installer-managed standalone package (MOB-043 finding 1), so an npm install would see it fail
+   * every time. `pagr doctor` says so once, and this falls back to a private child — which is
+   * what every Codex user had before this existed.
+   */
+  private async connect(): Promise<AppServerClient> {
+    const socketPath = this.controlSocket();
+    if (this.daemonAttachEnabled() && controlSocketPresent(socketPath)) {
+      const client = this.newClient({ kind: 'daemon', socketPath });
+      try {
+        // The handshake is bounded (the daemon's own client allows 2 s); everything after it uses
+        // the ordinary request timeout, because a real turn is not a probe.
+        await withTimeout(
+          client.start(),
+          this.opts.daemonProbeTimeoutMs ?? DAEMON_PROBE_TIMEOUT_MS,
+          'codex daemon did not answer initialize',
+        );
+        this.logger.log('info', 'using the shared codex app-server daemon', { socketPath });
+        return client;
+      } catch (err) {
+        this.logger.log('warn', 'codex daemon did not answer; starting our own app-server', {
+          socketPath,
+          message: (err as Error).message,
+        });
+        await client.stop().catch(() => {});
+        if (this.client === client) this.client = null;
+      }
+    }
+    const [bin, ...rest] = this.opts.codexCommand ?? ['codex'];
+    const client = this.newClient({
+      kind: 'stdio',
+      command: [bin ?? 'codex', ...rest, 'app-server'],
+      ...(this.opts.env ? { env: { ...process.env, ...this.opts.env } } : {}),
+    });
+    await client.start();
+    return client;
+  }
+
+  /**
+   * Whether to look for a shared daemon at all.
+   *
+   * The default is yes — but only for the machine's own `codex`. A configured `codexCommand` is
+   * the operator saying WHICH Codex this bridge drives (a wrapper, a pinned build, a fake in
+   * tests); attaching to the daemon of a different installation would quietly talk to something
+   * they did not choose. Passing `controlSocketPath` is the explicit way to say "that one".
+   */
+  private daemonAttachEnabled(): boolean {
+    if (this.opts.attachDaemon !== undefined) return this.opts.attachDaemon;
+    if (this.opts.controlSocketPath) return true;
+    const cmd = this.opts.codexCommand;
+    return !cmd || (cmd.length === 1 && cmd[0] === 'codex');
+  }
+
+  private newClient(transport: AppServerTransportSpec): AppServerClient {
+    const client = new AppServerClient({
+      transport,
+      clientVersion: this.opts.bridgeVersion ?? '0.1.0',
+      logger: this.logger,
+      // `thread/loaded/list` and `thread/unsubscribe` are experimental-era APIs; the mirror needs
+      // them and asking costs nothing on a server that does not gate them.
+      experimentalApi: transport.kind === 'daemon',
+      ...(this.opts.requestTimeoutMs ? { requestTimeoutMs: this.opts.requestTimeoutMs } : {}),
+    });
+    client.on('notification', (n) => this.onNotification(n));
+    client.on('request', (r) => this.onServerRequest(r));
+    client.on('exit', (info) => this.onExit(info.expected));
+    this.client = client;
+    return client;
+  }
+
+  // ---- mirrored terminal threads (B9) ----
+
+  /** True for a thread this bridge started: its session is ours to drive. */
+  private ownsThread(threadId: string): boolean {
+    const sid = this.byThread.get(threadId);
+    const live = sid ? this.sessions.get(sid) : undefined;
+    if (live) return live.mirror !== true;
+    return this.map.findByThread(threadId) !== undefined;
+  }
+
+  private startMirror(client: AppServerClient): void {
+    if (this.opts.mirror === false || this.mirror) return;
+    const mirror = new TerminalThreadMirror({
+      request: (method, params) => client.request(method, params),
+      isOurs: (threadId) => this.ownsThread(threadId),
+      onThread: (t) => this.adoptMirroredThread(t),
+      onFrames: (threadId, frames) => {
+        const live = this.liveByThread(threadId);
+        if (live) this.emitFrames(live, frames);
+      },
+      logger: this.logger,
+      ...(this.opts.discoveryIntervalMs
+        ? { discoveryIntervalMs: this.opts.discoveryIntervalMs }
+        : {}),
+      ...(this.opts.readPollIntervalMs ? { pollIntervalMs: this.opts.readPollIntervalMs } : {}),
+      ...(this.opts.idleUnsubscribeMs ? { idleUnsubscribeMs: this.opts.idleUnsubscribeMs } : {}),
+    });
+    this.mirror = mirror;
+    mirror.start();
+    void mirror.discover().catch((err) =>
+      this.logger.log('warn', 'first codex thread discovery failed', {
+        message: (err as Error).message,
+      }),
+    );
+  }
+
+  /**
+   * Discovery on demand — one pass, now. Connects the app-server if it is not up, which is the
+   * same thing any other command does; it never starts a daemon.
+   */
+  async discoverTerminalThreads(): Promise<MirroredThread[]> {
+    await this.ensureClient();
+    if (!this.mirror) return [];
+    await this.mirror.discover();
+    return this.mirror.list();
+  }
+
+  /**
+   * A terminal thread becomes a session this Mac knows about: `mirror_only`, `origin: 'terminal'`.
+   *
+   * It is deliberately NOT written to `codex-sessions.json`. That file is the map of threads the
+   * bridge may resume, and resuming somebody else's terminal thread is exactly what the writer
+   * lock exists to prevent.
+   */
+  private adoptMirroredThread(t: MirroredThread): LiveSession {
+    const sessionId = syntheticSessionId('codex', t.threadId);
+    const existing = this.sessions.get(sessionId);
+    const project = t.cwd ? (this.opts.resolveProject?.(t.cwd) ?? null) : null;
+    const status = mirrorStatus(t.status);
+    if (existing) {
+      if (existing.summary.status !== status) this.setStatus(existing, status);
+      return existing;
+    }
+    const ts = now();
+    const summary: SessionSummaryV2 = {
+      sessionId,
+      projectId: project?.projectId ?? UNREGISTERED_PROJECT,
+      provider: 'codex',
+      status,
+      activeTurn: status === 'working',
+      startedAt: ts,
+      updatedAt: ts,
+      controlLevel: 'mirror_only',
+      origin: 'terminal',
+      projectStatus: project ? 'registered' : 'unregistered',
+      ...(t.preview ? { taskSummary: clip(t.preview, 500) } : {}),
+    };
+    const live: LiveSession = {
+      summary,
+      threadId: t.threadId,
+      projectPath: project?.projectPath ?? t.cwd,
+      readOnly: true,
+      activeTurnId: null,
+      loaded: true,
+      agentBuffers: new Map(),
+      lastAgentMessage: '',
+      queued: [],
+      observedTurnIds: new Set(),
+      mirror: true,
+      commands: new Map(),
+    };
+    this.sessions.set(sessionId, live);
+    this.byThread.set(t.threadId, sessionId);
+    this.logger.log('info', 'mirroring a terminal codex thread', {
+      sessionId,
+      hosting: t.hosting,
+      project: project?.projectId ?? 'none',
+    });
+    // A thread in a directory no project covers is real, and local: the cloud cannot be told
+    // about it, because a `SessionSummary` has to name a `proj_…` id.
+    if (live.summary.projectId) this.emit({ kind: 'session', session: summary });
+    return live;
+  }
+
+  // ---- frames ----
+
+  private emitFrames(live: LiveSession, frames: MappedFrame[]): void {
+    if (this.opts.frames === false || frames.length === 0) return;
+    if (!live.summary.projectId) return; // unregistered: journaled by nobody, sent to nobody
+    for (const f of frames) {
+      this.emit({
+        kind: 'frame',
+        sessionId: live.summary.sessionId,
+        projectId: live.summary.projectId,
+        body: f.body,
+        meta: f.meta,
+        ...(f.providerRecordId ? { providerRecordId: f.providerRecordId } : {}),
+      });
+    }
+  }
+
+  /** A coalesced streaming frame came out; `owner` is the thread it belongs to. */
+  private onStreamFrame(owner: string, frame: MappedFrame): void {
+    const live = this.liveByThread(owner);
+    if (live) this.emitFrames(live, [frame]);
+  }
+
+  private framesForCompletedItem(live: LiveSession, n: ItemCompletedNotification): void {
+    const item = n.item;
+    this.coalescer.finish(item.id, 'assistant');
+    this.coalescer.finish(item.id, 'thinking');
+    this.coalescer.finish(item.id, 'terminal');
+    live.commands?.delete(item.id);
+    this.emitFrames(live, framesForItem(item, { turnId: n.turnId, source: 'app_server' }));
+  }
+
+  /**
+   * Every frame of a thread, read back through `thread/read`. The B12 backfill command calls this;
+   * the frames are marked `source: 'backfill'` and keyed on (turnId, position), because
+   * `thread/read` renumbers item ids and a backfill must not duplicate what was streamed live.
+   */
+  async readThreadFrames(threadId: string): Promise<MappedFrame[]> {
+    const client = await this.ensureClient();
+    const res = await client.request<ThreadReadResponse>(METHODS.threadRead, {
+      threadId,
+      includeTurns: true,
+    });
+    return framesForTurns(res?.thread?.turns ?? [], 'backfill');
   }
 
   private onExit(expected: boolean): void {
@@ -617,6 +951,16 @@ export class CodexAdapter implements CodingAgentAdapter {
     if (upFor >= (this.opts.healthyUptimeMs ?? Math.max(60_000, base * 10)))
       this.restartAttempts = 0;
     this.startedAtMs = null;
+    this.coalescer.clear();
+    this.mirror?.reset();
+    this.mirror = null;
+    // Threads we only mirrored belong to the server that is gone; they are rediscovered on the
+    // next connect rather than lingering as sessions nobody can see the end of.
+    for (const [sid, live] of [...this.sessions]) {
+      if (!live.mirror) continue;
+      this.sessions.delete(sid);
+      this.byThread.delete(live.threadId);
+    }
     this.failLiveSessions('Codex app-server exited unexpectedly');
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
@@ -750,6 +1094,7 @@ export class CodexAdapter implements CodingAgentAdapter {
     switch (n.method) {
       case NOTIFICATIONS.turnStarted: {
         const { threadId, turn } = p as unknown as TurnStartedNotification;
+        this.mirror?.noteActivity(threadId);
         const live = this.liveByThread(threadId);
         if (!live) return;
         live.activeTurnId = turn.id;
@@ -764,14 +1109,56 @@ export class CodexAdapter implements CodingAgentAdapter {
         const d = p as unknown as AgentMessageDeltaNotification;
         const live = this.liveByThread(d.threadId);
         if (!live) return;
+        this.mirror?.noteActivity(d.threadId);
         live.agentBuffers.set(d.itemId, (live.agentBuffers.get(d.itemId) ?? '') + d.delta);
+        this.coalescer.push({
+          owner: d.threadId,
+          itemId: d.itemId,
+          turnId: d.turnId,
+          kind: 'assistant',
+          delta: d.delta,
+        });
+        return;
+      }
+      case NOTIFICATIONS.reasoningTextDelta:
+      case NOTIFICATIONS.reasoningSummaryTextDelta: {
+        const d = p as unknown as ReasoningTextDeltaNotification;
+        const live = this.liveByThread(d.threadId);
+        if (!live) return;
+        this.mirror?.noteActivity(d.threadId);
+        this.coalescer.push({
+          owner: d.threadId,
+          itemId: d.itemId,
+          turnId: d.turnId,
+          kind: 'thinking',
+          delta: d.delta,
+        });
+        return;
+      }
+      case NOTIFICATIONS.commandOutputDelta: {
+        const d = p as unknown as CommandExecutionOutputDeltaNotification;
+        const live = this.liveByThread(d.threadId);
+        if (!live) return;
+        this.mirror?.noteActivity(d.threadId);
+        const command = live.commands?.get(d.itemId);
+        this.coalescer.push({
+          owner: d.threadId,
+          itemId: d.itemId,
+          turnId: d.turnId,
+          kind: 'terminal',
+          delta: d.delta,
+          ...(command ? { command } : {}),
+        });
         return;
       }
       case NOTIFICATIONS.itemStarted: {
         const { item, threadId } = p as unknown as ItemCompletedNotification;
         const live = this.liveByThread(threadId);
         if (!live) return;
+        this.mirror?.noteActivity(threadId);
         if (item.type === 'commandExecution' && 'command' in item) {
+          live.commands ??= new Map();
+          live.commands.set(item.id, String(item.command));
           this.sessionEvent(
             live,
             'progress',
@@ -782,9 +1169,14 @@ export class CodexAdapter implements CodingAgentAdapter {
         return;
       }
       case NOTIFICATIONS.itemCompleted: {
-        const { item, threadId } = p as unknown as ItemCompletedNotification;
+        const n = p as unknown as ItemCompletedNotification;
+        const { item, threadId } = n;
         const live = this.liveByThread(threadId);
         if (!live) return;
+        this.mirror?.noteActivity(threadId);
+        // The owner of a mirrored thread answered its own prompt; the phone's card is stale.
+        this.resolveMirrorApprovalsFor(item.id);
+        this.framesForCompletedItem(live, n);
         if (item.type === 'agentMessage') {
           const text =
             ('text' in item && typeof item.text === 'string' && item.text) ||
@@ -812,6 +1204,16 @@ export class CodexAdapter implements CodingAgentAdapter {
         const { threadId, turn } = p as unknown as TurnCompletedNotification;
         const live = this.liveByThread(threadId);
         if (!live) return;
+        this.mirror?.noteActivity(threadId);
+        if (live.mirror) {
+          // A mirrored turn ends the way it began: as somebody else's. Anything still pending on
+          // it was answered by whoever owns it — the turn could not have finished otherwise.
+          for (const p of [...this.pending.values()]) {
+            if (p.mirror && p.sessionId === live.summary.sessionId) this.answeredElsewhere(p);
+          }
+          this.setStatus(live, turn.status === 'failed' ? 'failed' : 'idle', { activeTurn: false });
+          return;
+        }
         live.activeTurnId = null;
         this.rememberObserved(live, turn.id);
         this.cancelApprovalsFor(live.summary.sessionId);
@@ -831,11 +1233,26 @@ export class CodexAdapter implements CodingAgentAdapter {
       }
       case NOTIFICATIONS.threadStatusChanged: {
         const { threadId, status } = p as unknown as ThreadStatusChangedNotification;
+        this.mirror?.noteActivity(threadId, status);
         const live = this.liveByThread(threadId);
         if (!live) return;
+        if (live.mirror) {
+          const next = mirrorStatus(status);
+          if (next !== live.summary.status) this.setStatus(live, next);
+          return;
+        }
         if (status.type === 'active' && status.activeFlags.includes('waitingOnUserInput')) {
           this.setStatus(live, 'waiting_for_user');
           this.sessionEvent(live, 'needs_input', 'Codex is waiting for your input');
+        }
+        return;
+      }
+      case NOTIFICATIONS.serverRequestResolved: {
+        // Somebody answered a request we were relaying — for a mirrored thread that is the owner
+        // at their keyboard, and their answer is the one the agent acted on.
+        const { requestId } = p as unknown as { requestId: RpcId };
+        for (const pending of [...this.pending.values()]) {
+          if (pending.mirror && pending.rpcId === requestId) this.answeredElsewhere(pending);
         }
         return;
       }
@@ -877,6 +1294,22 @@ export class CodexAdapter implements CodingAgentAdapter {
     const params = (r.params ?? {}) as Record<string, unknown>;
     const threadId = typeof params.threadId === 'string' ? params.threadId : '';
     const live = this.liveByThread(threadId);
+    if (r.method === SERVER_REQUESTS.requestUserInput) {
+      this.onQuestionRequest(r, live);
+      return;
+    }
+    // Attached to the shared daemon, every subscriber receives the same request — including
+    // requests for threads that are none of our business. Answering one would silently decide
+    // it for whoever does own it (MOB-043 finding 5: one id, first answer wins), so we do not
+    // answer at all. Our own private child only ever asks us about our own threads, so there
+    // the historical fail-safe decline still stands.
+    if (!live && client.mode === 'app-server-daemon') {
+      this.logger.log('info', 'server request for a thread we do not own; leaving it alone', {
+        method: r.method,
+        threadId: threadId.slice(0, 40),
+      });
+      return;
+    }
     if (!live) {
       // Not one of ours (or unknown method): fail safe by declining.
       this.logger.log('warn', 'server request for unknown thread; declining', { method: r.method });
@@ -902,6 +1335,7 @@ export class CodexAdapter implements CodingAgentAdapter {
     let hints: Hints;
     let providerRequestId: string;
     let requested: PendingApproval['requested'] = null;
+    let options: ApprovalOption[];
     // Unredacted facts for the device floor (`@pagr/bridge-core`'s deviceFloor). Never emitted to
     // the cloud — `preview` below is the relativized, clipped string that leaves the Mac.
     const local: LocalActionDetail = { projectPath: live.projectPath };
@@ -917,6 +1351,7 @@ export class CodexAdapter implements CodingAgentAdapter {
         if (c.command) local.command = c.command;
         if (c.cwd) local.cwd = c.cwd;
         providerRequestId = c.approvalId ?? c.itemId;
+        options = commandApprovalOptions();
         break;
       }
       case SERVER_REQUESTS.fileChangeApproval: {
@@ -931,6 +1366,7 @@ export class CodexAdapter implements CodingAgentAdapter {
         local.toolName = 'apply_patch';
         local.paths = files;
         providerRequestId = f.itemId;
+        options = fileChangeApprovalOptions();
         break;
       }
       case SERVER_REQUESTS.permissionsApproval: {
@@ -954,6 +1390,7 @@ export class CodexAdapter implements CodingAgentAdapter {
         if (pr.permissions.fileSystem) local.paths = ['/'];
         providerRequestId = pr.itemId;
         requested = pr.permissions;
+        options = permissionsApprovalOptions();
         break;
       }
       default:
@@ -961,6 +1398,12 @@ export class CodexAdapter implements CodingAgentAdapter {
         return;
     }
 
+    // A prompt from a thread inside no registered project cannot be routed: the cloud has no
+    // project id to send it to. Leave it entirely alone — the terminal that owns it still shows it.
+    if (live.mirror && !live.summary.projectId) {
+      this.logger.log('info', 'mirrored approval in an unregistered directory; not relaying');
+      return;
+    }
     const approvalId = newApprovalId();
     const timeoutMs = this.opts.approvalTimeoutMs ?? 600_000;
     const timer = setTimeout(() => this.timeoutApproval(approvalId), timeoutMs);
@@ -973,6 +1416,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       kind,
       timer,
       requested,
+      ...(live.mirror ? { mirror: true } : {}),
     };
     this.pending.set(approvalId, pending);
     this.setStatus(live, 'waiting_for_approval');
@@ -986,24 +1430,147 @@ export class CodexAdapter implements CodingAgentAdapter {
       preview: clip(relativizePaths(preview, live.projectPath), 1500),
       hints,
       local,
+      options,
+      source: live.mirror ? 'mirror' : 'owned',
       expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
     });
   }
 
-  private answer(p: PendingApproval, decision: 'accept' | 'decline'): void {
+  /** The owner answered it in their own terminal: withdraw the phone's card, write nothing. */
+  private answeredElsewhere(p: PendingApproval): void {
+    if (!this.pending.delete(p.approvalId)) return;
+    clearTimeout(p.timer);
+    this.emit({
+      kind: 'approval_resolved_locally',
+      approvalId: p.approvalId,
+      resolution: 'canceled',
+      answeredElsewhere: true,
+    });
+    const live = this.sessions.get(p.sessionId);
+    if (live && !this.hasPendingFor(p.sessionId)) this.setStatus(live, mirrorStatus(undefined));
+  }
+
+  private resolveMirrorApprovalsFor(itemId: string): void {
+    for (const p of [...this.pending.values()]) {
+      if (p.mirror && p.providerRequestId === itemId) this.answeredElsewhere(p);
+    }
+  }
+
+  // ---- questions (`item/tool/requestUserInput`) ----
+
+  private onQuestionRequest(r: RpcRequest, live: LiveSession | undefined): void {
+    const q = (r.params ?? {}) as unknown as ToolRequestUserInputParams;
+    if (!live) {
+      this.logger.log('info', 'question for a thread we do not own; leaving it alone');
+      return;
+    }
+    if (!live.summary.projectId) return;
+    const questions: FrameQuestion[] = q.questions.map((one) => ({
+      question: one.question,
+      header: one.header,
+      // Codex asks one answer per question; `isOther` means the user may type their own.
+      multiSelect: false,
+      options: (one.options ?? []).map((o) => ({
+        label: o.label,
+        ...(o.description ? { description: o.description } : {}),
+      })),
+    }));
+    // A thread we merely mirror is answered by the person sitting in front of it. Saying
+    // `answerable: false` is the honest version of "we cannot type into your terminal".
+    const answerable = live.mirror !== true;
+    const timeoutMs = this.opts.approvalTimeoutMs ?? 600_000;
+    this.questions.set(q.itemId, {
+      rpcId: r.id,
+      sessionId: live.summary.sessionId,
+      threadId: q.threadId,
+      itemId: q.itemId,
+      questions: q.questions,
+      answerable,
+    });
+    this.setStatus(live, 'waiting_for_user');
+    this.emit({
+      kind: 'question_asked',
+      sessionId: live.summary.sessionId,
+      projectId: live.summary.projectId,
+      providerRequestId: q.itemId,
+      questions,
+      answerable,
+      ...(answerable ? {} : { reason: 'mirror_only' }),
+      secret: q.questions.map((one) => one.isSecret === true),
+      expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
+    });
+    this.emitFrames(live, [
+      {
+        body: { kind: 'question', questions },
+        meta: { source: 'app_server', turnId: q.turnId, final: true },
+        providerRecordId: q.itemId,
+      },
+    ]);
+  }
+
+  /**
+   * Answer a question by option index. Indexes, never text: the options came from the agent, and
+   * echoing text back would let a compromised cloud put words in the user's mouth.
+   */
+  async answerQuestion(input: {
+    providerRequestId: string;
+    answers: Array<{ questionIndex: number; optionIndexes: number[]; freeText?: string }>;
+  }): Promise<void> {
+    const pending = this.questions.get(input.providerRequestId);
+    if (!pending) throw new Error(`unknown or expired question ${input.providerRequestId}`);
+    if (!pending.answerable)
+      throw new Error('this thread is mirrored; answer it in the terminal that owns it');
+    const answers: ToolRequestUserInputResponse['answers'] = {};
+    for (const a of input.answers) {
+      const question = pending.questions[a.questionIndex];
+      if (!question) continue;
+      const chosen = a.optionIndexes
+        .map((i) => question.options?.[i]?.label)
+        .filter((l): l is string => typeof l === 'string');
+      if (a.freeText) chosen.push(a.freeText);
+      answers[question.id] = { answers: chosen };
+    }
+    this.questions.delete(input.providerRequestId);
+    this.client?.respond(pending.rpcId, { answers } satisfies ToolRequestUserInputResponse);
+    const live = this.sessions.get(pending.sessionId);
+    if (live) this.setStatus(live, 'working');
+  }
+
+  /**
+   * Write the answer the agent is waiting for.
+   *
+   * `fromUser` is what separates a decision from a wind-down. A mirrored thread's request went to
+   * every subscriber at once and the owner is sitting in front of it; a timeout, a cancel or a
+   * shutdown on our side must leave their prompt exactly as they found it, so nothing is written
+   * unless a person on the phone actually chose something.
+   */
+  private answer(
+    p: PendingApproval,
+    decision: ApprovalDecision,
+    optionId?: string,
+    fromUser = true,
+  ): void {
     const client = this.client;
     if (!client?.running) return;
+    if (p.mirror && !fromUser) {
+      this.logger.log('info', 'not answering a mirrored approval on our own account', {
+        approvalId: p.approvalId,
+      });
+      return;
+    }
+    const accepted = decision === 'accept' || decision === 'acceptForSession';
     if (p.kind === 'permissions') {
       const granted: PermissionsRequestApprovalResponse =
-        decision === 'accept' && p.requested
+        accepted && p.requested
           ? {
               permissions: {
                 ...(p.requested.network ? { network: p.requested.network } : {}),
                 ...(p.requested.fileSystem ? { fileSystem: p.requested.fileSystem } : {}),
               },
-              scope: 'turn',
+              scope: scopeForOption(optionId),
             }
-          : { permissions: {}, scope: 'turn' };
+          : // An empty grant IS the denial (generated/v2/PermissionsRequestApprovalResponse.ts).
+            { permissions: {}, scope: 'turn' };
       client.respond(p.rpcId, granted);
     } else {
       client.respond(p.rpcId, { decision });
@@ -1014,7 +1581,7 @@ export class CodexAdapter implements CodingAgentAdapter {
     const p = this.pending.get(approvalId);
     if (!p) return;
     this.pending.delete(approvalId);
-    this.answer(p, 'decline');
+    this.answer(p, 'decline', undefined, false);
     this.emit({ kind: 'approval_resolved_locally', approvalId, resolution: 'timed_out' });
     const live = this.sessions.get(p.sessionId);
     if (live && !this.hasPendingFor(p.sessionId)) this.setStatus(live, 'working');
@@ -1030,7 +1597,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       if (p.sessionId !== sessionId) continue;
       clearTimeout(p.timer);
       this.pending.delete(p.approvalId);
-      this.answer(p, 'decline');
+      this.answer(p, 'decline', undefined, false);
       this.emit({
         kind: 'approval_resolved_locally',
         approvalId: p.approvalId,
@@ -1038,6 +1605,24 @@ export class CodexAdapter implements CodingAgentAdapter {
       });
     }
   }
+}
+
+/** Reject after `ms` without leaving the underlying promise's rejection unhandled. */
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    timer.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 export function buildInput(instruction: string, images: string[]): UserInput[] {

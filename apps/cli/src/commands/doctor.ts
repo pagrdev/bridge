@@ -1,5 +1,11 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  codexHomeDir,
+  controlSocketPath,
+  daemonDoctorLine,
+  probeDaemon,
+} from '@pagr/bridge-adapter-codex';
 import type { ChannelStatus, DaemonStatus } from '@pagr/bridge-core';
 import {
   auditPermissions,
@@ -420,6 +426,16 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
     } catch {
       add({ name: bin, status: 'warn', detail: 'not found on PATH', fix: hint });
     }
+  }
+
+  // ---- Codex shared app-server daemon -------------------------------------
+  // Terminal Codex threads are mirrored only while a shared daemon is running, and the bridge
+  // never starts one: `codex app-server daemon start` works solely for the installer-managed
+  // standalone package, so an npm install would watch it fail on every launch. One honest line.
+  if (opts.offline) add({ name: 'codex daemon', status: 'skip', detail: '--offline' });
+  else {
+    const socket = controlSocketPath(codexHomeDir(ctx.env));
+    add(daemonDoctorLine(await probeDaemon({ socketPath: socket })));
   }
 
   // ---- Claude Code permission hook ----------------------------------------

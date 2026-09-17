@@ -657,3 +657,22 @@ describe('doctor · Claude Code live steering', () => {
     expect(check(r, 'claude channel')?.detail).toContain('invalid JSON');
   });
 });
+
+describe('doctor · codex daemon', () => {
+  // The harness puts HOME in a temp directory, so this reads a `.codex` that does not exist —
+  // never the real one, and it starts nothing either way.
+  it('says the shared daemon is not running, and how to start one', async () => {
+    const r = await report();
+    const c = check(r, 'codex daemon');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('not running');
+    expect(c?.detail).toContain('codex app-server daemon start');
+    expect(c?.detail).toContain('installer-managed builds only');
+    // A Mac with no Codex daemon is a correct Mac: warn, never fail.
+    expect(r.ok).toBe(true);
+  });
+
+  it('is skipped with --offline', async () => {
+    expect(check(await report(['--offline']), 'codex daemon')?.status).toBe('skip');
+  });
+});
