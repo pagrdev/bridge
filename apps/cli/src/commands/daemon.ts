@@ -1,12 +1,16 @@
 import { existsSync, readFileSync } from 'node:fs';
 import {
+  type BackfillSource,
   type CodingAgentAdapter,
   createLogger,
   DaemonAlreadyRunningError,
+  type DaemonBackfillOptions,
   ensurePaths,
   FakeAdapter,
+  historySessionId,
   isPidAlive,
   launchAgentPlistPath,
+  type ReplayFrame,
   readConfig,
   readDaemonLock,
   startDaemon,
@@ -52,6 +56,89 @@ export async function buildAdapters(
   return map;
 }
 
+/**
+ * Where `session.list_history` and `session.backfill` read history from.
+ *
+ * Built here, in the CLI, because it is the only layer that already knows about both adapter
+ * packages: the core daemon deliberately does not depend on either, so it is handed the two
+ * callbacks rather than importing a transcript parser. A build that cannot load the adapter
+ * packages (the mock path) gets no sources, and both commands answer `capability_unsupported`
+ * instead of pretending this Mac has no history.
+ */
+export async function buildBackfill(
+  adapters: Map<Provider, CodingAgentAdapter>,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<DaemonBackfillOptions> {
+  const claudeMod = await import('@pagr/bridge-adapter-claude');
+  const codex = adapters.get('codex');
+  const sources: BackfillSource[] = [];
+  if (codex && hasThreadHistory(codex)) sources.push(codexHistorySource(codex));
+  return {
+    claudeHome: env.HOME ?? null,
+    sources,
+    replayTranscript: async (session) => {
+      if (session.provider !== 'claude' || !session.cwd || !env.HOME) return null;
+      return claudeMod.replayTranscript({
+        home: env.HOME,
+        cwd: session.cwd,
+        claudeSessionId: session.providerSessionId,
+      });
+    },
+  };
+}
+
+/** The two methods the Codex adapter adds beyond `CodingAgentAdapter`, when it is the real one. */
+interface CodexThreadHistory {
+  discoverTerminalThreads(): Promise<
+    Array<{ threadId: string; cwd: string; preview: string; updatedAt: number }>
+  >;
+  readThreadFrames(
+    threadId: string,
+  ): Promise<Array<{ body: unknown; meta: unknown; providerRecordId?: string }>>;
+}
+
+const hasThreadHistory = (a: CodingAgentAdapter): a is CodingAgentAdapter & CodexThreadHistory =>
+  typeof (a as Partial<CodexThreadHistory>).discoverTerminalThreads === 'function' &&
+  typeof (a as Partial<CodexThreadHistory>).readThreadFrames === 'function';
+
+/**
+ * Codex threads, through `thread/list` and `thread/read`.
+ *
+ * `thread/read` is the one cross-process door the spike found open (MOB-043 finding 7): it works
+ * read-only under another process's writer lock, which is exactly the situation a backfill is in
+ * — the thread belongs to somebody's terminal, and Pagr is only reading it. Its item ids are
+ * rollout-derived (`item-1`, `item-2`) rather than the UUIDv7s the live notifications carry, so
+ * the frames it produces are keyed on (turn, position) by `framesForTurns`; that is what stops a
+ * backfill duplicating what was streamed live.
+ */
+function codexHistorySource(adapter: CodingAgentAdapter & CodexThreadHistory): BackfillSource {
+  return {
+    provider: 'codex',
+    async list(since) {
+      const threads = await adapter.discoverTerminalThreads();
+      return threads
+        .filter((t) => t.updatedAt * 1000 >= since.getTime())
+        .map((t) => {
+          const at = new Date(t.updatedAt * 1000).toISOString();
+          return {
+            sessionId: historySessionId('codex', t.threadId),
+            providerSessionId: t.threadId,
+            provider: 'codex' as const,
+            ...(t.cwd ? { cwd: t.cwd } : {}),
+            ...(t.preview ? { taskSummary: t.preview.slice(0, 500) } : {}),
+            startedAt: at,
+            updatedAt: at,
+            origin: 'terminal' as const,
+          };
+        });
+    },
+    async replay(session) {
+      if (session.provider !== 'codex' || !session.providerSessionId) return null;
+      return (await adapter.readThreadFrames(session.providerSessionId)) as ReplayFrame[];
+    },
+  };
+}
+
 export function fallbackAdapters(): Map<Provider, CodingAgentAdapter> {
   return new Map<Provider, CodingAgentAdapter>([
     ['codex', new FakeAdapter('codex')],
@@ -80,6 +167,14 @@ async function runForeground(ctx: CliContext, opts: { mock: boolean }): Promise<
   if (opts.mock)
     logger.warn('PAGR_MOCK_AGENTS=1: agents are mocked; no real Codex/Claude sessions');
   const config = readConfig(paths.configFile);
+  let backfill: DaemonBackfillOptions | null = null;
+  try {
+    backfill = await buildBackfill(adapters, ctx.env);
+  } catch (err) {
+    logger.warn('history sources unavailable; `session.backfill` will be unsupported', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
   await startDaemon({
     home: ctx.home,
     adapters,
@@ -87,6 +182,7 @@ async function runForeground(ctx: CliContext, opts: { mock: boolean }): Promise<
     logger,
     bridgeVersion: ctx.bridgeVersion,
     ...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
+    ...(backfill ? { backfill } : {}),
   });
   await new Promise<never>(() => {}); // until SIGINT/SIGTERM (handled by startDaemon)
 }

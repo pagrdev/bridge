@@ -12,12 +12,26 @@ import type { CodingAgentAdapter } from './adapters/types.js';
 import { claudeApprovalOptions } from './approvalOptions.js';
 import type { FetchLike } from './attachments.js';
 import { cleanupTmp } from './attachments.js';
+import {
+  BackfillGuard,
+  type BackfillSource,
+  DEFAULT_BACKFILL_BYTES,
+  type DiscoveredSession,
+  MAX_HISTORY_DAYS,
+  MAX_HISTORY_LIMIT,
+  type ReplayFrame,
+} from './backfill.js';
 import { CommandTracker, verifyIncoming } from './commandGuard.js';
 import { SessionGuard } from './concurrency.js';
 import { type BridgeConfig, inspectConfig, readConfig, updateConfig } from './config.js';
 import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
 import type { LocalActionDetail } from './deviceFloor.js';
-import { ADOPTED_SESSION_NAME, Dispatcher, type RemoteProjectPickStatus } from './dispatcher.js';
+import {
+  ADOPTED_SESSION_NAME,
+  DispatchError,
+  Dispatcher,
+  type RemoteProjectPickStatus,
+} from './dispatcher.js';
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, InvalidDeviceKeyError, loadOrCreateIdentity } from './identity.js';
 import {
@@ -31,6 +45,7 @@ import {
   JOURNAL_MAX_TOTAL_BYTES,
   JOURNAL_RETENTION_DAYS,
   JournalStore,
+  journalSessions,
   OutboxCursors,
 } from './journal.js';
 import { KeepAwake, type KeepAwakeSpawn, type KeepAwakeStatus } from './keepAwake.js';
@@ -100,6 +115,24 @@ export interface CreateDaemonOptions {
    * `process.exit`; tests pass a recorder. See `DAEMON_EXIT`.
    */
   exit?: (code: number) => void;
+  /**
+   * The history sources `session.list_history` and `session.backfill` read.
+   *
+   * Supplied from outside because reading them means knowing what a Claude transcript and a Codex
+   * thread are, and the core package deliberately does not depend on either adapter package. The
+   * CLI, which already constructs the adapters, builds this and hands it in; a daemon with none
+   * still journals and streams exactly as before and answers both commands
+   * `capability_unsupported`.
+   */
+  backfill?: DaemonBackfillOptions;
+}
+
+/** What the daemon is handed about reading history; the rest of the channel it wires itself. */
+export interface DaemonBackfillOptions {
+  /** `$HOME` holding `.claude`. Null turns the Claude transcript source off. */
+  claudeHome?: string | null;
+  sources?: BackfillSource[];
+  replayTranscript?: (session: DiscoveredSession) => Promise<ReplayFrame[] | null>;
 }
 
 export interface DaemonStatus {
@@ -341,6 +374,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     else logger.debug('event (unpaired, dropped)', { type: event.type });
   };
 
+  /** One slot for every backfill on this Mac: a phone's and `pagr sessions backfill` alike. */
+  const backfillGuard = new BackfillGuard();
   const dispatcher = new Dispatcher({
     deviceId: identity.deviceId ?? `dev_${'0'.repeat(32)}`,
     adapters: o.adapters,
@@ -366,6 +401,29 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       recipientKeys: () => transport?.recipientKeys ?? recipientKeys,
       protocolVersion: () => transport?.negotiatedVersion ?? 1,
       imessageLinked: () => transport?.features?.imessage ?? false,
+    },
+    backfill: {
+      // The same answer the transcript mirror gets, so a backfilled session lands in the same
+      // project — and is refused for the same unregistered directory.
+      projectFor: (cwd) => getMirrorBridge().projectFor(cwd),
+      /**
+       * Hold the Mac awake for the whole backfill. Replaying a long transcript and sealing a few
+       * thousand frames takes longer than the idle timer, and a Mac that sleeps halfway through
+       * leaves the phone with a partial answer and no signal that anything is coming.
+       */
+      hold: (reason) => {
+        keepAwake.hold(reason);
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          keepAwake.release(reason);
+        };
+      },
+      guard: backfillGuard,
+      ...(o.backfill?.claudeHome !== undefined ? { claudeHome: o.backfill.claudeHome } : {}),
+      ...(o.backfill?.sources ? { sources: o.backfill.sources } : {}),
+      ...(o.backfill?.replayTranscript ? { replayTranscript: o.backfill.replayTranscript } : {}),
     },
     onApprovalsChange: () => syncKeepAwake(),
     onQuestionsChange: () => syncKeepAwake(),
@@ -644,6 +702,86 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       reason: c.reason,
     })),
   );
+  /**
+   * `pagr sessions` needs three things `sessions.json` does not hold: how much journal a session
+   * has, how far the gateway is behind on it, and whether it is one Pagr may drive. All three are
+   * on disk already; this joins them so the CLI does not have to know the journal's layout.
+   */
+  ipc.registerMethod('sessions.journal', () => {
+    outbox.flush();
+    journal.flushAll();
+    const out: Record<
+      string,
+      { lastSeq: number; bytes: number; sent: number; acked: number; updatedAt: string }
+    > = {};
+    for (const stat of journalSessions(paths.journalDir, paths.outboxFile)) {
+      let lastSeq = 0;
+      try {
+        lastSeq = journal.lastSeq(stat.sessionId);
+      } catch {
+        // An unreadable journal reports zero rather than failing the whole listing.
+      }
+      out[stat.sessionId] = {
+        lastSeq,
+        bytes: stat.bytes,
+        sent: stat.sent,
+        acked: stat.acked,
+        updatedAt: stat.updatedAt,
+      };
+    }
+    return out;
+  });
+  /**
+   * Age and size retention, on demand. It deletes journals — `~/.pagr/journal/*` — and NOTHING
+   * else: a transcript under `~/.claude` is Claude Code's own file and Pagr never removes one.
+   */
+  ipc.registerMethod('sessions.purge', (params) => {
+    const p = z.object({ days: z.number().int().min(0).max(3650).optional() }).parse(params ?? {});
+    const result = journal.prune({
+      days: p.days ?? o.journalRetentionDays ?? JOURNAL_RETENTION_DAYS,
+      maxTotalBytes: o.journalMaxTotalBytes ?? JOURNAL_MAX_TOTAL_BYTES,
+    });
+    for (const sessionId of result.removed) outbox.forget(sessionId);
+    return result;
+  });
+  /** The same code path a phone's `session.backfill` takes, so it can be tested without one. */
+  ipc.registerMethod('sessions.backfill', async (params) => {
+    const p = z
+      .object({
+        sessionId: z.string().min(1),
+        fromSeq: z.number().int().nonnegative().optional(),
+        toSeq: z.number().int().nonnegative().optional(),
+        maxBytes: z.number().int().positive().optional(),
+      })
+      .parse(params);
+    try {
+      return await dispatcher.runBackfill({
+        sessionId: p.sessionId,
+        fromSeq: p.fromSeq ?? 1,
+        ...(p.toSeq !== undefined ? { toSeq: p.toSeq } : {}),
+        maxBytes: p.maxBytes ?? DEFAULT_BACKFILL_BYTES,
+      });
+    } catch (err) {
+      if (err instanceof DispatchError) throw new IpcMethodError(err.code, err.message);
+      throw err;
+    }
+  });
+  ipc.registerMethod('sessions.history', async (params) => {
+    const p = z
+      .object({
+        provider: z.enum(['claude', 'codex']).optional(),
+        projectId: z.string().min(1).optional(),
+        sinceDays: z.number().int().min(1).max(MAX_HISTORY_DAYS).optional(),
+        limit: z.number().int().min(1).max(MAX_HISTORY_LIMIT).optional(),
+      })
+      .parse(params ?? {});
+    return dispatcher.listHistory({
+      ...(p.provider ? { provider: p.provider } : {}),
+      ...(p.projectId ? { projectId: p.projectId } : {}),
+      ...(p.sinceDays !== undefined ? { sinceDays: p.sinceDays } : {}),
+      ...(p.limit !== undefined ? { limit: p.limit } : {}),
+    });
+  });
   ipc.registerMethod('approvals.list', () => dispatcher.approvals.list());
   /**
    * Record a provider session the bridge did not start, so that it exists as far as this Mac is

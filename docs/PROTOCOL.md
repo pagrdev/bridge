@@ -94,6 +94,8 @@ Implementation: `packages/core/src/transport.ts`.
 | `agent.respond_to_approval` | `{ approvalId, sessionId, providerRequestId, previewHash, decision: allow\|deny, optionId? }` | `{ approvalId, decision }` |
 | `agent.answer_question` (v2) | `{ questionId, sessionId, providerRequestId, answers: [{ questionIndex, optionIndexes[], freeText? }] }` | `{ questionId }` |
 | `settings.sync_public_policy` | `{ approvalTimeoutSeconds }` | the stored policy |
+| `session.list_history` | `{ provider?, projectId?, sinceDays ≤ 365 (default 30), limit ≤ 200 (default 50) }` | `{ sessions: SessionSummaryV2[] }` |
+| `session.backfill` | `{ sessionId, fromSeq, toSeq?, maxBytes ≤ 8 MiB (default 1 MiB) }` | `{ frames, bytes, lastSeq, truncated }` |
 | `repo.scan` | `{}` | `RepoScanResult`: `{ repos: [{ handle: rh_<32hex>, displayName, repoHint?, registeredAs? }], truncated }` |
 | `project.register_handle` | `{ handle, displayName? }` | `ProjectSummary` |
 
@@ -130,6 +132,63 @@ Both commands are v2, are gated on `PAGR_REMOTE_PROJECT_PICK` (default on) and a
 `repo_scan.v1` in `device.hello.capabilities` exactly when they will run. With the flag off they
 ack `failed` / `capability_unsupported`. A second `repo.scan` within 30 s acks `failed` /
 `rate_limited`. `docs/SECURITY.md` § "Projects a phone can add" states what this widens.
+
+### History and backfill
+
+`session.list_history` and `session.backfill` are both v2; on a link that negotiated v1 they ack
+`failed` / `not_negotiated`. They exist because of one retention decision: **the cloud keeps sealed
+frames for 30 days, the phone keeps them forever, and anything older comes from the Mac on demand.**
+
+`session.list_history` answers with every session this Mac can still produce frames for, newest
+first, merged by session id from three places:
+
+- the journal (`~/.pagr/journal/`), for anything this bridge has already framed;
+- `~/.claude/projects/*/*.jsonl`, for Claude sessions that ran before Pagr was installed or in a
+  folder that was registered later. Superseded and orphaned variants of one session are folded into
+  that session; `agent-*.jsonl` (a subagent's own transcript) and `memory/` are not sessions and are
+  skipped. The name comes from a `custom-title` record, else `agent-name`, else `summary`; the times
+  come from the file's own; the working directory comes from the records, never from the encoded
+  directory name;
+- Codex's `thread/list`, when the app-server is attached.
+
+Ids are the same `ses_…` the rest of the bridge uses — `sha256("<provider>:<provider id>")` — so a
+session found by the hook, by the mirror and by history is ONE session on the phone. A session in a
+directory no project covers is not listed: a `SessionSummary` has to name a `proj_…`. A session that
+is not running right now is reported with `controlLevel: 'none'` and the `origin` its source implies
+(`terminal` for a transcript or a Codex thread); a session that IS live is described by its own live
+summary instead, which knows its real control level.
+
+`session.backfill` streams journaled frames from `fromSeq` as ordinary `session.frame` events — same
+sealing, same chunking, same caps — with `meta.source: 'backfill'`. Two paths:
+
+- **The journal has the session.** Frames are re-read and re-sealed. The seqs and bodies are exactly
+  the ones the phone would have received live; only `meta.source` differs.
+- **It does not.** The provider's own record is replayed into the journal FIRST, which is what
+  allocates the seqs, and then streamed. For Claude that is a one-shot pass of the transcript tailer
+  over every file of the session; for Codex it is `thread/read {includeTurns}`, whose item ids are
+  renumbered `item-1`, `item-2`, … so its frames dedupe on (turn, position) rather than on an item
+  id (`docs/spikes/2026-09-17-codex-daemon-attach.md`, finding 7). Either way the journal's
+  `providerRecordId` dedupe means replaying a session that was partly streamed live costs no
+  duplicate frames, and asking twice costs one replay.
+
+Limits and refusals:
+
+- `maxBytes` bounds what goes on the wire for one request; the stream stops before the frame that
+  would exceed it and the result says `truncated: true`, so the phone asks again from
+  `lastSeq + 1`. At least one frame is always sent, so a budget smaller than the first frame still
+  makes progress. The command schema caps a request at 8 MiB; the local trigger
+  (`pagr sessions backfill`) uses the core defaults instead — 16 MiB, up to 64 MiB.
+- **One backfill at a time on this Mac.** A second request while one is running acks `failed` /
+  `rate_limited` rather than queueing: a backfill competes with live frames for the socket and the
+  disk. `pagr sessions backfill` contends for the same single slot.
+- A `sessionId` nothing can produce frames for — no journal, no transcript, no thread — is `failed`
+  / `unknown_session`. Note that the command guard deliberately does NOT check `sessionId` against
+  `sessions.json` the way `agent.stop_session` does: a backfill is *for* sessions this Mac no longer
+  has a row for.
+- Progress is reported as a `session.event` of kind `progress` every 100 frames, and once at the
+  end. The Mac is held awake (`keepAwake` reason `backfill`) for the duration.
+
+Both commands need the frame journal; a bridge built without one answers `capability_unsupported`.
 
 ## Device events (bridge → cloud)
 
@@ -485,7 +544,8 @@ risk tiering; the bridge only ever reports.
 
 `~/.pagr/run/daemon.sock`, newline-delimited JSON `{ id, method, params }` → `{ id, result }` |
 `{ id, error: { code, message } }`. Methods: `status`, `projects.list`, `projects.add`, `projects.remove`,
-`sessions.list`, `sessions.reconcile`, `channel.status`, `approvals.list`, `approval.request` (blocks
+`sessions.list`, `sessions.journal`, `sessions.history`, `sessions.backfill`, `sessions.purge`,
+`sessions.reconcile`, `channel.status`, `approvals.list`, `approval.request` (blocks
 until decision/timeout, returns `{ approvalId, decision, resolution, optionId? }`; the Claude
 PermissionRequest hook passes `permissionSuggestions` so the prompt can offer "allow always", and
 hands those same rules back to Claude Code itself when `optionId` comes back `allow_always`),
@@ -501,6 +561,13 @@ See `packages/core/src/ipc.ts` and `daemon.ts`.
   session that was working when the daemon died never survives as a zombie.
 - `channel.status` → `{ enabled, attachedProjects, canSteerLive }`. `enabled` only means the flag is
   set; `canSteerLive` is the one that says a follow-up would really interrupt a turn.
+- `sessions.journal` → `{ [sessionId]: { lastSeq, bytes, sent, acked, updatedAt } }`, which is what
+  `pagr sessions` puts in its SEQ and JOURNAL columns.
+- `sessions.history` → the `session.list_history` answer, and `sessions.backfill` → the
+  `session.backfill` result, both through the exact code path a phone's command takes, so the
+  feature can be exercised from the Mac alone (`pagr sessions backfill <id>`).
+- `sessions.purge` → `{ removed, bytesFreed, totalBytes }`. Deletes whole journals under
+  `~/.pagr/journal` and nothing else; `~/.claude` is never touched.
 
 ## Concurrency rules (bridge-side, no protocol change)
 

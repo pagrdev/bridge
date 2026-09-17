@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AdapterEvent } from '@pagr/bridge-core';
+import { BackfillService, historySessionId, JournalStore } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CodexAdapter, MIRROR_READ_ONLY } from './adapter.js';
 import { AppServerClient } from './app-server.js';
@@ -267,6 +268,74 @@ describe('mirroring terminal threads', () => {
     tui.respond(request.id, { decision: 'decline' });
     const resolved = await waitFor((e) => e.kind === 'approval_resolved_locally');
     expect(resolved.kind === 'approval_resolved_locally' && resolved.answeredElsewhere).toBe(true);
+  }, 30_000);
+
+  /**
+   * The backfill door, end to end (MOB-043 finding 7): `thread/read` is the only way into a thread
+   * another process holds the writer lock on, and it renumbers item ids, so the frames it yields
+   * are keyed on (turn, position). Everything below is checking that the core backfill service can
+   * turn that into a journal with real seqs.
+   */
+  it('backfills a foreign thread through thread/read, into the journal', async () => {
+    daemon = await startFakeDaemon({ FAKE_CODEX_TUI_THREADS: `foreign-1=${project}` });
+    // Discovery is the mirror's, so it stays on; the read poll is pushed out of the way so the
+    // only `thread/read` in this test is the backfill's own.
+    const { adapter } = make(daemon.socketPath, { readPollIntervalMs: 600_000 });
+    await adapter.probe();
+
+    const journalDir = path.join(home, 'journal');
+    const journal = new JournalStore({ dir: journalDir });
+    const sessionId = historySessionId('codex', 'foreign-1');
+    const emitted: unknown[] = [];
+    const service = new BackfillService({
+      journal,
+      seal: (entry) => [{ entry } as never],
+      emit: (e) => emitted.push(e),
+      projectFor: () => ({
+        projectId: PROJ,
+        path: project,
+        displayName: 'project',
+        status: 'registered',
+      }),
+      sources: [
+        {
+          provider: 'codex',
+          list: async () => {
+            const threads = await adapter.discoverTerminalThreads();
+            return threads.map((t) => ({
+              sessionId: historySessionId('codex', t.threadId),
+              providerSessionId: t.threadId,
+              provider: 'codex' as const,
+              cwd: t.cwd,
+              startedAt: new Date(t.updatedAt * 1000).toISOString(),
+              updatedAt: new Date(t.updatedAt * 1000).toISOString(),
+              origin: 'terminal' as const,
+            }));
+          },
+          replay: async (s) => adapter.readThreadFrames(s.providerSessionId),
+        },
+      ],
+    });
+
+    const history = await service.listHistory({ sinceDays: 365 });
+    expect(history.map((h) => h.sessionId)).toContain(sessionId);
+    expect(history.find((h) => h.sessionId === sessionId)).toMatchObject({
+      provider: 'codex',
+      origin: 'terminal',
+      controlLevel: 'none',
+    });
+
+    const result = await service.backfill({ sessionId, fromSeq: 1 });
+    expect(result.frames).toBeGreaterThan(0);
+    expect(result.lastSeq).toBe(result.frames);
+    const entries = journal.read(sessionId, 1);
+    expect(entries.map((e) => e.body.kind)).toEqual(['user', 'assistant']);
+    expect(entries.every((e) => e.meta.source === 'backfill')).toBe(true);
+    // Keyed on (turn, position), not on the renumbered item id: a second read adds nothing.
+    await service.backfill({ sessionId, fromSeq: 1 });
+    expect(journal.lastSeq(sessionId)).toBe(entries.length);
+    expect(rpcCalls(daemon.rpcLog).map((c) => c.method)).toContain('thread/read');
+    journal.closeAll();
   }, 30_000);
 
   it('refuses to steer or stop a thread it only mirrors', async () => {

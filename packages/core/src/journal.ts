@@ -815,6 +815,33 @@ export interface JournalStats {
 }
 
 /**
+ * Every journal on disk with its cursors, whether or not the gateway is behind on it.
+ *
+ * `journalStats` answers the doctor's question ("what is falling behind?"); this answers
+ * `pagr sessions`' question ("how much history does each session have?"), which needs the rows
+ * that are perfectly in sync as well. `behind` is 0 for those, not absent.
+ */
+export function journalSessions(
+  dir: string,
+  outboxFile = join(dir, 'outbox.json'),
+): JournalSessionStat[] {
+  const cursors = sanitise(readJson<Record<string, unknown>>(outboxFile, {}));
+  return journalFiles(dir)
+    .map((f) => {
+      const c = cursors[f.sessionId] ?? { sent: 0, acked: 0 };
+      return {
+        sessionId: f.sessionId,
+        bytes: f.bytes,
+        updatedAt: new Date(f.mtimeMs).toISOString(),
+        sent: c.sent,
+        acked: c.acked,
+        behind: Math.max(0, c.sent - c.acked),
+      };
+    })
+    .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+}
+
+/**
  * What `pagr doctor` reports about the journal. Reads the files directly rather than asking the
  * daemon, because the question "how much of my own disk is this using" has to be answerable when
  * the daemon is not running.

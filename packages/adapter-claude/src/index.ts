@@ -119,6 +119,11 @@ export {
   UnknownRecordTypes,
 } from './transcript/records.js';
 export {
+  MAX_REPLAY_TOOL_CALLS,
+  replayTranscript,
+  type TranscriptReplayOptions,
+} from './transcript/replay.js';
+export {
   type TailedRecord,
   type TailerFileState,
   TailerStateStore,
