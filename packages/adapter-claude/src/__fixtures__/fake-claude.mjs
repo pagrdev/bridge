@@ -13,6 +13,13 @@
 //                     tool that records none): the diff has to come from the transcript, or be
 //                     approximated
 //         "write"  → control_request can_use_tool (Write) → waits for control_response → tool_result → result
+//         "write always" → the same, but the request carries `permission_suggestions`, so an
+//                     "allow always" has rules to persist. Every control_response line is appended
+//                     to FAKE_CLAUDE_CONTROL_FILE when that env var is set, so a test can read
+//                     back exactly what the adapter wrote (incl. `updatedPermissions`).
+//         "elsewhere" → asks permission and then answers it ITSELF, as a terminal user would:
+//                     the tool_result arrives with no control_response, which is what
+//                     `answeredElsewhere` looks like on the wire
 //         "fail"   → result subtype error_during_execution
 //         "hang"   → no result until SIGINT (then result success "interrupted") / SIGTERM exits 143
 //         "crash"  → process.exit(7) mid-turn
@@ -161,7 +168,12 @@ function result(ok, text) {
   );
 }
 
-function askPermission(toolName, input, toolUseId) {
+/** The rules a real Claude offers alongside "always allow" for a Write. */
+const SUGGESTIONS = [
+  { type: 'addRules', rules: [{ toolName: 'Write', ruleContent: '//tmp/**' }], behavior: 'allow' },
+];
+
+function askPermission(toolName, input, toolUseId, suggestions = []) {
   const request_id = `req_${n++}`;
   return new Promise((resolve) => {
     pendingControl.set(request_id, resolve);
@@ -174,7 +186,7 @@ function askPermission(toolName, input, toolUseId) {
         display_name: toolName,
         input,
         tool_use_id: toolUseId,
-        permission_suggestions: [],
+        permission_suggestions: suggestions,
       },
     });
   });
@@ -262,6 +274,30 @@ async function handleUser(text) {
     result(true, 'Edited. DONE');
     return;
   }
+  if (/elsewhere/i.test(text)) {
+    // Asks, and then answers itself: the person hit "yes" in the terminal, so the tool runs and
+    // its result arrives while Pagr is still holding the prompt open on a phone.
+    const toolUseId = `toolu_${n++}`;
+    assistant([
+      {
+        type: 'tool_use',
+        id: toolUseId,
+        name: 'Write',
+        input: { file_path: `${process.cwd()}/hello.txt`, content: 'hi\n' },
+      },
+    ]);
+    void askPermission(
+      'Write',
+      { file_path: `${process.cwd()}/hello.txt`, content: 'hi\n' },
+      toolUseId,
+      SUGGESTIONS,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    toolResult(toolUseId, 'File created successfully', undefined);
+    assistant([{ type: 'text', text: 'Wrote hello.txt in the terminal. DONE' }]);
+    result(true, 'Wrote hello.txt in the terminal. DONE');
+    return;
+  }
   if (/write/i.test(text)) {
     const toolUseId = `toolu_${n++}`;
     assistant([
@@ -276,6 +312,7 @@ async function handleUser(text) {
       'Write',
       { file_path: `${process.cwd()}/hello.txt`, content: 'hi\n' },
       toolUseId,
+      /always/i.test(text) ? SUGGESTIONS : [],
     );
     const allowed = res?.behavior === 'allow';
     out({
@@ -336,6 +373,10 @@ rl.on('line', (line) => {
     return;
   }
   if (m.type === 'control_response') {
+    // Recorded verbatim so a test can assert what the adapter actually sent back — an allow with
+    // `updatedPermissions` is the whole of "allow always".
+    if (process.env.FAKE_CLAUDE_CONTROL_FILE)
+      appendFileSync(process.env.FAKE_CLAUDE_CONTROL_FILE, `${line}\n`);
     const r = pendingControl.get(m.response?.request_id);
     if (r) {
       pendingControl.delete(m.response.request_id);

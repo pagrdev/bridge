@@ -82,7 +82,11 @@ export type AdapterEvent =
        */
       local?: LocalActionDetail;
       expiresAt: string;
-      /** v2. The agent's own option list, in the agent's order. The phone renders exactly these. */
+      /**
+       * v2. The agent's own option list, in the agent's order. The phone renders exactly these.
+       * Omitted by an adapter that only knows allow/deny; the phone then falls back to the two
+       * options every agent has.
+       */
       options?: ApprovalOption[];
       /**
        * Where this request reached us. `mirror` means the agent asked EVERY subscriber and the
@@ -118,8 +122,14 @@ export type AdapterEvent =
       kind: 'approval_resolved_locally';
       approvalId: string;
       resolution: 'allowed' | 'denied' | 'timed_out' | 'canceled';
-      /** v2. Somebody answered it somewhere else — the phone dismisses rather than errors. */
+      /**
+       * v2. Somebody answered it somewhere else — the phone dismisses rather than errors. What
+       * the adapter observed, never what it did: a `tool_result` arriving for a prompt Pagr never
+       * answered, or a mirrored thread's owner answering first.
+       */
       answeredElsewhere?: boolean;
+      /** Where that answer came from, when the adapter knows. Defaults to the provider itself. */
+      source?: 'terminal' | 'provider';
     }
   /**
    * The agent asked the user a question (Codex `item/tool/requestUserInput`, Claude's
@@ -155,7 +165,8 @@ export interface CodingAgentAdapter {
     decision: 'allow' | 'deny';
     /**
      * v2. The exact option the user chose, from `approval.requested.options`. `decision` stays
-     * the truth for a v1 cloud that has never heard of options.
+     * the truth for a v1 cloud that has never heard of options, and an adapter that is handed an
+     * option it does not recognise must behave exactly as it did before options existed.
      */
     optionId?: string;
   }): Promise<void>;

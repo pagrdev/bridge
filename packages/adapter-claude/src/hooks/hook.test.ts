@@ -247,6 +247,66 @@ describe('permission.mjs hook', () => {
     }
   });
 
+  /**
+   * MOB-035. The hook relays a prompt from the user's own `claude`, so it has to carry the same
+   * options a bridge-spawned session does — which means forwarding the rules Claude offered, and
+   * handing them back when the person chooses "allow always".
+   */
+  it('forwards permission_suggestions so a hook-relayed prompt can offer "allow always"', async () => {
+    const suggestions = [
+      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git push:*' }] },
+    ];
+    const d = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+    await runHook({ ...stdinPayload, permission_suggestions: suggestions }, {
+      PAGR_DAEMON_SOCK: sock,
+    });
+    await d.close();
+    expect(d.seen[0]?.params.permissionSuggestions).toEqual(suggestions);
+
+    // An empty list still travels, and says "there is nothing to persist here".
+    const e = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+    await runHook(stdinPayload, { PAGR_DAEMON_SOCK: sock });
+    await e.close();
+    expect(e.seen[0]?.params.permissionSuggestions).toEqual([]);
+  });
+
+  it('writes Claude\'s own rules back on allow_always, and nothing extra on a plain allow', async () => {
+    const suggestions = [
+      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git push:*' }] },
+    ];
+    const always = fakeDaemon(sock, () => ({
+      result: { decision: 'allow', optionId: 'allow_always' },
+    }));
+    const r = await runHook({ ...stdinPayload, permission_suggestions: suggestions }, {
+      PAGR_DAEMON_SOCK: sock,
+    });
+    await always.close();
+    expect(JSON.parse(r.stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: 'PermissionRequest',
+        decision: { behavior: 'allow', updatedPermissions: suggestions },
+      },
+    });
+
+    // "Allow once" is the same allow it has always been.
+    const once = fakeDaemon(sock, () => ({
+      result: { decision: 'allow', optionId: 'allow_once' },
+    }));
+    const r2 = await runHook({ ...stdinPayload, permission_suggestions: suggestions }, {
+      PAGR_DAEMON_SOCK: sock,
+    });
+    await once.close();
+    expect(JSON.parse(r2.stdout).hookSpecificOutput.decision).toEqual({ behavior: 'allow' });
+
+    // An "always" with nothing to persist cannot invent a rule.
+    const empty = fakeDaemon(sock, () => ({
+      result: { decision: 'allow', optionId: 'allow_always' },
+    }));
+    const r3 = await runHook(stdinPayload, { PAGR_DAEMON_SOCK: sock });
+    await empty.close();
+    expect(JSON.parse(r3.stdout).hookSpecificOutput.decision).toEqual({ behavior: 'allow' });
+  });
+
   it('installHooks copies the script and hookSettings references it', () => {
     const { hookPath } = installHooks(dir);
     expect(hookPath).toBe(path.join(dir, 'hooks', 'permission.mjs'));

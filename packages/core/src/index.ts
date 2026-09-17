@@ -1,5 +1,6 @@
 export { FakeAdapter } from './adapters/fake.js';
 export * from './adapters/types.js';
+export * from './approvalOptions.js';
 export * from './approvals.js';
 export * from './attachmentLease.js';
 export * from './attachments.js';

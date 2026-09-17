@@ -2,6 +2,7 @@ import { release } from 'node:os';
 import {
   type AgentConnectionStatus,
   type ApprovalOption,
+  type ApprovalOptionKind,
   type CommandBody,
   type CommandPayload,
   canonicalize,
@@ -16,7 +17,15 @@ import {
 } from '@pagr/protocol';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
 import {
+  allowAlwaysEnabled,
+  APPROVAL_OPTION_KINDS,
+  decisionForOptionKind,
+  defaultOptionId,
+  isPersistentOptionKind,
+} from './approvalOptions.js';
+import {
   type ApprovalDecision,
+  type ApprovalOutcome,
   type ApprovalResolution,
   type ApprovalSource,
   type PendingApproval,
@@ -106,8 +115,9 @@ export interface ApprovalRequest extends Omit<PendingApprovalInput, 'onResolve' 
    */
   local?: LocalActionDetail;
   /**
-   * v2. The agent's own option list, forwarded to the phone as-is. Not stored on the record: the
-   * bridge answers the agent with what the cloud sends back, and never with a remembered option.
+   * v2. The agent's own option list, forwarded to the phone as-is and kept on the pending record
+   * — not so the bridge can answer on its own, but so an answer naming an option this prompt
+   * never offered is refused instead of guessed at.
    */
   options?: ApprovalOption[];
   /** Resolved exactly once. `decision` is null for timeouts / provider-side / shutdown. */
@@ -115,6 +125,7 @@ export interface ApprovalRequest extends Omit<PendingApprovalInput, 'onResolve' 
     decision: ApprovalDecision | null,
     resolution: ApprovalResolution,
     source: ApprovalSource,
+    outcome: ApprovalOutcome,
   ) => Promise<void> | void;
 }
 type AckErrorCode = NonNullable<AckPayload['errorCode']>;
@@ -940,7 +951,9 @@ export class Dispatcher {
   private async respondToApproval(p: CommandPayload<'agent.respond_to_approval'>) {
     // Read before `respond` consumes the entry. `respond` still re-checks the binding, so a
     // mismatched request is reported as a mismatch rather than as a policy refusal.
-    const pending = p.decision === 'allow' ? this.approvals.get(p.approvalId) : null;
+    const entry = this.approvals.get(p.approvalId);
+    const optionKind = entry && p.optionId ? this.checkOption(entry, p) : null;
+    const pending = p.decision === 'allow' ? entry : null;
     // An entry with no stored classification is re-classified here rather than waved through:
     // a missing assessment must never be the reason a cloud `allow` succeeds.
     const assessment =
@@ -951,8 +964,12 @@ export class Dispatcher {
           preview: pending.preview,
           hints: pending.hints,
         }));
-    const refusal = assessment ? this.floor.check(assessment) : null;
-    const r = await this.approvals.respond(refusal ? { ...p, decision: 'deny' } : p);
+    // A standing grant is judged harder than a one-off: see `DeviceFloor.check`.
+    const persistent = optionKind !== null && isPersistentOptionKind(optionKind);
+    const refusal = assessment ? this.floor.check(assessment, { persistent }) : null;
+    const r = await this.approvals.respond(
+      refusal ? { ...p, decision: 'deny', refusal: refusal.message } : p,
+    );
     if (!r.ok) {
       const msg = {
         unknown: 'no pending approval (expired or already used)',
@@ -969,6 +986,7 @@ export class Dispatcher {
         approvalId: p.approvalId,
         sessionId: pending.sessionId,
         risks: refusal.risks.join(','),
+        ...(p.optionId ? { optionId: p.optionId } : {}),
       });
       // The user must be able to see this happened without reading the daemon log.
       this.send('session.event', {
@@ -982,6 +1000,36 @@ export class Dispatcher {
       throw new DispatchError('capability_unsupported', refusal.message);
     }
     return { approvalId: p.approvalId, decision: p.decision };
+  }
+
+  /**
+   * Validate a v2 answer's `optionId` against the prompt it claims to answer, and return the kind
+   * it means. `decision` stays required on the wire (a v1 bridge has never heard of options), so
+   * the two must agree: an `optionId: 'allow_always'` arriving with `decision: 'deny'` is a
+   * malformed command, not an instruction to guess which half was meant.
+   */
+  private checkOption(
+    record: PendingApproval,
+    p: CommandPayload<'agent.respond_to_approval'>,
+  ): ApprovalOptionKind {
+    const optionId = p.optionId ?? '';
+    const kind = this.optionKind(record, optionId);
+    if (!kind)
+      throw new DispatchError(
+        'invalid_payload',
+        `${optionId} is not an option this approval offered`,
+      );
+    if (kind === 'allow_always' && !allowAlwaysEnabled(this.env))
+      throw new DispatchError(
+        'capability_unsupported',
+        'persistent approvals are switched off on this Mac (PAGR_ALLOW_ALWAYS=0)',
+      );
+    if (decisionForOptionKind(kind) !== p.decision)
+      throw new DispatchError(
+        'invalid_payload',
+        `option ${optionId} does not agree with decision ${p.decision}`,
+      );
+    return kind;
   }
 
   // ---------- remote project pick ----------
@@ -1077,6 +1125,31 @@ export class Dispatcher {
     return this.policy.approvalTimeoutSeconds * 1000;
   }
 
+  /** The daemon's own environment; the floor and the option switches read it, never the cloud. */
+  private get env(): NodeJS.ProcessEnv {
+    return this.o.env ?? process.env;
+  }
+
+  /** True when the link speaks v2, so a sealed frame is something a phone can actually open. */
+  private frameProtocolV2(): boolean {
+    const channel = this.o.frames;
+    return channel !== undefined && channel.protocolVersion() >= 2;
+  }
+
+  /**
+   * The kind behind an option id. The agent's own list wins; an id that is itself a kind is
+   * accepted when the adapter published no list at all (a v1 adapter, or the hook path before it
+   * learned to send suggestions), and anything else is not an option of this prompt.
+   */
+  private optionKind(record: PendingApproval, optionId: string): ApprovalOptionKind | null {
+    const found = record.options.find((o) => o.optionId === optionId);
+    if (found) return found.kind;
+    if (record.options.length > 0) return null;
+    return APPROVAL_OPTION_KINDS.includes(optionId as ApprovalOptionKind)
+      ? (optionId as ApprovalOptionKind)
+      : null;
+  }
+
   /**
    * Register a pending approval (from an adapter or a hook over IPC), emit
    * `approval.requested`, and resolve `onDecision` exactly once.
@@ -1087,7 +1160,7 @@ export class Dispatcher {
    * consumed the entry by the time this runs, so a failed relay cannot be answered a second time.
    */
   requestApproval(input: ApprovalRequest): PendingApproval {
-    const { onDecision, local, options, ...rest } = input;
+    const { onDecision, local, options: offered, ...rest } = input;
     // Classified here, on the Mac, from what the provider asked for — before the cloud has been
     // told this prompt exists, and never from anything the cloud will later echo back.
     const assessment = classifyLocally({
@@ -1096,13 +1169,20 @@ export class Dispatcher {
       hints: rest.hints ?? {},
       ...(local ? { detail: local } : {}),
     });
+    // Last word on `PAGR_ALLOW_ALWAYS=0`: the adapters filter too, but this is the daemon's own
+    // environment, so a persistent grant cannot reach a phone because one adapter forgot.
+    const options = (offered ?? []).filter(
+      (o) => o.kind !== 'allow_always' || allowAlwaysEnabled(this.env),
+    );
     const record = this.approvals.register(
       {
         ...rest,
         assessment,
-        onResolve: async (resolution, decision, source) => {
+        options,
+        onResolve: async (resolution, decision, source, outcome) => {
+          const optionId = outcome.optionId ?? defaultOptionId(decision);
           try {
-            await onDecision(decision, resolution, source);
+            await onDecision(decision, resolution, source, outcome);
           } catch (err) {
             const message = (err instanceof Error ? err.message : String(err)).slice(0, 500);
             this.logger.warn('approval relay failed', {
@@ -1120,13 +1200,56 @@ export class Dispatcher {
               summary: `Could not deliver the approval decision to ${record.provider}: ${message}`,
               at: this.now().toISOString(),
             });
+            if (source === 'cloud')
+              this.send('approval.applied', {
+                approvalId: record.approvalId,
+                sessionId: record.sessionId,
+                optionId,
+                applied: false,
+                error: message,
+              });
             throw err;
           }
-          this.send('approval.resolved_locally', { approvalId: record.approvalId, resolution });
+          const protocolSource = source === 'cloud' ? null : source;
+          this.send('approval.resolved_locally', {
+            approvalId: record.approvalId,
+            resolution,
+            ...(protocolSource ? { source: protocolSource } : {}),
+            ...(outcome.answeredElsewhere ? { answeredElsewhere: true } : {}),
+          });
+          // `command.ack` says the bridge heard the tap; this says the agent was actually told.
+          // A refusal by the device floor is reported here too — as `applied: false` with the
+          // reason — because the phone's card must not sit on "sending" when nothing was carried.
+          if (source === 'cloud' || outcome.answeredElsewhere)
+            this.send('approval.applied', {
+              approvalId: record.approvalId,
+              sessionId: record.sessionId,
+              optionId,
+              applied: outcome.refusal === undefined,
+              // What the agent was actually told, which is not always what was chosen: a
+              // persistent grant the floor refused is relayed as a plain deny. The provider's own
+              // enum value for it is the adapter's business (see adapter-codex/src/approvals.ts).
+              appliedAs: outcome.refusal !== undefined ? 'deny' : (decision ?? 'deny'),
+              ...(outcome.refusal !== undefined ? { error: outcome.refusal } : {}),
+            });
         },
       },
       this.approvalTimeoutMs,
     );
+    // v2: the preview travels sealed, in its own frame, and the plaintext copy on the event goes
+    // away. A v1 gateway has never heard of frames, so it keeps getting the preview as before.
+    const frame = this.frameProtocolV2()
+      ? this.emitFrame(
+          record.sessionId,
+          { kind: 'approval_preview', preview: record.preview },
+          {
+            projectId: record.projectId,
+            provider: record.provider,
+            meta: { source: 'stdio', actionType: record.actionType },
+          },
+        )
+      : null;
+    const sealedPreview = frame?.emitted === true;
     this.send('approval.requested', {
       approvalId: record.approvalId,
       sessionId: record.sessionId,
@@ -1134,13 +1257,14 @@ export class Dispatcher {
       provider: record.provider,
       providerRequestId: record.providerRequestId,
       actionType: record.actionType,
-      preview: record.preview,
+      preview: sealedPreview ? '' : record.preview,
       previewHash: record.previewHash,
       hints: record.hints,
       expiresAt: record.expiresAt,
       // v2: the agent's own options travel with the request. A v1 cloud ignores the field and
       // answers with `decision` alone, which is why it is never the only thing we send.
-      ...(options && options.length > 0 ? { options } : {}),
+      ...(options.length > 0 ? { options } : {}),
+      ...(sealedPreview ? { frameSeq: frame.seq } : {}),
     });
     // Nothing decides it here. The prompt now waits for the person — on their phone, or in the
     // terminal the agent is running in, whichever answers first. The bridge used to auto-approve
@@ -1213,15 +1337,20 @@ export class Dispatcher {
           ...(e.local ? { local: e.local } : {}),
           ...(e.options && e.options.length > 0 ? { options: e.options } : {}),
           expiresAt: e.expiresAt,
-          onDecision: async (decision, _resolution, source) => {
-            // The provider already knows when it resolved the request itself. Everything else —
-            // the cloud's answer, a local timeout, and this device's own decision (tier A, or a
-            // floor refusal turned into a deny) — has to reach the agent.
-            if (source === 'provider' || source === 'shutdown') return;
+          onDecision: async (decision, _resolution, source, outcome) => {
+            // The provider already knows when it resolved the request itself, and so does the
+            // person who answered in the terminal. Everything else — the cloud's answer, a local
+            // timeout, and a floor refusal turned into a deny — has to reach the agent.
+            if (source === 'provider' || source === 'shutdown' || source === 'terminal') return;
             await adapter?.respondToApproval({
               approvalId: e.approvalId,
               providerRequestId: e.providerRequestId,
               decision: decision ?? 'deny',
+              // A refused persistent grant is relayed as a plain deny: the option the person
+              // chose is not the thing the agent is being told to do any more.
+              ...(outcome.optionId && outcome.refusal === undefined
+                ? { optionId: outcome.optionId }
+                : {}),
             });
           },
         });
@@ -1236,17 +1365,25 @@ export class Dispatcher {
           questions: e.questions.length,
         });
         return;
-      case 'approval_resolved_locally':
-        // The provider already resolved it; do not call back into the adapter.
-        await this.approvals.resolveLocally(e.approvalId, e.resolution).then((had) => {
-          if (!had)
-            this.send('approval.resolved_locally', {
-              approvalId: e.approvalId,
-              resolution: e.resolution,
-              ...(e.answeredElsewhere ? { answeredElsewhere: true } : {}),
-            });
-        });
+      case 'approval_resolved_locally': {
+        // Somebody else already resolved it; do not call back into the adapter.
+        const answeredElsewhere = e.answeredElsewhere === true;
+        const had = answeredElsewhere
+          ? await this.approvals.resolveExternally(
+              e.approvalId,
+              e.source ?? 'provider',
+              e.resolution,
+            )
+          : await this.approvals.resolveLocally(e.approvalId, e.resolution);
+        if (!had)
+          this.send('approval.resolved_locally', {
+            approvalId: e.approvalId,
+            resolution: e.resolution,
+            ...(e.source ? { source: e.source } : {}),
+            ...(answeredElsewhere ? { answeredElsewhere: true } : {}),
+          });
         return;
+      }
     }
   }
 

@@ -14,6 +14,7 @@ import type {
   SessionSummary,
   StartSessionInput,
 } from '@pagr/bridge-core';
+import { claudeApprovalOptions } from '@pagr/bridge-core';
 import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.js';
 import { ClaudeProcess, sealedModeEnabled } from './claude-process.js';
 import {
@@ -32,6 +33,7 @@ import {
   actionTypeForTool,
   filePathsOf,
   mapToolKind,
+  type PermissionSuggestion,
   previewForTool,
   type StreamEvent,
   type StreamRecord,
@@ -120,6 +122,13 @@ interface PendingApproval {
   sessionId: string;
   providerRequestId: string;
   input: Record<string, unknown>;
+  /**
+   * The rules Claude offered to persist with this prompt. Handed straight back as
+   * `updatedPermissions` when the person chooses "allow always"; never read, never stored.
+   */
+  suggestions: PermissionSuggestion[];
+  /** The `tool_use_id` this prompt is about, when Claude named one. */
+  toolUseId: string | null;
   timer: NodeJS.Timeout;
 }
 
@@ -411,6 +420,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     approvalId: string;
     providerRequestId: string;
     decision: 'allow' | 'deny';
+    optionId?: string;
   }): Promise<void> {
     const p = this.pending.get(input.approvalId);
     if (!p) throw new Error(`unknown or expired approval ${input.approvalId}`);
@@ -420,11 +430,20 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     this.pending.delete(input.approvalId);
     clearTimeout(p.timer);
     const live = this.sessions.get(p.sessionId);
+    // "Allow always" hands Claude back its own suggested rules, which is how they end up in the
+    // user's Claude Code settings rather than in a Pagr-shaped policy of our own. `decision` is
+    // still what decides: an option that disagrees with it never persists anything.
+    const persist =
+      input.decision === 'allow' && input.optionId === 'allow_always' && p.suggestions.length > 0;
     if (live?.proc?.alive) {
       live.proc.answerPermission(
         p.requestId,
         input.decision === 'allow'
-          ? { behavior: 'allow', updatedInput: p.input }
+          ? {
+              behavior: 'allow',
+              updatedInput: p.input,
+              ...(persist ? { updatedPermissions: p.suggestions } : {}),
+            }
           : { behavior: 'deny', message: 'Denied by the user via Pagr' },
       );
     }
@@ -733,7 +752,36 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private onRecord(live: LiveSession, proc: ClaudeProcess, rec: StreamRecord): void {
     if (live.proc !== proc) return;
     if (rec.type === 'assistant_blocks') this.onAssistantBlocks(live, rec);
-    else if (rec.type === 'user_blocks') this.onUserBlocks(live, rec);
+    else if (rec.type === 'user_blocks') {
+      this.noteExternalAnswers(rec);
+      this.onUserBlocks(live, rec);
+    }
+  }
+
+  /**
+   * A tool's result arriving for a prompt Pagr never answered means somebody answered it in the
+   * terminal — Claude only runs the tool (or reports it refused) once the permission is settled.
+   * The entry is consumed as `answeredElsewhere` so the phone dismisses its card rather than
+   * timing out on a question that no longer exists.
+   */
+  private noteExternalAnswers(rec: Extract<StreamRecord, { type: 'user_blocks' }>): void {
+    for (const b of rec.blocks) {
+      if (b.type !== 'tool_result') continue;
+      for (const p of [...this.pending.values()]) {
+        if (p.toolUseId !== b.toolUseId) continue;
+        clearTimeout(p.timer);
+        this.pending.delete(p.approvalId);
+        this.emit({
+          kind: 'approval_resolved_locally',
+          approvalId: p.approvalId,
+          resolution: b.isError ? 'denied' : 'allowed',
+          source: 'terminal',
+          answeredElsewhere: true,
+        });
+        const live = this.sessions.get(p.sessionId);
+        if (live && !this.hasPendingFor(p.sessionId)) this.setStatus(live, 'working');
+      }
+    }
   }
 
   private onAssistantBlocks(
@@ -941,12 +989,15 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     const timer = setTimeout(() => this.timeoutApproval(approvalId), timeoutMs);
     timer.unref();
     const providerRequestId = (ev.toolUseId ?? ev.requestId).slice(0, 200);
+    const suggestions = ev.suggestions ?? [];
     this.pending.set(approvalId, {
       approvalId,
       requestId: ev.requestId,
       sessionId: live.summary.sessionId,
       providerRequestId,
       input: ev.input,
+      suggestions,
+      toolUseId: ev.toolUseId || null,
       timer,
     });
     const preview = previewForTool(ev.toolName, ev.input, live.projectPath);
@@ -969,6 +1020,8 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       actionType: actionTypeForTool(ev.toolName),
       preview: clip(preview, 1500),
       hints,
+      // "Allow always" is offered exactly when Claude handed us rules to persist with it.
+      options: claudeApprovalOptions(suggestions.length > 0, this.opts.env ?? process.env),
       // Unredacted, for the device floor only. `preview` above is what leaves the Mac.
       local: {
         toolName: ev.toolName,

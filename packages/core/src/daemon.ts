@@ -8,6 +8,7 @@ import type {
 } from '@pagr/protocol';
 import { z } from 'zod';
 import type { CodingAgentAdapter } from './adapters/types.js';
+import { claudeApprovalOptions } from './approvalOptions.js';
 import type { FetchLike } from './attachments.js';
 import { cleanupTmp } from './attachments.js';
 import { CommandTracker, verifyIncoming } from './commandGuard.js';
@@ -173,6 +174,12 @@ const ApprovalRequestParams = z.object({
   preview: z.string().max(1500),
   hints: z.record(z.boolean()).optional(),
   timeoutMs: z.number().int().positive().optional(),
+  /**
+   * Claude's `permission_suggestions` for this prompt, forwarded verbatim by the hook. Only their
+   * presence is read here — they are the rules an "allow always" would write, so without them
+   * there is no such option to offer. They never leave this Mac.
+   */
+  permissionSuggestions: z.array(z.unknown()).max(50).optional(),
 });
 
 const AgentEventParams = z.object({
@@ -648,10 +655,17 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       sessionId = rec.sessionId;
       emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
     }
+    // The hook relays a prompt from the person's own `claude`, so it gets the same options a
+    // bridge-spawned session would: "allow always" exactly when Claude offered rules to persist.
+    const options =
+      p.provider === 'claude'
+        ? claudeApprovalOptions((p.permissionSuggestions?.length ?? 0) > 0, o.env ?? process.env)
+        : [];
     return new Promise<{
       approvalId: string;
       decision: 'allow' | 'deny' | null;
       resolution: string;
+      optionId?: string;
     }>((resolve) => {
       const record = dispatcher.requestApproval({
         sessionId,
@@ -660,6 +674,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         providerRequestId: p.providerRequestId,
         actionType: p.actionType,
         preview: p.preview,
+        ...(options.length > 0 ? { options } : {}),
         ...(p.hints ? { hints: p.hints } : {}),
         // The hook sends a project-relative preview and its cwd; that plus the registered project
         // root is what the device floor gets to classify on this path. It is less than the
@@ -668,13 +683,20 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         ...(p.timeoutMs
           ? { expiresAt: new Date(now().getTime() + p.timeoutMs).toISOString() }
           : {}),
-        onDecision: (decision, resolution) => {
+        onDecision: (decision, resolution, _source, outcome) => {
           if (!p.sessionId) {
             const rec = sessions.setStatus(sessionId, 'idle');
             if (rec)
               emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
           }
-          resolve({ approvalId: record.approvalId, decision, resolution });
+          // The hook is the one that answers Claude here, so it is told which option won: an
+          // `allow_always` is the difference between allowing the call and writing a rule.
+          resolve({
+            approvalId: record.approvalId,
+            decision,
+            resolution,
+            ...(outcome?.optionId ? { optionId: outcome.optionId } : {}),
+          });
         },
       });
     });

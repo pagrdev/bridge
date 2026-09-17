@@ -53,6 +53,13 @@ export type UserBlock =
   | { type: 'image' }
   | { type: 'other'; blockType: string };
 
+/**
+ * One entry of `permission_suggestions` on a `can_use_tool` control request: a permission rule
+ * Claude is offering to persist if the user says "always". Opaque to Pagr on purpose — the shape
+ * is Claude's, it is echoed back verbatim as `updatedPermissions`, and nothing here reads inside.
+ */
+export type PermissionSuggestion = Record<string, unknown>;
+
 /** Every line shape, with nothing collapsed. */
 export type StreamRecord =
   | { type: 'init'; sessionId: string; raw: Record<string, unknown> }
@@ -80,6 +87,11 @@ export type StreamRecord =
       toolUseId: string | null;
       toolName: string;
       input: Record<string, unknown>;
+      /**
+       * Present (and non-empty) only when Claude offered rules to persist. That is exactly when
+       * an "allow always" means anything, so it is what the option list is built from.
+       */
+      suggestions?: PermissionSuggestion[];
     }
   | { type: 'permission_cancel'; requestId: string }
   | { type: 'other'; raw: Record<string, unknown> }
@@ -98,6 +110,7 @@ export type StreamEvent =
       toolUseId: string;
       toolName: string;
       input: Record<string, unknown>;
+      suggestions?: PermissionSuggestion[];
     }
   | { type: 'permission_cancel'; requestId: string }
   | { type: 'other'; raw: Record<string, unknown> }
@@ -162,6 +175,11 @@ export function parseStreamRecord(line: string): StreamRecord {
     case 'control_request': {
       const req = (o.request ?? {}) as Record<string, unknown>;
       if (req.subtype !== 'can_use_tool') return { type: 'other', raw: o };
+      const suggestions = Array.isArray(req.permission_suggestions)
+        ? (req.permission_suggestions.filter(
+            (x) => x !== null && typeof x === 'object',
+          ) as PermissionSuggestion[])
+        : [];
       return {
         type: 'permission_request',
         requestId: String(o.request_id ?? ''),
@@ -171,6 +189,7 @@ export function parseStreamRecord(line: string): StreamRecord {
           string,
           unknown
         >,
+        ...(suggestions.length > 0 ? { suggestions } : {}),
       };
     }
     case 'control_cancel_request':
@@ -296,11 +315,19 @@ export function userMessageLine(text: string): string {
  * Build the stdin line answering a `can_use_tool` control request. Shape mirrors the Agent SDK's
  * PermissionResult: `{behavior:'allow', updatedInput}` | `{behavior:'deny', message}` (verified
  * 2026-08-24: allow → tool ran; file was created).
+ *
+ * An allow may also carry `updatedPermissions` — the request's own `permission_suggestions`,
+ * handed back so Claude writes them into ITS settings. That is what "allow always" means: the
+ * rule belongs to Claude Code, not to Pagr, and Pagr keeps no copy of it.
  */
 export function controlResponseLine(
   requestId: string,
   decision:
-    | { behavior: 'allow'; updatedInput: Record<string, unknown> }
+    | {
+        behavior: 'allow';
+        updatedInput: Record<string, unknown>;
+        updatedPermissions?: PermissionSuggestion[];
+      }
     | { behavior: 'deny'; message: string },
 ): string {
   return `${JSON.stringify({
