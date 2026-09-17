@@ -283,6 +283,17 @@ provider `deny`, emits a `session.event` naming the class and the opt-in, and ac
 `failed` / `capability_unsupported`. There is no path that turns a refusal into a quieter allow, and
 none that answers the same prompt twice.
 
+**Standing grants are judged harder than one-off answers.** A prompt now carries the agent's own
+options, and "allow always" is a real one: it hands Claude Code back the `permission_suggestions`
+it offered with the prompt, as `updatedPermissions`, so the rule is written into **Claude's own
+settings** and outlives the session — Pagr stores no permission rules of its own and keeps no copy.
+Because such a grant is forever, the floor never lets one through for a class it is holding: a
+`network` class lifted only by `allowedHosts` covers this one action against those hosts, not a
+rule, so `allow_always` and `allow_session` are refused for it while a plain `allow_once` is
+carried. Only a class you lifted by hand — in `device-policy.json` or `PAGR_DEVICE_FLOOR` — permits
+a persistent grant. Starting the daemon with `PAGR_ALLOW_ALWAYS=0` removes the option everywhere:
+it never appears on the card, and an answer naming it is refused rather than downgraded.
+
 ## Agents the bridge spawns (`adapter-claude`, `adapter-codex`)
 
 `claude` is started with `--setting-sources user,project,local` and no `--strict-mcp-config`: the

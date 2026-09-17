@@ -630,3 +630,154 @@ describe('ClaudeAdapter drains evicted children', () => {
     }
   });
 });
+
+/**
+ * MOB-035. The options an approval card carries, and what each one actually does to Claude.
+ *
+ * The property that matters: "allow always" is not a Pagr policy. It hands Claude back the very
+ * `permission_suggestions` it offered, so the rule lands in the user's own Claude Code settings —
+ * and it is offered only when Claude supplied some.
+ */
+describe('ClaudeAdapter approval options (MOB-035)', () => {
+  let home: string;
+  let project: string;
+  let adapter: ClaudeAdapter | null = null;
+  let controlFile: string;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-claude-opt-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-opt-'));
+    controlFile = path.join(home, 'control.jsonl');
+  });
+  afterEach(async () => {
+    await adapter?.shutdown();
+    adapter = null;
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  });
+
+  const make = (env: Record<string, string> = {}): ClaudeAdapter => {
+    adapter = new ClaudeAdapter({
+      home,
+      claudeCommand: ['node', FIXTURE],
+      approvalTimeoutMs: 5_000,
+      env: { FAKE_CLAUDE_CONTROL_FILE: controlFile, ...env },
+    });
+    return adapter;
+  };
+
+  const ask = async (a: ClaudeAdapter, instruction: string) => {
+    const c = collector();
+    a.subscribe(c.emit);
+    await a.startSession({
+      sessionId: SES,
+      project: { projectId: PROJ, path: project, displayName: 'demo' },
+      instruction,
+      localImagePaths: [],
+      readOnly: false,
+    });
+    const req = await c.waitFor((e) => e.kind === 'approval_requested');
+    if (req.kind !== 'approval_requested') throw new Error('unreachable');
+    return { c, req };
+  };
+
+  const controlLines = (): Array<Record<string, unknown>> =>
+    fs.existsSync(controlFile)
+      ? fs
+          .readFileSync(controlFile, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as Record<string, unknown>)
+      : [];
+
+  it('offers "allow always" only when the request carried permission suggestions', async () => {
+    const { req } = await ask(make(), 'write always please');
+    expect(req.options).toEqual([
+      { optionId: 'allow_once', kind: 'allow_once', label: 'Allow once' },
+      { optionId: 'allow_always', kind: 'allow_always', label: 'Allow always' },
+      { optionId: 'reject_once', kind: 'reject_once', label: 'Reject' },
+    ]);
+  });
+
+  it('offers allow once / reject when Claude suggested no rules to persist', async () => {
+    const { req } = await ask(make(), 'please write hello.txt');
+    expect(req.options?.map((o) => o.optionId)).toEqual(['allow_once', 'reject_once']);
+  });
+
+  it('PAGR_ALLOW_ALWAYS=0 takes the option away even when Claude offered rules', async () => {
+    const { req } = await ask(make({ PAGR_ALLOW_ALWAYS: '0' }), 'write always please');
+    expect(req.options?.map((o) => o.optionId)).toEqual(['allow_once', 'reject_once']);
+  });
+
+  it('allow_always answers Claude with updatedPermissions; allow_once never does', async () => {
+    const a = make();
+    const { c, req } = await ask(a, 'write always please');
+    await a.respondToApproval({
+      approvalId: req.approvalId,
+      providerRequestId: req.providerRequestId,
+      decision: 'allow',
+      optionId: 'allow_always',
+    });
+    await c.waitFor((e) => e.kind === 'approval_resolved_locally');
+    const response = controlLines()[0]?.response as {
+      response: { behavior: string; updatedPermissions?: unknown[] };
+    };
+    expect(response.response).toMatchObject({
+      behavior: 'allow',
+      updatedPermissions: [
+        { type: 'addRules', rules: [{ toolName: 'Write', ruleContent: '//tmp/**' }] },
+      ],
+    });
+    await c.waitFor(sessionEvent('completed'));
+
+    // The same prompt answered "once" writes no rule anywhere.
+    fs.writeFileSync(controlFile, '');
+    const second = await a.sendInstruction({
+      sessionId: SES,
+      instruction: 'write always please, again',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    expect(second.delivered).toBe('new_turn');
+    const again = await c.waitFor(
+      (e) => e.kind === 'approval_requested' && e.approvalId !== req.approvalId,
+    );
+    if (again.kind !== 'approval_requested') throw new Error('unreachable');
+    await a.respondToApproval({
+      approvalId: again.approvalId,
+      providerRequestId: again.providerRequestId,
+      decision: 'allow',
+      optionId: 'allow_once',
+    });
+    await c.waitFor(
+      (e) => e.kind === 'approval_resolved_locally' && e.approvalId === again.approvalId,
+    );
+    const onceResponse = controlLines()[0]?.response as {
+      response: { behavior: string; updatedPermissions?: unknown[] };
+    };
+    expect(onceResponse.response.behavior).toBe('allow');
+    expect(onceResponse.response.updatedPermissions).toBeUndefined();
+  });
+
+  it('marks an approval answered elsewhere when the tool result arrives without our answer', async () => {
+    const a = make();
+    const { c, req } = await ask(a, 'write elsewhere');
+    const resolved = await c.waitFor((e) => e.kind === 'approval_resolved_locally');
+    expect(resolved).toMatchObject({
+      approvalId: req.approvalId,
+      resolution: 'allowed',
+      source: 'terminal',
+      answeredElsewhere: true,
+    });
+    // Nothing was written back to Claude: the person had already answered in their terminal.
+    expect(controlLines()).toEqual([]);
+    // …and the prompt is gone, so a late answer from a phone finds nothing to answer.
+    await expect(
+      a.respondToApproval({
+        approvalId: req.approvalId,
+        providerRequestId: req.providerRequestId,
+        decision: 'allow',
+      }),
+    ).rejects.toThrow(/unknown or expired approval/);
+  });
+});

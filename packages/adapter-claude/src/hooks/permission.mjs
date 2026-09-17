@@ -171,6 +171,14 @@ export function buildRequest(hook) {
   const providerRequestId =
     str(hook.tool_use_id) ?? str(hook.prompt_id) ?? `hook_${randomBytes(8).toString('hex')}`;
 
+  // The rules Claude is offering to persist if the user says "always". Forwarded so a prompt
+  // relayed through this hook gets the same options as one from a bridge-spawned session; the
+  // daemon reads only whether there are any. They never leave this Mac, and the copy that is
+  // written back into Claude's settings is the one right here, not one that made a round trip.
+  const permissionSuggestions = Array.isArray(hook.permission_suggestions)
+    ? hook.permission_suggestions.filter((x) => x !== null && typeof x === 'object').slice(0, 50)
+    : [];
+
   return {
     provider: 'claude',
     // Bridge-spawned sessions carry PAGR_SESSION_ID; the user's own interactive `claude` does
@@ -184,11 +192,16 @@ export function buildRequest(hook) {
     // way the bridge-spawned path does it in `@pagr/bridge-core`'s `relativizePaths`.
     preview: relativizePaths(preview, cwd).replace(/\s+/g, ' ').trim().slice(0, 1500),
     hints,
+    permissionSuggestions,
     cwd: cwd ?? null,
   };
 }
 
-/** Ask the daemon over the Unix socket. Resolves 'allow' | 'deny' | null (no decision). */
+/**
+ * Ask the daemon over the Unix socket. Resolves `{decision, optionId}` or null (no decision).
+ * `optionId` is the option the person actually chose on their phone; `allow_always` is the one
+ * that means "and write the rule", and anything unrecognised is treated as a plain answer.
+ */
 export function askDaemon(params, { sockPath = SOCK, timeoutMs = TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
     let done = false;
@@ -221,7 +234,11 @@ export function askDaemon(params, { sockPath = SOCK, timeoutMs = TIMEOUT_MS } = 
           if (m.id === 1) {
             const r = m.result ?? {};
             const d = r.decision ?? r.behavior;
-            return finish(d === 'allow' || d === 'deny' ? d : null);
+            if (d !== 'allow' && d !== 'deny') return finish(null);
+            return finish({
+              decision: d,
+              optionId: typeof r.optionId === 'string' ? r.optionId : undefined,
+            });
           }
         } catch {
           /* ignore non-JSON */
@@ -234,12 +251,20 @@ export function askDaemon(params, { sockPath = SOCK, timeoutMs = TIMEOUT_MS } = 
   });
 }
 
-/** `message` is deny-only per the hooks reference; an allow carries the decision and nothing else. */
-export function hookOutput(decision, message) {
+/**
+ * `message` is deny-only per the hooks reference; an allow carries the decision and nothing else —
+ * unless it is an "allow always", which carries `updatedPermissions` so Claude Code writes the
+ * rules it suggested into its own settings. Pagr stores no permission rules of its own.
+ */
+export function hookOutput(decision, message, updatedPermissions) {
+  const allow =
+    Array.isArray(updatedPermissions) && updatedPermissions.length > 0
+      ? { behavior: 'allow', updatedPermissions }
+      : { behavior: 'allow' };
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PermissionRequest',
-      decision: decision === 'deny' ? { behavior: 'deny', message } : { behavior: 'allow' },
+      decision: decision === 'deny' ? { behavior: 'deny', message } : allow,
     },
   });
 }
@@ -253,9 +278,16 @@ async function main() {
   }
   if (hook?.hook_event_name !== 'PermissionRequest') return;
   const params = buildRequest(hook);
-  const decision = await askDaemon(params);
-  if (decision === 'allow') process.stdout.write(hookOutput('allow'));
-  else if (decision === 'deny')
+  const answer = await askDaemon(params);
+  if (answer?.decision === 'allow')
+    process.stdout.write(
+      hookOutput(
+        'allow',
+        undefined,
+        answer.optionId === 'allow_always' ? params.permissionSuggestions : undefined,
+      ),
+    );
+  else if (answer?.decision === 'deny')
     process.stdout.write(hookOutput('deny', 'Denied by the user via Pagr'));
   // else: print nothing → native permission flow stays in control
 }

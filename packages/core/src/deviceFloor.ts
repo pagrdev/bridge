@@ -324,26 +324,38 @@ export class DeviceFloor {
    * `null` when a cloud `allow` may be relayed. Otherwise the refusal, naming every class that
    * blocked it. Never throws and never returns a partial allowance: an action carrying three
    * classes needs all three lifted.
+   *
+   * `persistent` is for the answers that outlive the prompt — "allow always", "allow for this
+   * session". Those are refused for any floored class *even when the host allow-list would have
+   * let this one action through*: a host list is a judgement about one command reaching one
+   * host, and a rule written into the agent's settings is forever. Only the `allow` list, which
+   * the user wrote by hand on this Mac, lifts a class for a persistent grant.
    */
-  check(a: LocalRiskAssessment): DeviceFloorRefusal | null {
-    const blocked = a.risks.filter((r) => !this.isLifted(r, a));
+  check(a: LocalRiskAssessment, opts: { persistent?: boolean } = {}): DeviceFloorRefusal | null {
+    const persistent = opts.persistent === true;
+    const blocked = a.risks.filter((r) => !this.isLifted(r, a, persistent));
     if (blocked.length === 0) return null;
     const what = blocked.map((r) => RISK_DESCRIPTIONS[r]).join(', and ');
     return {
       risks: blocked,
       message:
         `This Mac's device policy refused the approval: the action would ${what}. ` +
+        (persistent
+          ? 'A standing grant ("allow always", "allow for this session") is never carried for ' +
+            'that, and a host allow-list does not lift it — it covers one action, not a rule. '
+          : '') +
         'A decision from Pagr is not enough for that on its own. To allow it, put ' +
         `"allow": ${JSON.stringify(blocked)} in ~/.pagr/device-policy.json, or start the daemon ` +
         `with ${DEVICE_FLOOR_ENV}=${blocked.join(',')}, then ask again.`,
     };
   }
 
-  private isLifted(risk: DeviceRiskKind, a: LocalRiskAssessment): boolean {
+  private isLifted(risk: DeviceRiskKind, a: LocalRiskAssessment, persistent = false): boolean {
     if (this.allowed.has(risk)) return true;
     // A host the user listed locally is not "a new host". Every host the action names must be
-    // listed: one unknown host is enough to keep the class in force.
-    if (risk === 'network' && a.hosts.length > 0 && this.hosts.size > 0)
+    // listed: one unknown host is enough to keep the class in force. A persistent grant is not
+    // about one action at all, so the host list says nothing about it.
+    if (!persistent && risk === 'network' && a.hosts.length > 0 && this.hosts.size > 0)
       return a.hosts.every((h) => this.hosts.has(h));
     return false;
   }

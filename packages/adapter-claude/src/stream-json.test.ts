@@ -71,6 +71,20 @@ describe('parseStreamLine', () => {
       toolUseId: 'toolu_01Tu',
       toolName: 'Write',
       input: { file_path: '/p/hello.txt', content: 'hi\n' },
+      // The rules Claude offers to persist. Their presence is what makes "allow always" real.
+      suggestions: [{ type: 'setMode', mode: 'acceptEdits' }],
+    });
+    // No suggestions on the request → no `suggestions` field, and so no "allow always" option.
+    expect(
+      parseStreamLine(
+        '{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"toolu_2","permission_suggestions":[]}}',
+      ),
+    ).toEqual({
+      type: 'permission_request',
+      requestId: 'r2',
+      toolUseId: 'toolu_2',
+      toolName: 'Bash',
+      input: { command: 'ls' },
     });
     expect(parseStreamLine('{"type":"control_cancel_request","request_id":"x"}')).toEqual({
       type: 'permission_cancel',

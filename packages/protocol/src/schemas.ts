@@ -701,7 +701,7 @@ export const EventPayloads = {
     approvalId: ApprovalId,
     resolution: z.enum(['allowed', 'denied', 'timed_out', 'canceled']),
     /** v2. Where the answer came from, so the phone can say "answered on your Mac". */
-    source: z.enum(['terminal', 'ide', 'provider', 'bridge', 'timeout']).optional(),
+    source: z.enum(['terminal', 'ide', 'provider', 'bridge', 'timeout', 'shutdown']).optional(),
     /**
      * v2. True when somebody answered it somewhere else while the phone was showing it — the
      * phone dismisses its card instead of reporting an error.
