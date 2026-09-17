@@ -120,6 +120,12 @@ export const DEFAULT_REFRESH_MS = 5000;
  */
 export const SESSION_HEARTBEAT_MS = 60 * 60_000;
 
+/** Index of the last `text` block in a message, or -1. One turn, one iMessage line. */
+function lastTextBlock(blocks: { type: string }[]): number {
+  for (let i = blocks.length - 1; i >= 0; i--) if (blocks[i]?.type === 'text') return i;
+  return -1;
+}
+
 export class ClaudeMirror {
   private readonly env: NodeJS.ProcessEnv;
   private readonly bridge: MirrorBridge;
@@ -407,6 +413,10 @@ export class ClaudeMirror {
     blocks: AssistantBlock[],
     t: TailedRecord,
   ): void {
+    // A message that calls no tool is the end of the turn. Never a subagent's message: a side
+    // thread finishing is not the session answering, and the iMessage line is the answer.
+    const endsTurn = !t.subagent && !blocks.some((b) => b.type === 'tool_use');
+    const last = lastTextBlock(blocks);
     blocks.forEach((b, i) => {
       const id = blockFrameId(rec.uuid, i);
       switch (b.type) {
@@ -416,7 +426,15 @@ export class ClaudeMirror {
           return;
         case 'text':
           if (!b.text.trim()) return;
-          this.frame(s, { kind: 'assistant', text: b.text }, t, {}, id, rec.timestamp);
+          this.frame(
+            s,
+            { kind: 'assistant', text: b.text },
+            t,
+            {},
+            id,
+            rec.timestamp,
+            endsTurn && i === last,
+          );
           return;
         case 'tool_use':
           this.rememberCall(s, b.toolUseId, { name: b.name, input: b.input });
@@ -594,6 +612,7 @@ export class ClaudeMirror {
     meta: Omit<Partial<JournalMeta>, 'source'>,
     providerRecordId?: string,
     at?: string,
+    endsTurn = false,
   ): void {
     const subagent = t.subagent;
     // A subagent's frames hang off the `Task` call that spawned it, so the phone can fold the
@@ -612,6 +631,7 @@ export class ClaudeMirror {
       },
       ...(providerRecordId ? { providerRecordId: scoped(providerRecordId, subagent) } : {}),
       ...(at ? { at } : {}),
+      ...(endsTurn ? { endsTurn: true } : {}),
     });
     this.lastFrameAt = this.now().toISOString();
   }

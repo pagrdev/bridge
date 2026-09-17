@@ -17,6 +17,11 @@ export interface MappedFrame {
   body: FrameBody;
   meta: JournalMeta;
   providerRecordId?: string;
+  /**
+   * The agent's last word of the turn. Codex says exactly one `agentMessage` per turn and says it
+   * when the turn is over, so the mapping is direct — see `EmitFrameInput.endsTurn`.
+   */
+  endsTurn?: boolean;
 }
 
 export interface ItemMapOptions {
@@ -175,6 +180,9 @@ export function framesForItem(item: ThreadItem, o: ItemMapOptions): MappedFrame[
           body: { kind: 'assistant', text },
           meta: metaFor(o, { final: true, status: 'ok' }),
           providerRecordId: recordIdFor(item, o),
+          // Not for a backfill: replaying last week's transcript must not put last week's
+          // answers back into the iMessage thread.
+          ...(o.source === 'backfill' ? {} : { endsTurn: true }),
         },
       ];
     }

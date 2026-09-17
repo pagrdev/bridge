@@ -1,6 +1,6 @@
 {
   "name": "pagr-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Pagr bridge — open-source macOS daemon that lets Pagr's cloud drive your local Claude Code and Codex sessions through typed, signed commands. No remote shell.",
   "license": "Apache-2.0",

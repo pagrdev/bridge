@@ -12,6 +12,10 @@ This repository is the open-source half of Pagr: the daemon and CLI that run on 
 - A local **project registry** mapping opaque `proj_…` IDs to folders. Any folder on your disk can be reached — naming one on this Mac (`pagr project use`, `project add`, or `project scan`) mints its id — but only this Mac can turn a path into an id. The cloud only ever sees the ID and a display name, and an id it invents resolves to nothing.
 - A **command guard** that rejects anything that isn't a schema-valid, server-signed, unexpired, non-replayed command bound to this device.
 - A **device-side approval floor**: every permission prompt is classified on your Mac, and a decision from the cloud is refused for remote scripts, network egress, paths outside the project, credential files, privilege escalation and destructive or history-rewriting git — unless *you* lift that class in `~/.pagr/device-policy.json` or `PAGR_DEVICE_FLOOR`. No command can lift it. `pagr doctor` shows what is in force.
+- An **end-to-end-encrypted transcript** for the iPhone app (protocol v2). Each piece of a session — your messages, the agent's, its thinking, every tool call and its output, diffs, terminal blocks — is journaled in plaintext on **your** disk and sealed on this Mac for the phones you paired before it goes anywhere. The cloud relays ciphertext it holds no key for.
+- A **local archive and backfill**: `~/.pagr/journal/` keeps 30 days (2 GiB ceiling), so a phone that has been away, or a new phone, can ask this Mac for older history instead of the cloud keeping a copy. `pagr sessions purge` empties it.
+- **Questions, not just approvals.** `AskUserQuestion` and Codex's `requestUserInput` are relayed with their real structure — header, options, multi-select — and answered from the phone or the lock screen.
+- **Keep-awake, honestly scoped.** While a session is live or a prompt is waiting, the Mac is held against **idle sleep** (`caffeinate -i -s`). Closing the lid still sleeps it, and Pagr says so rather than promising otherwise. `PAGR_KEEP_AWAKE=0` turns it off.
 
 ## What the bridge is not
 
@@ -28,7 +32,9 @@ pagr project use      # make the current folder reachable (repo or not) — no s
 pagr project add      # …or register it under a name you choose
 pagr project scan     # …or find every repo under ~/code, ~/src, ~/Developer… and pick
 pagr projects         # what is reachable, and what is running in each
-pagr status
+pagr status           # pairing, daemon, gateway — and the phone link: protocol, phone keys,
+                      # keep-awake, channel, mirror, journal size
+pagr sessions         # what is running, what Pagr may drive, and how much journal each has
 pagr claude           # start Claude Code with the Pagr channel (see below)
 ```
 
@@ -37,6 +43,21 @@ directory), stops at each `.git`, skips `node_modules`/caches/hidden folders, an
 found. Add `--dry-run` to preview, `--all` to take everything, `--json` for a machine-readable
 plan. Names come from the folder plus the GitHub repo name, so you can text either; collisions
 are qualified (`two/app`) rather than silently duplicated. Running it twice is a no-op.
+
+## What your phone sees, and what our cloud sees
+
+| | Your phone | The Pagr cloud |
+| --- | --- | --- |
+| the words: messages, thinking, tool output, diffs, terminal blocks | yes — it holds the key | **no.** It stores and relays a sealed envelope |
+| ids, statuses, timestamps, project and Mac names | yes | yes — routing, push and the session list need them |
+| an approval's preview | yes, sealed | no. It sees the action type, the risk hints and a hash |
+| a question's words and option labels | yes, sealed | no. It sees how many options there are, and which take more than one |
+| what you type on your phone | — | **yes.** The phone→Mac direction travels in signed command payloads and is not sealed |
+| the line your iMessage thread shows | — | yes, while you have a thread linked — iMessage is plaintext by nature |
+
+`pagr status` prints the fingerprints of every phone this Mac seals to; compare them with what the
+app shows. [`docs/SECURITY.md`](docs/SECURITY.md) § *What changed for the iPhone app* states the
+boundary exactly, including what it does **not** defend against.
 
 ## Control a terminal session from your phone
 

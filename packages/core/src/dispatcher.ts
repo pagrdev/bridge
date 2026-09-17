@@ -49,7 +49,8 @@ import {
 import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.js';
 import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFloor.js';
 import { type EventPayloadInput, makeEvent } from './events.js';
-import { chunkFrame, type FrameBody } from './frames.js';
+import { chunkFrame, type FrameBody, type FrameQuestion } from './frames.js';
+import { clip } from './heuristics.js';
 import { type ChannelBridge, getChannelBridge } from './ipc.js';
 import type { JournalEntry, JournalMeta, JournalStore, OutboxCursors } from './journal.js';
 import type { Logger } from './logging.js';
@@ -69,7 +70,7 @@ import {
 } from './questions.js';
 import { handleFor, RepoHandleCache, scanRepos } from './repoScan.js';
 import { importRecipientKeys, type RecipientKeySet, sealFrame } from './seal.js';
-import { isAdopted, isReportable, type SessionStore } from './sessions.js';
+import { isAdopted, isReportable, type SessionStore, UNREGISTERED_PROJECT } from './sessions.js';
 
 /**
  * How an adopted session is labelled for the person looking at their phone. It has to be
@@ -117,6 +118,51 @@ export const MAX_HELLO_SESSIONS = 100;
  */
 export const MAX_HELLO_BYTES = 128 * 1024;
 
+/**
+ * Named capabilities a v2 `device.hello` may advertise.
+ *
+ * Every one of them is a FACT about this daemon as it is running right now, not a build-time
+ * constant: a name appears here exactly when the thing behind it will actually work, so a cloud
+ * that gates a button on one is never lying to the person holding the phone. The gating is
+ * enumerated in `Dispatcher.helloCapabilities`.
+ */
+export const HELLO_CAPABILITIES = {
+  /** Sealed transcript frames: a journal is wired up, so `session.frame` can be produced. */
+  frames: 'frames.v1',
+  /** The frames can actually be sealed: the daemon has (or can be handed) a recipient key set. */
+  seal: 'seal.v1',
+  /** `question.asked` / `agent.answer_question`: some adapter can write an answer back. */
+  questions: 'questions.v1',
+  /** The agent's own option list travels on `approval.requested` and `optionId` is honoured. */
+  approvalOptions: 'approval_options.v1',
+  /** `session.list_history` / `session.backfill`: a history source is wired up. */
+  backfill: 'backfill.v1',
+  /** `repo.scan` / `project.register_handle` (`PAGR_REMOTE_PROJECT_PICK`). */
+  repoScan: 'repo_scan.v1',
+  /** The Mac is held awake while Pagr has live work (`PAGR_KEEP_AWAKE`, macOS only). */
+  keepAwake: 'keep_awake.v1',
+  /** The Claude Code channel is registered, so a terminal session can be given a turn. */
+  channel: 'channel.v1',
+} as const;
+
+/**
+ * What `device.hello` v2 says about the Claude Code channel. Every field is a local fact the
+ * daemon already holds; nothing here forks `claude` (a hello is sent on every connect).
+ */
+export interface HelloChannelStatus {
+  /** The channel server file is present in this install. */
+  serverInstalled: boolean;
+  /** The daemon's `channel.*` IPC is on AND the server is installed, so `pagr claude` can attach. */
+  registered: boolean;
+  /** Claude sessions bound by session id right now. */
+  boundSessions: number;
+  /** Never `steered`: a channel line is surfaced to Claude at the next turn boundary. */
+  mode: 'queued_next_turn' | 'off';
+}
+
+/** Longest iMessage line the bridge composes from an agent's final message. */
+export const IMESSAGE_CLIP = 500;
+
 const TERMINAL_STATUSES = new Set<SessionStatus>(['completed', 'failed', 'stopped']);
 const isTerminalStatus = (s: SessionStatus): boolean => TERMINAL_STATUSES.has(s);
 
@@ -124,7 +170,7 @@ const helloBytes = (hello: EventPayload<'device.hello'>): number =>
   Buffer.byteLength(JSON.stringify(hello), 'utf8');
 
 /** Live sessions first, then the most recently updated: what a phone opening the app needs. */
-export function rankHelloSessions(sessions: SessionSummary[]): SessionSummary[] {
+export function rankHelloSessions<T extends SessionSummary>(sessions: T[]): T[] {
   return [...sessions].sort((a, b) => {
     const live = Number(isLiveStatus(b.status)) - Number(isLiveStatus(a.status));
     if (live !== 0) return live;
@@ -217,6 +263,16 @@ export interface DispatcherOptions {
    */
   recipientKeyIds?: () => string[];
   /**
+   * The protocol version in force on the current link (`GatewayClient.negotiatedVersion`). Read
+   * at hello time, because it is a property of the connection, not of the daemon. Absent means 1,
+   * and a v1 hello carries exactly the fields it carried before v2 existed.
+   */
+  negotiatedVersion?: () => number;
+  /** Whether this Mac is actually being held awake (`KeepAwake` minus its opt-outs). */
+  keepAwakeEnabled?: () => boolean;
+  /** Live Claude channel facts for `device.hello` v2. Absent means "this bridge has no channel". */
+  channelHello?: () => HelloChannelStatus;
+  /**
    * Called whenever the set of pending approvals changes. The daemon uses it to hold the Mac
    * awake while somebody still has a prompt to answer; nothing in the dispatcher depends on it.
    */
@@ -300,6 +356,36 @@ export interface EmitFrameInput {
   providerRecordId?: string;
   at?: string;
   imessage?: string;
+  /**
+   * This frame is the agent's last word of the turn — a message with nothing else to do after it.
+   *
+   * Both agents end a turn the same way: an assistant message that calls no tool. The adapters
+   * say so here rather than the dispatcher guessing, and it is what decides which single frame of
+   * a turn carries the plaintext `imessage` line. Anything else would put one line in the
+   * iMessage thread per paragraph the model wrote.
+   */
+  endsTurn?: boolean;
+}
+
+/** How an agent is named in a line a person reads in their iMessage thread. */
+export const agentName = (provider: Provider): string =>
+  provider === 'claude' ? 'Claude' : 'Codex';
+
+/**
+ * The plaintext iMessage line for a question: who asked, and what they asked.
+ *
+ * The header when the agent gave one (it is the short form the model itself wrote for a narrow
+ * column), otherwise the question text. Only the FIRST question of a multi-question ask: the
+ * thread gets a nudge to open the app, not the whole sheet, and the options are never included
+ * because answering happens on the phone where they are legible.
+ */
+export function questionImessageLine(q: {
+  provider: Provider;
+  questions: FrameQuestion[];
+}): string {
+  const first = q.questions[0];
+  const text = (first?.header || first?.question || 'a question').trim();
+  return clip(`${agentName(q.provider)} asked: ${text}`, IMESSAGE_CLIP);
 }
 
 /** One journaled frame the gateway has not acked, ready to go back on the wire. */
@@ -435,7 +521,11 @@ export class Dispatcher {
       meta: input.meta,
       body,
     };
-    for (const event of this.frameEvents(entry, input.imessage)) this.o.emit(event);
+    for (const event of this.frameEvents(
+      entry,
+      input.imessage ?? this.imessageLineFor(body, input),
+    ))
+      this.o.emit(event);
     channel.cursors.noteSent(sessionId, seq);
     return { seq, emitted: true };
   }
@@ -510,6 +600,25 @@ export class Dispatcher {
     if (!channel) return null;
     if (channel.protocolVersion() < 2) return 'protocol_v1';
     return this.recipients().length === 0 ? 'no_recipients' : null;
+  }
+
+  /** True when the account has an iMessage thread linked, so a plaintext line may be sent. */
+  private imessageLinked(): boolean {
+    return this.o.frames?.imessageLinked?.() === true;
+  }
+
+  /**
+   * The plaintext line this frame contributes to the iMessage thread, or undefined.
+   *
+   * Only the agent's final message of a turn produces one, and only when a thread is linked: a
+   * line here travels in the clear through the cloud's messaging path, so nothing composes one
+   * speculatively "in case" the feature is switched on later. The gate is re-read on every frame,
+   * which is what makes `settings.updated` take effect mid-connection.
+   */
+  private imessageLineFor(body: FrameBody, input: EmitFrameInput): string | undefined {
+    if (!input.endsTurn || body.kind !== 'assistant' || !this.imessageLinked()) return undefined;
+    const line = clip(body.text, IMESSAGE_CLIP);
+    return line === '' ? undefined : line;
   }
 
   /** One `session.frame` event per sealed chunk. All of them carry the same `seq`. */
@@ -685,7 +794,9 @@ export class Dispatcher {
         this.logger.warn('probe failed', { provider: adapter.provider, error: String(err) });
       }
     }
-    const sessions: SessionSummary[] = [];
+    const version = this.helloProtocolVersion();
+    const v2 = version >= 2;
+    const sessions: SessionSummaryV2[] = [];
     const seen = new Set<string>();
     for (const adapter of this.o.adapters.values()) {
       try {
@@ -718,17 +829,37 @@ export class Dispatcher {
     }
     // v2 capabilities. Only facts: a name appears here exactly when the command behind it will
     // actually run on this Mac, so a cloud that gates a button on one is never lying to a user.
-    const capabilityNames = this.remotePickEnabled() ? ['repo_scan.v1'] : [];
+    //
+    // On a v1 link this is the one name v1 ever carried, and the hello stays byte-identical to
+    // what a pre-v2 gateway has always received — a gateway that answered 1 has told us it has
+    // never heard of the rest, and a hello is not the place to find out how it copes.
+    const capabilityNames = v2
+      ? this.helloCapabilities()
+      : this.remotePickEnabled()
+        ? [HELLO_CAPABILITIES.repoScan]
+        : [];
     const recipientKeyIds = [...(this.o.recipientKeyIds?.() ?? [])].sort();
+    const ranked = rankHelloSessions(sessions).slice(
+      0,
+      this.o.maxHelloSessions ?? MAX_HELLO_SESSIONS,
+    );
+    const channel = v2 ? this.o.channelHello?.() : undefined;
+    const lifted = this.floor.lifted;
     const hello: EventPayload<'device.hello'> = {
       bridgeVersion: this.o.bridgeVersion,
-      protocolVersion: 1,
+      // The NEGOTIATED version, not an offer: a hello is the first thing sent on a connection
+      // whose version has already been settled by `auth.result`, so it reports what is in force.
+      protocolVersion: version,
       platform: 'darwin',
       osVersion: this.o.osVersion ?? release(),
       agents,
       projects: this.o.registry.summaries(),
-      sessions: rankHelloSessions(sessions).slice(0, this.o.maxHelloSessions ?? MAX_HELLO_SESSIONS),
+      sessions: v2 ? ranked.map((s) => this.helloSession(s)) : ranked,
       ...(capabilityNames.length > 0 ? { capabilities: capabilityNames } : {}),
+      // v2. Always present on a v2 link, empty array and all: "nothing is lifted" is a fact the
+      // app's Security screen states, and an absent field would read as "this bridge cannot say".
+      ...(v2 ? { floor: { lifted } } : {}),
+      ...(channel ? { channel } : {}),
       // v2, and omitted when empty: a hello with no phones in it says the same thing to a v2
       // gateway as it does to a v1 one that has never heard of the field.
       ...(recipientKeyIds.length > 0 ? { recipientKeyIds } : {}),
@@ -742,13 +873,74 @@ export class Dispatcher {
     return this.fitHello(hello, sessions.length);
   }
 
+  /** The version in force on this connection. 1 when nothing has negotiated anything. */
+  private helloProtocolVersion(): 1 | 2 {
+    return (this.o.negotiatedVersion?.() ?? 1) >= 2 ? 2 : 1;
+  }
+
+  /**
+   * The capability names this daemon may honestly advertise, in a stable order.
+   *
+   * Each line is the same condition the command behind it is actually gated on elsewhere in this
+   * file, so the two cannot drift: `backfill.v1` is `this.o.backfill`, which is what makes
+   * `session.backfill` answer instead of `capability_unsupported`, and so on.
+   */
+  helloCapabilities(): string[] {
+    const names: string[] = [];
+    const frames = this.o.frames !== undefined;
+    if (frames) names.push(HELLO_CAPABILITIES.frames);
+    // Sealing needs both halves: something to seal (the journal) and somewhere to get the phone
+    // keys from. A set that is merely empty right now still counts — the phones arrive with
+    // `auth.result` and `keys.updated`, and `recipientKeyIds` says which are pinned this second.
+    if (frames && this.o.recipientKeyIds !== undefined) names.push(HELLO_CAPABILITIES.seal);
+    if ([...this.o.adapters.values()].some((a) => typeof a.answerQuestion === 'function'))
+      names.push(HELLO_CAPABILITIES.questions);
+    // Unconditional: the dispatcher forwards whatever options an adapter offers and refuses an
+    // `optionId` the prompt never carried, for every provider and both directions.
+    names.push(HELLO_CAPABILITIES.approvalOptions);
+    if (this.o.backfill !== undefined) names.push(HELLO_CAPABILITIES.backfill);
+    if (this.remotePickEnabled()) names.push(HELLO_CAPABILITIES.repoScan);
+    if (this.o.keepAwakeEnabled?.() === true) names.push(HELLO_CAPABILITIES.keepAwake);
+    if (this.o.channelHello?.().registered === true) names.push(HELLO_CAPABILITIES.channel);
+    return names;
+  }
+
+  /**
+   * A summary as v2 describes it: what Pagr may do with the session, who started it, whether its
+   * directory is a project, how far this Mac's journal for it goes, and — for a session running
+   * somewhere Pagr does not know about — the handle that turns the folder into a project.
+   *
+   * Anything the adapter already said is kept: a mirrored Codex thread and a mirrored Claude
+   * session arrive here already carrying their control level and origin, and this Mac's
+   * `sessions.json` knows nothing better about them than they do.
+   */
+  private helloSession(s: SessionSummaryV2): SessionSummaryV2 {
+    const rec = this.o.sessions.get(s.sessionId);
+    const adopted = rec ? isAdopted(rec) : false;
+    const out: SessionSummaryV2 = { ...s };
+    if (out.controlLevel === undefined)
+      out.controlLevel = !adopted
+        ? 'full'
+        : this.channelBoundTo(s.sessionId)
+          ? 'full'
+          : 'approvals_only';
+    if (out.origin === undefined) out.origin = adopted ? 'terminal' : 'pagr';
+    if (out.projectStatus === undefined)
+      out.projectStatus = s.projectId === UNREGISTERED_PROJECT ? 'unregistered' : 'registered';
+    if (out.repoHandle === undefined && out.projectStatus === 'unregistered' && rec?.cwd) {
+      const handle = this.offerRepoHandle(rec.cwd);
+      if (handle) out.repoHandle = handle;
+    }
+    return this.withLastSeq(out);
+  }
+
   /**
    * A session's status as this Mac knows it. `sessions.json` is reconciled against the providers
    * at every daemon start, so a session it records as completed / failed / stopped is finished —
    * and a hello must never tell the cloud otherwise. The gateway upserts these summaries, so one
    * downgraded row is enough to make a dead session look resumable on the user's phone (BR-4).
    */
-  private authoritative(summary: SessionSummary): SessionSummary {
+  private authoritative(summary: SessionSummaryV2): SessionSummaryV2 {
     const rec = this.o.sessions.get(summary.sessionId);
     if (!rec || !isTerminalStatus(rec.status) || isTerminalStatus(summary.status)) return summary;
     return { ...summary, status: rec.status, activeTurn: false, updatedAt: rec.updatedAt };
@@ -1566,6 +1758,12 @@ export class Dispatcher {
       // answers with `decision` alone, which is why it is never the only thing we send.
       ...(options.length > 0 ? { options } : {}),
       ...(sealedPreview ? { frameSeq: frame.seq } : {}),
+      // Plaintext, and only when a thread is linked. It is the same one-liner the iMessage thread
+      // has always shown for a prompt — the preview — which is why sealing the preview for the
+      // phone did not have to cost the thread its message.
+      ...(this.imessageLinked()
+        ? { imessage: clip(`${agentName(record.provider)}: ${record.preview}`, IMESSAGE_CLIP) }
+        : {}),
     });
     // Nothing decides it here. The prompt now waits for the person — on their phone, or in the
     // terminal the agent is running in, whichever answers first. The bridge used to auto-approve
@@ -1646,6 +1844,7 @@ export class Dispatcher {
         secret: record.secret,
       },
       expiresAt: record.expiresAt,
+      ...(this.imessageLinked() ? { imessage: questionImessageLine(record) } : {}),
     });
     return record;
   }
@@ -1706,6 +1905,7 @@ export class Dispatcher {
           ...(e.providerRecordId ? { providerRecordId: e.providerRecordId } : {}),
           ...(e.at ? { at: e.at } : {}),
           ...(e.imessage ? { imessage: e.imessage } : {}),
+          ...(e.endsTurn ? { endsTurn: true } : {}),
         });
         return;
       case 'approval_requested': {

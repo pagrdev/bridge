@@ -235,6 +235,15 @@ const CAPABILITIES = {
  * documented stdio permission-prompt protocol; nothing is auto-allowed. Credentials are never
  * read, stored or transmitted.
  */
+/**
+ * Index of the last `text` block in an assistant message, or -1. The turn-ending iMessage line
+ * belongs to exactly one frame, and this is the one a person would read as the answer.
+ */
+function lastTextBlock(blocks: { type: string }[]): number {
+  for (let i = blocks.length - 1; i >= 0; i--) if (blocks[i]?.type === 'text') return i;
+  return -1;
+}
+
 export class ClaudeAdapter implements CodingAgentAdapter {
   readonly provider = 'claude' as const;
   private readonly logger: FileLogger;
@@ -973,6 +982,10 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     live: LiveSession,
     rec: Extract<StreamRecord, { type: 'assistant_blocks' }>,
   ): void {
+    // A message that calls no tool is the end of the turn: Claude only stops when it has nothing
+    // left to run. `result` confirms it a moment later, but by then the frame has gone, so this
+    // is the only point at which the last word of a turn is still identifiable as such.
+    const endsTurn = !rec.blocks.some((b) => b.type === 'tool_use');
     rec.blocks.forEach((b, i) => {
       switch (b.type) {
         case 'thinking':
@@ -981,7 +994,16 @@ export class ClaudeAdapter implements CodingAgentAdapter {
           return;
         case 'text':
           if (!b.text.trim()) return;
-          this.frame(live, { kind: 'assistant', text: b.text }, {}, blockId(rec.uuid, i), rec.at);
+          this.frame(
+            live,
+            { kind: 'assistant', text: b.text },
+            {},
+            blockId(rec.uuid, i),
+            rec.at,
+            // Only the last text block of a final message: a model that wrote three paragraphs
+            // is one message in the thread, not three.
+            endsTurn && i === lastTextBlock(rec.blocks),
+          );
           return;
         case 'tool_use':
           this.rememberToolCall(live, b.toolUseId, { name: b.name, input: b.input });
@@ -1126,6 +1148,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     meta: Omit<Partial<JournalMeta>, 'source'> = {},
     providerRecordId?: string,
     at?: string,
+    endsTurn = false,
   ): void {
     this.emit({
       kind: 'frame',
@@ -1135,6 +1158,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       meta: { source: 'stdio', ...meta },
       ...(providerRecordId ? { providerRecordId } : {}),
       ...(at ? { at } : {}),
+      ...(endsTurn ? { endsTurn: true } : {}),
     });
   }
 

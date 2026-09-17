@@ -1,9 +1,16 @@
 import { existsSync } from 'node:fs';
-import { inspectConfig, ProjectRegistry } from '@pagr/bridge-core';
+import { describeKeepAwake, inspectConfig, ProjectRegistry } from '@pagr/bridge-core';
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { daemonStatus } from '../ipc.js';
 import { bad, bold, dim, kv, ok, printJson, shortId, warn } from '../output.js';
+import {
+  describeChannel,
+  describeJournal,
+  describeMirror,
+  describeProtocol,
+  describeRecipientKeys,
+} from './doctor.js';
 
 export interface AgentLine {
   provider: 'claude' | 'codex';
@@ -61,6 +68,16 @@ export async function runStatus(ctx: CliContext): Promise<void> {
     adoptedSessions: status?.adoptedSessions ?? null,
     unregisteredSessions: status?.unregisteredSessions ?? null,
     pendingApprovals: status?.pendingApprovals ?? null,
+    // v2. What the phone half of Pagr depends on, in the order a person would ask about it:
+    // is the link speaking v2 at all, who can read what it sends, will the Mac stay awake,
+    // can a terminal be given a turn, is your own work being mirrored, and how much of it is
+    // sitting in plaintext on this disk.
+    protocolVersion: status?.protocolVersion ?? null,
+    recipientKeyIds: status?.recipientKeyIds ?? null,
+    keepAwake: status?.keepAwake ?? null,
+    channel: status?.channel ?? null,
+    mirror: status?.mirror ?? null,
+    journalBytes: status?.journalBytes ?? null,
   };
   if (ctx.json) {
     printJson(ctx, data);
@@ -111,6 +128,20 @@ export async function runStatus(ctx: CliContext): Promise<void> {
         `${data.unregisteredSessions} of your own session(s) run outside every registered project, so their prompts stay in the terminal — see \`pagr sessions\``,
       ),
     );
+  if (status) {
+    ctx.out('');
+    ctx.out(bold('Phone link'));
+    ctx.out(
+      kv([
+        ['protocol', describeProtocol(status.protocolVersion)],
+        ['phone keys', describeRecipientKeys(status.recipientKeyIds)],
+        ['keep-awake', status.keepAwake ? describeKeepAwake(status.keepAwake) : 'unknown'],
+        ['channel', describeChannel(status.channel)],
+        ['mirror', status.mirror ? describeMirror(status.mirror) : 'nothing mirrored yet'],
+        ['journal', describeJournal(status.journalBytes)],
+      ]),
+    );
+  }
   ctx.out('');
   ctx.out(bold('Agents'));
   ctx.out(

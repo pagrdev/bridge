@@ -8,6 +8,27 @@ Start with `pagr doctor`. It checks Node, `~/.pagr` (existence, writability, 070
 - `pagr doctor --offline` skips the network checks.
 - `pagr status` shows the live picture; `pagr daemon logs -f` streams `~/.pagr/logs/daemon.log`.
 
+### Where the phone-app entries are
+
+Protocol v2 added a lot of moving parts, and each has its own section rather than a row in the
+table below. In the order things usually go wrong:
+
+| If | Read |
+| --- | --- |
+| `pagr claude` shows a full-screen warning **every** launch | *Taking a turn in a terminal session (`pagr claude`)* |
+| Claude refuses the model, or the channel flag does nothing | same section — the floor is Claude Code **2.1.251** |
+| the Claude panel in VS Code / Cursor can be approved but not steered | *Taking a turn…* → *Things that surprise people* — IDE sessions are `approvals_only` by design |
+| terminal Codex threads never appear on the phone | *Codex daemon not running* |
+| a prompt from your own `claude` never reaches your phone | *Claude approvals not reaching your phone* |
+| a question (`AskUserQuestion`) never reaches your phone | *A question never reached my phone* |
+| a new phone shows only the last few days | *Older history missing on a new phone* |
+| the Mac sleeps in the middle of a run | *Mac keeps sleeping while Pagr works* |
+| the app shows nothing at all and `pagr status` says `v1` | the gateway has not accepted protocol v2 — `pagr status` → **protocol**, then update the bridge |
+| the app shows metadata but no words | no phone key is pinned — `pagr status` → **phone keys**; pair the phone, then the journal drains |
+
+`pagr status` now prints one line for each of those facts (protocol, phone keys, keep-awake,
+channel, mirror, journal), so it is the quickest way to tell which section you need.
+
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `pagr status` says **daemon not running** | launch agent not installed / not loaded, or crashed at start | `pagr daemon install`, then `pagr daemon logs`. Foreground debugging: `pagr daemon run` |

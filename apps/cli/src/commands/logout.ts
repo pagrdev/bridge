@@ -1,4 +1,5 @@
 import { existsSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { deleteIdentity, readConfig, uninstallLaunchAgent } from '@pagr/bridge-core';
 import type { Command } from 'commander';
 import { removeHookForUser } from '../claudeHook.js';
@@ -20,6 +21,20 @@ export interface LogoutResult {
   /** Whether the user-scope Claude Code channel registration was removed with it. */
   claudeChannelRemoved: boolean;
 }
+
+/**
+ * Everything protocol v2 added under `~/.pagr` that a logout must take with it.
+ *
+ * The journal is the reason this list exists: it holds plaintext copies of your own sessions —
+ * what you typed and what the agent said — so a pairing that is being torn down must not leave
+ * them behind. `tailer-state.json` records how far each Claude transcript was read, which is
+ * meaningless without the journal it fed. `replay.json` is the anti-replay nonce set for a device
+ * key that has just been deleted. `config.json` carries `recipientKeys`, the phones this Mac was
+ * sealing to, and goes with the rest of the pairing.
+ *
+ * `~/.claude` and `~/.codex` are NOT in it and never will be: they are the agents' own files.
+ */
+export const V2_LOGOUT_PATHS = ['journal', 'tailer-state.json', 'replay.json'] as const;
 
 /**
  * Tear down the local half of a pairing. `report: false` lets `uninstall` reuse it without
@@ -46,13 +61,24 @@ export async function runLogout(
   // registered would have every `pagr claude` spawn a process that can only fail.
   const channelRemoved = removeChannelRegistration(ctx);
   const removed: string[] = [];
-  const files = [ctx.paths.configFile, ctx.paths.sessionsFile, ctx.paths.replayFile];
+  const files = [
+    ctx.paths.configFile, // pairing, pinned server keys AND the pinned `recipientKeys`
+    ctx.paths.sessionsFile,
+    ctx.paths.replayFile,
+    join(ctx.home, 'tailer-state.json'),
+  ];
   if (opts.purge) files.push(ctx.paths.projectsFile, ctx.paths.policyFile);
   for (const f of files) {
     if (existsSync(f)) {
       rmSync(f, { force: true });
       removed.push(f);
     }
+  }
+  // The journal is plaintext transcript, so it goes whole — directory and all — rather than being
+  // left for a retention sweep that will never run again on an unpaired Mac.
+  if (existsSync(ctx.paths.journalDir)) {
+    rmSync(ctx.paths.journalDir, { recursive: true, force: true });
+    removed.push(ctx.paths.journalDir);
   }
   // Only clear a stale socket: a daemon still answering (e.g. a foreground `daemon run`) keeps it.
   const sock = socketPath(ctx);
@@ -89,6 +115,7 @@ export async function runLogout(
         : `config removed ${dim('(projects kept; use --purge to drop them)')}`,
     ),
   );
+  ctx.out(ok('session journals, transcript cursors and pinned phone keys removed'));
   // Logging out only clears this Mac. The device is still registered on the account until it is
   // revoked, so say so even when we cannot work out the dashboard's URL to link to.
   if (config.deviceId) {

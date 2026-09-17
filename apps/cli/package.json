@@ -1,6 +1,6 @@
 {
   "name": "@pagr/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "pagr \u2014 connect your Mac's Claude Code and Codex sessions to Pagr",
   "keywords": [
     "pagr",

@@ -33,7 +33,7 @@ import {
   launchAgentPlan,
 } from '../launchd.js';
 import { bad, dim, kv, ok, printJson, warn } from '../output.js';
-import { removeChannelRegistration } from './claudeChannel.js';
+import { channelServerPath, removeChannelRegistration } from './claudeChannel.js';
 
 /** Mirrors core's launchAgent label (not re-exported from the core index). */
 export const LAUNCH_AGENT_LABEL = 'dev.pagr.bridge';
@@ -189,6 +189,14 @@ async function runForeground(ctx: CliContext, opts: { mock: boolean }): Promise<
     logger,
     bridgeVersion: ctx.bridgeVersion,
     claudeSessionForPid: (pid) => claudeSessionIdForPid(claudeHome, pid),
+    // The CLI is the layer that knows where its own `dist` is; the daemon only reports the fact.
+    channelServerInstalled: () => {
+      try {
+        return existsSync(channelServerPath(ctx));
+      } catch {
+        return false;
+      }
+    },
     ...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
     ...(backfill ? { backfill } : {}),
   });

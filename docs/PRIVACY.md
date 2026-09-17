@@ -21,14 +21,26 @@ network call sites: `transport.ts` (gateway), `pairing.ts` (pairing API), `attac
 
 ## What is in the protocol events
 
-| Event | Contains | Never contains |
+**What changed with the iPhone app.** Before protocol v2, the transcript of a session never left
+this Mac: the cloud saw a clipped summary and nothing else. It does now — but **sealed**. The
+words leave the Mac encrypted for the phones you have paired, and the Pagr cloud stores and relays
+ciphertext it holds no key for. So the honest phrasing is not "your transcripts stay on your Mac";
+it is *the cloud cannot read them*. The table below says exactly what it can.
+
+| Event | Contains | The cloud cannot see |
 | --- | --- | --- |
-| `device.hello` / `device.heartbeat` | bridge + macOS version, agent install/auth status, project **ids + display names + git remote host/name**, session summaries | local filesystem paths, environment variables, file contents |
+| `device.hello` / `device.heartbeat` | bridge + macOS version, agent install/auth status, project **ids + display names + git remote host/name**, session summaries, the capability names this Mac honours, the device-floor classes you lifted (by name), the Claude channel's state, the **fingerprints** of the phones sealed to | local filesystem paths, environment variables, file contents, the phones' private keys |
 | `command.ack` | command id, status, error code, a short message, a command-specific result | secrets |
-| `session.updated` / `session.event` | session id, status, a ≤2000-char summary produced by the adapter | full transcripts, diffs, file bodies |
-| `approval.requested` | a ≤1500-char **preview** of the action (the command line or file list) and its sha256 | full file contents |
-| `session.frame` | session/project/provider ids, a sequence number, the frame's **kind** (`assistant`, `tool_call`, `diff`, `terminal`…), a timestamp, its size, whether it was clipped, and the **sealed** body | anything readable. The body is encrypted on this Mac for the phones you have paired, and the cloud relays ciphertext it holds no key for. A frame over 512 KiB is clipped for the wire (command output keeps its first 8 KiB and last 56 KiB) and the full text stays in `~/.pagr/journal/` |
+| `session.updated` / `session.event` | session id, status, control level, origin, a ≤2000-char summary produced by the adapter | the rest of the session; the summary is a clip, and everything else travels sealed |
+| `approval.requested` | approval id, action type, the sha256 of the preview, the risk hints, expiry. On v2 the preview itself moves into a **sealed** frame and this field goes out empty | the command line or file list, once v2 is in force |
+| `question.asked` | question id, how many options each question has, which take more than one, which must never be echoed back | the question's words and its option labels — those are in the sealed frame |
+| `session.frame` | session/project/provider ids, a sequence number, the frame's **kind** (`assistant`, `tool_call`, `diff`, `terminal`…), a timestamp, its size, whether it was clipped, and the **sealed** body | the body. It is encrypted on this Mac for the phones you paired. A frame over 512 KiB is clipped for the wire (command output keeps its first 8 KiB and last 56 KiB) and the full text stays in `~/.pagr/journal/` |
+| `imessage` (a field on the three events above) | **plaintext**, and only while you have an iMessage thread linked: the agent's final message of a turn clipped to 500 characters, an approval's one-liner, or "<Agent> asked: <header>" | nothing — this field is deliberately readable, because it is the line your iMessage thread shows. Unlink the thread and it stops on the very next event |
 | `attachment.consumed` | attachment id and ok/error | image bytes |
+
+**The phone → Mac direction is not sealed.** What you type on your phone — instructions, answers,
+decisions — travels in the signed command payloads the cloud queues, re-mints and audits, and the
+cloud can read those. `docs/SECURITY.md` § "What changed for the iPhone app" explains why.
 
 ### Backfill reads nothing new
 
@@ -56,7 +68,7 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 
 | Path | Purpose |
 | --- | --- |
-| `config.json` | `deviceId`, `userId`, gateway URL, pinned server public keys, device name. No secrets. |
+| `config.json` | `deviceId`, `userId`, gateway URL, pinned server public keys, `recipientKeys` (the **public** X25519 key of each phone you paired, by fingerprint) and when they were last pinned, device name. No secrets: every key in this file is a public one. |
 | `projects.json` | project id → **local path** mapping. This is the only place paths live; the cloud sees ids. |
 | `project-id-salt.json` | 32 random bytes (0600) that ids are derived from, so the same folder keeps one id. Salted so an id cannot be tested against a guessed path off this Mac. Never transmitted. |
 | `sessions.json` | session id → provider session id mapping. |
@@ -69,7 +81,9 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 | `journal/outbox.json` | per session, how far the frames have been sent and how far the cloud confirmed them (`{sent, acked}`). Ids and numbers only. |
 | `tailer-state.json` | how far the transcript mirror has read each Claude transcript file: its inode, a byte offset, and the tail of a line that was still being written when the daemon last looked. It exists so a restart resumes instead of replaying every session on the Mac. Entries for files that are gone are swept on startup. |
 | `tmp/att_*.{png,jpg,heic,webp}` | downloaded screenshots (0600), held for the agent turn that referenced them and deleted when that turn ends, whether it finished, failed or was stopped; a 1 h sweep is the backstop, and everything goes on daemon shutdown. |
-| `run/daemon.sock` | Unix socket (0600) for the CLI and Claude hooks. Not reachable over the network. |
+| `run/` | `daemon.sock` — a Unix socket (0600) for the CLI, the Claude hook and the channel server, not reachable over the network — plus `daemon.lock` (the single-instance pid lock) and `daemon.sock.path` (the socket path in use, so hooks can find it). |
+| `hooks/` | the `PermissionRequest` hook script `pagr claude hook-install` writes and points your Claude Code settings at. Executable, and it does one thing: ask the local daemon. |
+| `bin/pagr-node` | a tiny launcher that resolves Node at start-up, so a Node upgrade cannot break the launch agent. No credentials. |
 | Keychain `dev.pagr.bridge / device.private_key` | Ed25519 private key. Never transmitted. |
 
 ### What the daemon reads outside `~/.pagr`
@@ -86,6 +100,31 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 
 `PAGR_INSECURE_FILE_STORE=1` moves the private key to `~/.pagr/secrets.json` (0600). It exists for CI
 and headless machines; the daemon logs a warning whenever it is in use.
+
+### Processes the daemon may run
+
+It spawns three kinds of child, all with argument arrays and never through a shell, and no secret
+is ever passed as an argument (argv is visible in `ps` to every user on the machine):
+
+| Process | When | What it is |
+| --- | --- | --- |
+| `claude` / `codex` | a session Pagr starts | the agent itself, as you would run it, in a registered project |
+| `/usr/bin/caffeinate -i -s` | while a session is live or a prompt is waiting | the power assertion. **Idle sleep only** — closing the lid still sleeps the Mac. It is reference-counted, released 60 s after the last piece of work, and dies with the daemon. `PAGR_KEEP_AWAKE=0` removes it |
+| `codex app-server` | only when there is no shared Codex daemon to attach to | a private app-server for Pagr's own sessions. When your shared daemon *is* running, Pagr attaches to it as one more client and starts nothing |
+
+The Claude **channel server** (`dist/channel-server.mjs`) is not in that list because the daemon
+never starts it: Claude Code does, as an MCP server, when you launch a session with `pagr claude`.
+It has no network listener and no credentials, and talks only to the daemon's 0600 socket.
+
+### Deleting what v2 added
+
+`pagr logout` removes the journal directory whole, `tailer-state.json`, `replay.json`,
+`sessions.json` and `config.json` — which is where `recipientKeys` lives — deletes the device
+private key from the Keychain, takes Pagr's hook back out of your Claude Code settings, and asks
+Claude Code to drop the user-scope `pagr` MCP server. It leaves `~/.claude` and `~/.codex`
+otherwise exactly as it found them; a mirrored Codex thread is handed its subscription back rather
+than left attached. `--purge` also drops the project registry. `pagr uninstall` does all of that
+and removes `~/.pagr` entirely.
 
 ## Deleting your data
 

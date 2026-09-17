@@ -9,6 +9,7 @@ import {
 import type { ChannelStatus, DaemonStatus } from '@pagr/bridge-core';
 import {
   auditPermissions,
+  CLAUDE_CHANNEL_ENV,
   checkHomeWritable,
   clockSkewMs,
   DEVICE_FLOOR_ENV,
@@ -667,12 +668,16 @@ function mirrorCheck(status: DaemonStatus | null): Check {
       status: 'skip',
       detail: status ? 'no Claude sessions mirrored yet' : 'daemon not running',
     };
-  if (!mirror.enabled)
-    return {
-      name: 'mirror',
-      status: 'ok',
-      detail: `off (${MIRROR_ENV}=0) — your own terminal sessions are not mirrored`,
-    };
+  return { name: 'mirror', status: 'ok', detail: describeMirror(mirror) };
+}
+
+// ---- describers shared with `pagr status` --------------------------------------------------
+// One phrasing per fact, in one place. `pagr status` prints the same sentence `pagr doctor` does,
+// so nobody has to reconcile two descriptions of the same thing when they differ.
+
+/** The Claude transcript mirror: counts and an age, never a path or a session name. */
+export function describeMirror(mirror: NonNullable<DaemonStatus['mirror']>): string {
+  if (!mirror.enabled) return `off (${MIRROR_ENV}=0) — your own terminal sessions are not mirrored`;
   const age = mirror.lastFrameAt ? Date.now() - Date.parse(mirror.lastFrameAt) : null;
   const last =
     age === null || Number.isNaN(age)
@@ -682,11 +687,45 @@ function mirrorCheck(status: DaemonStatus | null): Check {
     mirror.unknownRecordTypes > 0
       ? `; ${mirror.unknownRecordTypes} unrecognised record type(s) — Claude Code writes something this bridge has no frame for`
       : '';
-  return {
-    name: 'mirror',
-    status: 'ok',
-    detail: `${mirror.sessions} session(s), ${mirror.filesWatched} file(s) watched, ${last}${unknown}`,
-  };
+  return `${mirror.sessions} session(s), ${mirror.filesWatched} file(s) watched, ${last}${unknown}`;
+}
+
+/** What the gateway and this bridge settled on. v1 means no frames, no questions, no backfill. */
+export function describeProtocol(version: number | undefined): string {
+  if (version === undefined) return 'unknown (older bridge)';
+  return version >= 2
+    ? 'v2 — sealed transcript frames, questions, backfill'
+    : 'v1 — summaries only; this gateway has not accepted v2';
+}
+
+/**
+ * The phones this Mac seals to, by fingerprint.
+ *
+ * Printed in full rather than counted: the fingerprint is the thing a person compares against
+ * what their phone shows them, and a key set you cannot read is a key set you cannot check.
+ */
+export function describeRecipientKeys(ids: string[] | undefined): string {
+  if (ids === undefined) return 'unknown (older bridge)';
+  if (ids.length === 0) return 'none — nothing can be sealed, frames stay on this Mac';
+  return `${ids.length} phone(s): ${ids.join(', ')}`;
+}
+
+/** The Claude channel, as the daemon reports it in `device.hello`. */
+export function describeChannel(channel: DaemonStatus['channel'] | undefined): string {
+  if (!channel) return 'unknown (older bridge)';
+  if (!channel.registered)
+    return channel.serverInstalled
+      ? `off (${CLAUDE_CHANNEL_ENV}=0) — terminal sessions stay approvals-only`
+      : 'not registered — terminal sessions stay approvals-only';
+  return `registered, ${channel.boundSessions} session(s) bound, follow-ups ${channel.mode === 'queued_next_turn' ? 'queued to the next turn boundary' : 'off'}`;
+}
+
+/** The plaintext transcript archive on this disk. */
+export function describeJournal(bytes: number | undefined): string {
+  if (bytes === undefined) return 'unknown (older bridge)';
+  return bytes === 0
+    ? 'empty'
+    : `${formatBytes(bytes)} of plaintext transcript in ~/.pagr/journal (pagr sessions purge)`;
 }
 
 /**
@@ -751,7 +790,7 @@ function launchAgentLoadedSafely(ctx: CliContext): boolean {
 }
 
 /** Sizes people read at a glance; the exact byte count is never the point here. */
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ['KB', 'MB', 'GB', 'TB'];
   let value = bytes / 1024;

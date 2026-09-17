@@ -22,7 +22,7 @@ class Pagr < Formula
   homepage "https://github.com/pagrdev/bridge"
   # RELEASE: `scripts/release.mjs` rewrites this line. Declared before `url` so the interpolation
   # below resolves; no leading `v`.
-  version "0.1.0"
+  version "0.2.0"
   url "https://registry.npmjs.org/@pagr/cli/-/cli-#{version}.tgz"
   # RELEASE: `scripts/release.mjs` rewrites this line with `shasum -a 256` of the tarball above.
   # All zeros = not yet released.
