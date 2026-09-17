@@ -1,8 +1,27 @@
-# `@pagr/claude-channel`
+# `@pagr/claude-channel` — deprecated
+
+> **Deprecated as of MOB-037.** The Pagr channel server moved into `@pagr/cli`, where it ships as
+> `dist/channel-server.mjs` with no dependencies beyond Node itself (the MCP SDK is gone). This
+> package is now a thin re-export of `@pagr/bridge-adapter-claude`, kept only so an existing
+> `.mcp.json` entry or `claude mcp add-json` registration that points at its `server.mjs` keeps
+> resolving.
+>
+> **What to run instead**
+>
+> ```sh
+> pagr claude channel-install   # registers `pagr` at user scope (every project)
+> pagr claude                   # starts Claude Code with the channel loaded
+> ```
+>
+> `pagr claude` adds `--dangerously-load-development-channels server:pagr` for you and prints one
+> line warning you that Claude Code will ask you to confirm development channels — it asks on
+> **every** launch and the acceptance cannot be pre-set, which is why there is no shim on `PATH`
+> and why plain `claude` is left untouched. See
+> [`docs/spikes/2026-09-17-dev-channels-warning.md`](../../docs/spikes/2026-09-17-dev-channels-warning.md).
 
 A [Claude Code **channel**](https://code.claude.com/docs/en/channels) that connects a running
-Claude Code session to your Pagr-paired phone. It is the only path on which Pagr can steer an
-**in-flight** Claude turn instead of queueing a follow-up.
+Claude Code session to your Pagr-paired phone. It is the only path on which Pagr can put a
+follow-up into a Claude Code session that is already running in your own terminal.
 
 > **Research preview. Development flag only. Pagr does not depend on this package.**
 > See [Status](#status) below before installing it.
@@ -18,10 +37,11 @@ three things, all of them against the local Pagr daemon's Unix socket:
 | Session → phone | Claude calls the `reply` MCP tool → daemon (`channel.outbound`) | The daemon emits a `session.event` of kind `agent_message`; the cloud texts you |
 | Approvals | `notifications/claude/channel/permission_request` → daemon (`approval.request`) → `notifications/claude/channel/permission` | A permission prompt from an interactive Claude Code session reaches your phone, and your answer closes the local dialog |
 
-The daemon flips the Claude adapter into live-steering mode for a project the moment a channel
-starts polling it. From then on `agent.send_instruction` for a session in that project is
-delivered as `{ delivered: 'steered' }` — a real injection into the running turn — rather than
-`'queued'`.
+The daemon binds a channel to the Claude **session** that spawned it (`process.ppid` →
+`~/.claude/sessions/<pid>.json`). From then on `agent.send_instruction` for that session is
+accepted and answered `{ delivered: 'queued' }`, and the phone watches it move
+`queued → picked_up → delivered`: the text appears in the terminal at once and Claude acts on it
+at the next turn boundary. It is not an interruption, and the bridge does not claim one.
 
 ## Status
 

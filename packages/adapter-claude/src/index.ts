@@ -6,7 +6,9 @@ import { channelModeEnabled } from './channel-mode.js';
 import { MockClaudeAdapter, type MockClaudeOptions } from './mock.js';
 
 export { ClaudeAdapter, type ClaudeAdapterOptions, newApprovalId } from './adapter.js';
+export * from './channel/index.js';
 export {
+  CHANNEL_ARMED_DETAIL,
   CHANNEL_FLAG_ENV,
   CHANNEL_PROBE_DETAIL,
   ChannelMode,
@@ -14,6 +16,7 @@ export {
   channelCapabilities,
   channelModeEnabled,
   channelStatus,
+  newFollowupId,
 } from './channel-mode.js';
 export {
   ClaudeProcess,
@@ -82,6 +85,7 @@ export {
   type ClaudeProcessInfo,
   ClaudeProcessWatch,
   type ClaudeProcessWatchOptions,
+  claudeSessionIdForPid,
   cwdOfTranscript,
   type DiscoveryEvent,
   isProcessAlive,
@@ -91,6 +95,7 @@ export {
 export {
   ClaudeMirror,
   type ClaudeMirrorOptions,
+  channelFollowupIn,
   originOf,
   syntheticClaudeSessionId,
 } from './transcript/mirror.js';
@@ -98,6 +103,7 @@ export {
   encodeProjectDir as encodeClaudeProjectDir,
   isLiveTranscriptName,
   pidOfSessionFile,
+  pidSessionFile,
   projectDirFor,
   projectsDir,
   sessionFile,
@@ -149,7 +155,8 @@ export function createClaudeAdapter(opts: CreateClaudeAdapterOptions = {}): Codi
   const mock = opts.mock ?? env.PAGR_MOCK_AGENTS === '1';
   if (mock) return new MockClaudeAdapter(opts.mockOptions);
   const { home, mock: _m, mockOptions: _mo, processEnv: _pe, ...rest } = opts;
-  // ADR 0001: `approved-channel` is feature-flagged and off unless the operator opts in.
+  // ADR 0001 `approved-channel`: registered by default, but inert until a `pagr claude` session
+  // actually connects a channel server. `PAGR_CLAUDE_CHANNEL=0` takes it away entirely.
   return new ClaudeAdapter({
     ...rest,
     home: home ?? defaultPagrHome(),

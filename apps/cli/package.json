@@ -1,7 +1,7 @@
 {
   "name": "@pagr/cli",
   "version": "0.1.0",
-  "description": "pagr — connect your Mac's Claude Code and Codex sessions to Pagr",
+  "description": "pagr \u2014 connect your Mac's Claude Code and Codex sessions to Pagr",
   "keywords": [
     "pagr",
     "cli",
@@ -42,7 +42,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/bin.js",
+    "build": "tsc -p tsconfig.json && cp src/channel-server.mjs dist/channel-server.mjs && chmod +x dist/bin.js dist/channel-server.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run"
   },

@@ -1,5 +1,6 @@
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { getPaths, type IpcServer, PRIVATE_KEY_SECRET } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EXIT } from '../errors.js';
@@ -658,72 +659,133 @@ describe('doctor · the transcript mirror', () => {
   });
 });
 
-describe('doctor · Claude Code live steering', () => {
-  it('says follow-ups are queued when channel mode is off', async () => {
-    server = await fakeDaemon(h.home, {
-      status: () => daemonStatus(),
-      'channel.status': () => ({ enabled: false, attachedProjects: [], canSteerLive: false }),
-    });
-    const r = await report(['--offline']);
-    expect(check(r, 'live steering')?.status).toBe('skip');
-    expect(check(r, 'live steering')?.detail).toContain('queued, not steered');
+describe('doctor · Claude Code channel', () => {
+  /** A `claude` that is installed, at a given version, with a given user-scope registration. */
+  const fakeClaude = (opts: { version?: string; registered?: string | false } = {}) => {
+    // Doctor finds the binary by walking PATH itself, so there has to be a real executable file.
+    const bin = join(h.home, '..', 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'claude'), '#!/bin/sh\nexit 0\n');
+    chmodSync(join(bin, 'claude'), 0o755);
+    h.overrides.env = { ...h.overrides.env, PATH: bin };
+    h.execImpl = (file, args) => {
+      if (file !== 'claude') throw new Error('not found');
+      if (args[0] === '--version') return `${opts.version ?? '2.1.274'} (Claude Code)\n`;
+      if (args[0] === 'mcp' && args[1] === 'get') {
+        if (opts.registered === false || opts.registered === undefined)
+          throw new Error('No MCP server found with name: pagr');
+        return `pagr:\n  Scope: User config\n  Command: node\n  Args: ${opts.registered}\n`;
+      }
+      return '';
+    };
+  };
+
+  const channelStatus = (over: Record<string, unknown> = {}) => ({
+    enabled: true,
+    attachedProjects: [] as string[],
+    canSteerLive: false,
+    boundSessions: 0,
+    ...over,
   });
 
-  it('warns when the flag is on but nothing is attached', async () => {
-    server = await fakeDaemon(h.home, {
-      status: () => daemonStatus(),
-      'channel.status': () => ({ enabled: true, attachedProjects: [], canSteerLive: false }),
-    });
-    const r = await report(['--offline']);
-    const c = check(r, 'live steering');
+  it('names the real `claude` and its version', async () => {
+    fakeClaude({ version: '2.1.274' });
+    const c = check(await report(['--offline']), 'claude launcher');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('2.1.274');
+  });
+
+  it('warns below the 2.1.251 floor, because older Claude cannot run the current models', async () => {
+    fakeClaude({ version: '2.1.220' });
+    const c = check(await report(['--offline']), 'claude launcher');
     expect(c?.status).toBe('warn');
-    expect(c?.detail).toContain('QUEUED');
-    expect(c?.fix).toContain('--dangerously-load-development-channels');
+    expect(c?.detail).toContain('2.1.251');
+    expect(c?.fix).toContain('@anthropic-ai/claude-code@latest');
   });
 
-  it('reports live steering as available only when a channel is attached', async () => {
+  it('warns when the channel is not registered, and says how', async () => {
+    fakeClaude({ registered: false });
+    const c = check(await report(['--offline']), 'claude channel');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('not registered at user scope');
+    expect(c?.fix).toContain('pagr claude channel-install');
+  });
+
+  it('reports a user-scope registration that points at the shipped server', async () => {
+    const serverPath = fileURLToPath(new URL('../channel-server.mjs', import.meta.url));
+    fakeClaude({ registered: serverPath });
+    const c = check(await report(['--offline']), 'claude channel');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('registered at user scope');
+  });
+
+  it('counts bound sessions, not merely attached projects', async () => {
+    fakeClaude();
     server = await fakeDaemon(h.home, {
       status: () => daemonStatus(),
-      'channel.status': () => ({
-        enabled: true,
-        attachedProjects: ['/code/app'],
-        canSteerLive: true,
-      }),
+      'channel.status': () =>
+        channelStatus({ attachedProjects: ['/code/app'], canSteerLive: true, boundSessions: 2 }),
     });
-    const r = await report(['--offline']);
-    expect(check(r, 'live steering')?.status).toBe('ok');
-    expect(check(r, 'live steering')?.detail).toContain('can steer live');
+    const c = check(await report(['--offline']), 'channel sessions');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('2 Claude session(s) bound');
   });
 
-  it('skips the check entirely when the daemon is down', async () => {
-    const r = await report(['--offline']);
-    expect(check(r, 'live steering')?.status).toBe('skip');
-    expect(check(r, 'live steering')?.detail).toContain('daemon not running');
+  it('warns when the daemon accepts channels but no session is bound', async () => {
+    fakeClaude();
+    server = await fakeDaemon(h.home, {
+      status: () => daemonStatus(),
+      'channel.status': () => channelStatus(),
+    });
+    const c = check(await report(['--offline']), 'channel sessions');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('no Claude session is bound');
+    expect(c?.fix).toContain('pagr claude');
   });
 
-  it('reports whether this project has the channel server in .mcp.json', async () => {
+  it('skips the session count entirely when the daemon is down', async () => {
+    fakeClaude();
+    const c = check(await report(['--offline']), 'channel sessions');
+    expect(c?.status).toBe('skip');
+    expect(c?.detail).toContain('daemon not running');
+  });
+
+  /**
+   * The wording is the deliverable here. A channel event renders in the terminal at once and the
+   * model acts on it when the running turn ends (spike MOB-045), so "steered" would be a lie and
+   * "queued" alone would undersell it.
+   */
+  it('describes delivery as queued and surfaced at the next turn boundary — never steered', async () => {
+    fakeClaude();
+    server = await fakeDaemon(h.home, {
+      status: () => daemonStatus(),
+      'channel.status': () => channelStatus({ boundSessions: 1, canSteerLive: true }),
+    });
+    const c = check(await report(['--offline']), 'live steering');
+    expect(c?.detail).toBe('queued, surfaced at the next turn boundary');
+    expect(c?.detail).not.toContain('steer');
+  });
+
+  it('mentions a project .mcp.json only when there is one, and names a broken one', async () => {
+    fakeClaude();
     const project = join(h.home, '..', 'proj');
     mkdirSync(project, { recursive: true });
     h.overrides.env = { ...h.overrides.env, PAGR_DOCTOR_PROJECT: project };
-    let r = await report(['--offline']);
-    expect(check(r, 'claude channel')?.status).toBe('skip');
-    expect(check(r, 'claude channel')?.fix).toContain('channel-setup');
+    // No file: the per-project path is not the recommendation any more, so it is not a line.
+    expect(check(await report(['--offline']), 'claude channel (project)')).toBeUndefined();
 
     writeFileSync(
       join(project, '.mcp.json'),
       JSON.stringify({ mcpServers: { pagr: { command: 'node', args: ['/s.mjs'] } } }),
     );
-    r = await report(['--offline']);
-    expect(check(r, 'claude channel')?.status).toBe('ok');
-  });
+    const present = check(await report(['--offline']), 'claude channel (project)');
+    expect(present?.status).toBe('ok');
+    expect(present?.detail).toContain('per-project consent dialog');
 
-  it('names a broken .mcp.json instead of pretending it is absent', async () => {
-    const project = join(h.home, '..', 'proj2');
-    mkdirSync(project, { recursive: true });
     writeFileSync(join(project, '.mcp.json'), '{ not json');
-    h.overrides.env = { ...h.overrides.env, PAGR_DOCTOR_PROJECT: project };
-    const r = await report(['--offline']);
-    expect(check(r, 'claude channel')?.detail).toContain('invalid JSON');
+    expect(check(await report(['--offline']), 'claude channel (project)')?.detail).toContain(
+      'invalid JSON',
+    );
   });
 });
 

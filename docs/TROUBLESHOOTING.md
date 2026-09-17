@@ -180,11 +180,17 @@ Removing it: `pagr logout` and `pagr uninstall` take the entry back out, as does
 `pagr claude hook-remove`. Only Pagr's own entry is touched; a copy of the file as it was is left
 next to it as `settings.json.pagr.bak`.
 
-(The other command that writes into a project is `pagr claude channel-setup`, which adds a `pagr`
-entry to `.mcp.json` for the research-preview channel mode. It is opt-in, unrelated to permission
-hooks, and not needed for normal use.)
+(`pagr claude channel-install` writes a separate thing — an MCP server entry at **user** scope,
+through `claude mcp add-json` — which is what lets `pagr claude` give a terminal session to your
+phone. It is unrelated to permission hooks and not needed for normal use. The older
+`pagr claude channel-setup` writes the same server into a project `.mcp.json` instead; that adds a
+"New MCP server found in this project" dialog per project on top of the per-launch warning, so
+prefer user scope.)
 
-Note that Claude Code cannot be steered mid-turn: instructions sent while a turn is active are queued and delivered when it ends (`queued_followup` → `followup_delivered` in `pagr sessions`).
+Note that Claude Code cannot be interrupted mid-turn: a follow-up sent while a turn is active is
+queued and surfaced at the next turn boundary (`queued_followup` → `followup_delivered` in
+`pagr sessions`). With a channel bound it appears in the terminal immediately and is still acted on
+at that same boundary — see below.
 
 ## Older history missing on a new phone
 
@@ -465,21 +471,57 @@ plus the parent of your current directory) — only the ones that exist.
 `pagr projects` lists name, aliases, live sessions, path and id; `pagr project remove` accepts any
 of name, alias or id and refuses an ambiguous reference instead of picking one.
 
-## Live steering vs queued follow-ups
+## Taking a turn in a terminal session (`pagr claude`)
 
-By default a follow-up you text while Claude Code is mid-turn is **queued** and delivered when the
-turn ends. Live steering exists only through a Claude Code *channel*, which is an Anthropic
-research preview.
+A `claude` you started yourself is `approvals_only`: Pagr relays its prompts and shows what it is
+doing, and cannot send it anything. To change that for a session, start it through the launcher:
 
-- `pagr claude channel-setup --dry-run` explains what a channel is, what
-  `--dangerously-load-development-channels` means, and prints the exact `.mcp.json` change without
-  writing anything.
-- `pagr doctor` reports two separate things: **claude channel** (is the server in this project's
-  `.mcp.json`?) and **live steering** (can the daemon steer *right now*?).
-- The capability the cloud sees follows the second one. `PAGR_CLAUDE_CHANNEL=1` alone reports
-  `canSteerActiveTurn: false` and says follow-ups will be QUEUED; it flips to `true` only while a
-  channel server is actually polling, and back to `false` within ~50 s of it stopping. Pagr never
-  says it interrupted your agent when it merely queued a message.
+```bash
+pagr claude channel-install   # once
+pagr claude                   # instead of `claude`; your arguments pass through unchanged
+```
+
+**Claude Code asks you to confirm development channels on every launch.** That is not a bug and it
+is not something Pagr can turn off: there is no setting, no environment variable and no key in
+`~/.claude.json` that pre-accepts it (verified on 2.1.220 and 2.1.274 —
+`docs/spikes/2026-09-17-dev-channels-warning.md`). `pagr claude` prints one line before it starts so
+the dialog is expected; press Enter. Pagr does not send that keystroke for you — it is the consent
+gate, and its position in the startup sequence and its option numbering both move between versions.
+
+`pagr doctor` reports four separate things, because they fail separately:
+
+| line | what it means |
+| --- | --- |
+| **claude launcher** | there is a real `claude` on `PATH`, and it is at least 2.1.251 (older builds accept the flag but refuse the current default models) |
+| **claude channel** | the `pagr` server is registered at user scope and the server file is there |
+| **channel sessions** | how many Claude sessions a channel is bound to *right now* |
+| **live steering** | what a follow-up actually does: *queued, surfaced at the next turn boundary* |
+
+### Things that surprise people
+
+- **"The channel is registered but nothing is bound."** Registration alone does nothing. The server
+  is only spawned by a session that names it on the command line, which is what `pagr claude` does
+  and what plain `claude` deliberately does not.
+- **IDE sessions stay `approvals_only`.** The Claude panel in VS Code, Cursor or the desktop app
+  does not go through `pagr claude`, so it never loads a channel. Its prompts still reach your phone
+  through the permission hook; it just cannot be given a turn.
+- **Channel events are silently dropped in headless mode.** In a `-p` / `--print` /
+  `--output-format` run Claude Code accepts the flag, connects the server, shows no dialog — and
+  then drops every channel event with no error on either side. `pagr claude` therefore leaves the
+  flag off for those runs, and the bridge's own spawns never carry it.
+- **"Claude asks permission before texting me back."** In manual permission mode the model's call to
+  the `reply` tool opens its own dialog. Allow `mcp__pagr__reply` once (option 2 on that dialog, or
+  `/permissions`) and it will not ask again. Claude Code 2.1.274 defaults to auto mode, where it
+  does not come up at all.
+- **The banner line vanished.** 2.1.274 sometimes collapses the `Channels (experimental)` notice
+  into `+N more · /status`. `pagr claude channel-status` is the reliable answer.
+- **It went back to `approvals_only` on its own.** A channel counts as live only while it keeps
+  polling; two missed long polls (~50 s) means the terminal is gone. Closing that window is the
+  intended way to end the grant.
+
+Removing it: `pagr claude channel-remove`, and also `pagr logout` and `pagr daemon uninstall`.
+`PAGR_NO_CHANNEL=1` or `pagr claude --no-channel` starts plain `claude` for one launch;
+`PAGR_CLAUDE_CHANNEL=0` on the daemon takes the `channel.*` IPC methods away entirely.
 
 ## Mac keeps sleeping while Pagr works
 

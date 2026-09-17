@@ -1,7 +1,7 @@
 {
   "name": "@pagr/claude-channel",
   "version": "0.1.0",
-  "description": "Pagr channel server for Claude Code — pushes phone messages into a running Claude Code session and relays permission prompts. Research preview, dev-flag only (ADR 0001 `approved-channel`).",
+  "description": "DEPRECATED \u2014 the Pagr channel server now ships inside @pagr/cli (dist/channel-server.mjs). This package re-exports it so existing registrations keep resolving.",
   "keywords": [
     "pagr",
     "claude-code",
@@ -47,9 +47,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "@pagr/bridge-adapter-claude": "workspace:*",
-    "@pagr/bridge-core": "workspace:*",
-    "zod": "^3.25.0"
+    "@pagr/bridge-adapter-claude": "workspace:*"
   }
 }

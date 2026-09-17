@@ -875,7 +875,7 @@ describe('daemon startup reconciliation', () => {
     }
   });
 
-  it('answers channel.status honestly whether or not the flag is on', async () => {
+  it('answers channel.status honestly: registered by default, nothing attached', async () => {
     const home = join(t.home, 'pagr');
     mkdirSync(home, { recursive: true });
     const d = await createDaemon({
@@ -890,8 +890,13 @@ describe('daemon startup reconciliation', () => {
         enabled: boolean;
         canSteerLive: boolean;
       }>('channel.status');
-      expect(via).toEqual({ enabled: false, attachedProjects: [], canSteerLive: false });
-      expect(d.channelStatus().enabled).toBe(false);
+      expect(via).toEqual({
+        enabled: true,
+        attachedProjects: [],
+        canSteerLive: false,
+        boundSessions: 0,
+      });
+      expect(d.channelStatus().enabled).toBe(true);
     } finally {
       await d.stop();
     }

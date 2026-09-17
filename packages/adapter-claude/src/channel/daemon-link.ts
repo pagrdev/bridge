@@ -1,27 +1,7 @@
-import { actionTypeForTool, hintsForCommand } from '@pagr/bridge-adapter-claude';
-import { IpcClient, IpcClientError, resolveSocketPath } from '@pagr/bridge-core';
-import type { PermissionBehavior, PermissionRequest } from './protocol.mjs';
-
-export interface ChannelPollResponse {
-  cursor: number;
-  messages: Array<{ seq: number; text: string }>;
-}
-
-/**
- * Everything the channel server needs from the outside world. The real implementation talks
- * only to the local Pagr daemon over its Unix-domain socket; tests substitute a fake.
- */
-export interface DaemonLink {
-  /** Long-poll for texts the cloud queued for this project. Resolves with `messages: []` on idle. */
-  poll(cursor: number): Promise<ChannelPollResponse>;
-  /** Claude's `reply` tool → daemon → cloud → the developer's phone. */
-  outbound(text: string): Promise<void>;
-  /**
-   * Relay a permission prompt. Resolves `null` when no human decision arrived — the caller must
-   * then stay SILENT so Claude Code's own terminal dialog keeps control.
-   */
-  requestApproval(req: PermissionRequest): Promise<PermissionBehavior | null>;
-}
+import { hintsForCommand, IpcClient, IpcClientError, resolveSocketPath } from '@pagr/bridge-core';
+import { actionTypeForTool } from '../stream-json.js';
+import type { PermissionBehavior, PermissionRequest } from './protocol.js';
+import type { ChannelPollResponse, DaemonLink } from './types.js';
 
 export interface IpcDaemonLinkOptions {
   cwd: string;
@@ -31,6 +11,12 @@ export interface IpcDaemonLinkOptions {
   pollTimeoutMs?: number;
   approvalTimeoutMs?: number;
   sessionId?: string | undefined;
+  /**
+   * The pid of the `claude` that spawned this server. `process.ppid` in production; the daemon
+   * turns it into a Claude session id through `~/.claude/sessions/<pid>.json`, which is what binds
+   * the channel to ONE terminal rather than to a directory.
+   */
+  claudePid?: number;
 }
 
 const POLL_TIMEOUT_MS = 30_000;
@@ -56,7 +42,11 @@ export class IpcDaemonLink implements DaemonLink {
   poll(cursor: number): Promise<ChannelPollResponse> {
     return this.client.call<ChannelPollResponse>(
       'channel.poll',
-      { cwd: this.opts.cwd, cursor },
+      {
+        cwd: this.opts.cwd,
+        cursor,
+        ...(this.opts.claudePid ? { claudePid: this.opts.claudePid } : {}),
+      },
       this.opts.pollTimeoutMs ?? POLL_TIMEOUT_MS,
     );
   }
@@ -75,15 +65,15 @@ export class IpcDaemonLink implements DaemonLink {
       const res = await this.client.call<ApprovalReply>(
         'approval.request',
         buildApprovalParams(req, this.opts.cwd, timeoutMs, this.opts.sessionId),
-        // Give the daemon a little longer than the deadline we asked it to honour, so a
-        // decision that lands right at the wire still reaches us.
+        // Give the daemon a little longer than the deadline we asked it to honour, so a decision
+        // that lands right at the wire still reaches us.
         timeoutMs + 15_000,
       );
       const d = res?.decision;
       return d === 'allow' || d === 'deny' ? d : null;
     } catch (err) {
-      // Daemon down, project not registered, timeout — all mean "no decision". Never deny on
-      // our own initiative: a denial we invented would reject a call the user never saw.
+      // Daemon down, project not registered, timeout — all mean "no decision". Never deny on our
+      // own initiative: a denial we invented would reject a call the user never saw.
       if (err instanceof IpcClientError) return null;
       return null;
     }
@@ -106,8 +96,8 @@ export function buildApprovalParams(
     .filter((s) => s && s.trim().length > 0)
     .join('\n')
     .slice(0, 1500);
-  // `input_preview` is "the tool's arguments as JSON-shaped display text"; for Bash it carries
-  // the command, which is exactly what the shell heuristics want.
+  // `input_preview` is "the tool's arguments as JSON-shaped display text"; for Bash it carries the
+  // command, which is exactly what the shell heuristics want.
   const hints = hintsForCommand(`${req.description} ${req.input_preview}`, undefined, undefined);
   return {
     provider: 'claude',

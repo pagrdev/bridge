@@ -1,11 +1,23 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { isAbsolute, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { hookState, installHookForUser, removeHookForUser } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
+import { daemonStatus, ipc } from '../ipc.js';
 import { bad, bold, dim, ok, printJson, warn } from '../output.js';
+import {
+  CHANNEL_SERVER_NAME,
+  CLAUDE_VERSION_FLOOR,
+  channelServerPath,
+  channelStatusReport,
+  DEV_CHANNEL_FLAG,
+  LAUNCH_COMMAND,
+  REPLY_TOOL_PERMISSION,
+  runChannelInstall,
+  runChannelRemove,
+} from './claudeChannel.js';
+import { runClaudeLauncher } from './claudeLauncher.js';
 
 /**
  * `pagr claude channel-setup` — wire the Pagr channel server into a project's `.mcp.json`.
@@ -16,10 +28,13 @@ import { bad, bold, dim, ok, printJson, warn } from '../output.js';
  */
 
 /** Key under `mcpServers`; also the name used after `server:` on the Claude Code command line. */
-export const MCP_SERVER_KEY = 'pagr';
+export const MCP_SERVER_KEY = CHANNEL_SERVER_NAME;
 export const MCP_CONFIG_FILE = '.mcp.json';
 
-export const LAUNCH_COMMAND = `claude --dangerously-load-development-channels server:${MCP_SERVER_KEY}`;
+export { CHANNEL_SERVER_NAME, CLAUDE_VERSION_FLOOR, LAUNCH_COMMAND } from './claudeChannel.js';
+
+/** What `channel-setup` still tells you to type: per-project registration is not the launcher. */
+export const PROJECT_LAUNCH_COMMAND = `claude ${DEV_CHANNEL_FLAG} server:${CHANNEL_SERVER_NAME}`;
 
 export const PREVIEW_WARNING = [
   'Claude Code channels are a RESEARCH PREVIEW.',
@@ -109,27 +124,9 @@ export function writeMcpConfig(file: string, config: McpConfig): void {
   writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 }
 
-/**
- * Absolute path of the built channel server. `@pagr/claude-channel` is a separate, optional
- * package: the daemon and CLI work without it, so a missing install is a precondition error
- * with an install hint rather than a crash.
- */
+/** Absolute path of the built channel server; it ships inside this CLI. */
 export function resolveChannelServer(ctx: CliContext, override?: string): string {
-  const explicit = override ?? ctx.env.PAGR_CHANNEL_SERVER;
-  if (explicit) {
-    const p = isAbsolute(explicit) ? explicit : resolve(process.cwd(), explicit);
-    if (!existsSync(p)) throw new CliError(`no channel server at ${p}`, EXIT.precondition);
-    return p;
-  }
-  try {
-    return createRequire(import.meta.url).resolve('@pagr/claude-channel/server');
-  } catch {
-    throw new CliError(
-      'the Pagr channel server is not installed',
-      EXIT.precondition,
-      'install it with `npm i -g @pagr/claude-channel`, or pass --server <path to server.mjs>',
-    );
-  }
+  return channelServerPath(ctx, override);
 }
 
 export interface ChannelSetupOptions {
@@ -180,7 +177,8 @@ export async function runChannelSetup(ctx: CliContext, opts: ChannelSetupOptions
       serverKey: MCP_SERVER_KEY,
       mcpEntry: entry,
       otherServers: Object.keys(config.mcpServers ?? {}).filter((k) => k !== MCP_SERVER_KEY),
-      launchCommand: LAUNCH_COMMAND,
+      launchCommand: PROJECT_LAUNCH_COMMAND,
+      perProjectConsentDialog: true,
       env: { PAGR_CLAUDE_CHANNEL: '1' },
       researchPreview: true,
       explanation: CHANNEL_EXPLAINER,
@@ -213,12 +211,66 @@ export async function runChannelSetup(ctx: CliContext, opts: ChannelSetupOptions
   ctx.out(dim(`  ${PREVIEW_WARNING}`));
   ctx.out('');
   ctx.out('Then, in this project:');
-  ctx.out(`  ${bold(LAUNCH_COMMAND)}`);
+  ctx.out(`  ${bold(PROJECT_LAUNCH_COMMAND)}`);
   ctx.out('');
   ctx.out(dim('  Being in .mcp.json is not enough — the server must also be named on the'));
-  ctx.out(dim('  command line. Restart the daemon with PAGR_CLAUDE_CHANNEL=1 so it accepts'));
-  ctx.out(dim('  the channel and steers this project live instead of queueing follow-ups.'));
-  ctx.out(dim('  `pagr doctor` will then say whether steering is actually reachable.'));
+  ctx.out(dim('  command line. A project-scoped server also adds a second dialog: Claude Code'));
+  ctx.out(dim('  asks "New MCP server found in this project" the first time, on top of the'));
+  ctx.out(dim('  development-channel warning it asks on every launch.'));
+  ctx.out('');
+  ctx.out(dim(`  Most people want \`pagr claude channel-install\` instead: user scope covers`));
+  ctx.out(dim(`  every project and has no per-project dialog, and \`${LAUNCH_COMMAND}\` adds the`));
+  ctx.out(dim('  flag for you. `pagr doctor` says whether a channel is actually bound.'));
+}
+
+/** `pagr claude channel-status` — registered? built? bound to anything right now? */
+export async function runChannelStatus(ctx: CliContext): Promise<void> {
+  const running = await daemonStatus(ctx);
+  let channel: { attachedProjects: string[]; boundSessions?: number } | null = null;
+  if (running) {
+    try {
+      channel = await ipc(ctx).call('channel.status', undefined, 3000);
+    } catch {
+      channel = null;
+    }
+  }
+  const report = await channelStatusReport(ctx, channel);
+  if (ctx.json) {
+    printJson(ctx, { ...report, daemonRunning: Boolean(running), launchCommand: LAUNCH_COMMAND });
+    return;
+  }
+  ctx.out(
+    report.registered
+      ? ok(`\`${CHANNEL_SERVER_NAME}\` registered at user scope`)
+      : report.problem
+        ? bad(`could not ask Claude Code: ${report.problem}`)
+        : warn('not registered — run `pagr claude channel-install`'),
+  );
+  ctx.out(
+    report.serverInstalled
+      ? ok(`server present ${dim(report.serverPath)}`)
+      : bad(`server missing at ${report.serverPath}`),
+  );
+  ctx.out(
+    !running
+      ? warn('daemon not running, so nothing can be bound')
+      : report.boundSessions
+        ? ok(`${report.boundSessions} Claude session(s) bound to a channel`)
+        : warn(`no session bound — start one with \`${LAUNCH_COMMAND}\``),
+  );
+  ctx.out(
+    report.claudeVersion === null
+      ? warn('`claude` is not on PATH')
+      : report.meetsFloor === false
+        ? warn(`claude ${report.claudeVersion} (channels need ${CLAUDE_VERSION_FLOOR} or newer)`)
+        : ok(`claude ${report.claudeVersion}`),
+  );
+  if (report.registered)
+    ctx.out(
+      dim(
+        `  in manual permission mode Claude asks before it answers you; allow ${REPLY_TOOL_PERMISSION} once`,
+      ),
+    );
 }
 
 /**
@@ -277,8 +329,35 @@ export function runHookStatus(ctx: CliContext): void {
     );
 }
 
+/**
+ * Everything the user typed after `pagr claude`, in order.
+ *
+ * `rawArgs` is what `Command.parse` was handed, so it still contains the global flags that came
+ * before the subcommand name; those belong to `pagr`, not to `claude`, and stop at the `claude`
+ * token. Anything after it — including `--json` — is Claude Code's.
+ */
+export function passthroughArgs(rawArgs: readonly string[]): string[] {
+  const i = rawArgs.indexOf('claude');
+  return i === -1 ? [] : rawArgs.slice(i + 1);
+}
+
 export function registerClaude(program: Command, getCtx: () => CliContext): void {
-  const c = program.command('claude').description('Claude Code integration helpers');
+  const c = program
+    .command('claude')
+    .description('start Claude Code with the Pagr channel, or manage the integration')
+    // Everything after `pagr claude` belongs to Claude Code, including flags commander has never
+    // heard of (`-p`, `--model`, `--resume`). A subcommand name still wins, which is what makes
+    // `pagr claude channel-install` work while `pagr claude --resume foo` passes straight through.
+    .allowUnknownOption(true)
+    .allowExcessArguments(true)
+    .argument('[claudeArgs...]', 'arguments passed straight through to `claude`')
+    .action(() => {
+      // Commander reorders unknown options after operands, which would turn `-p "hi"` into
+      // `"hi" -p`. The raw argv is the only faithful record of what the user typed.
+      const raw = (program as Command & { rawArgs?: string[] }).rawArgs ?? [];
+      const { exitCode } = runClaudeLauncher(getCtx(), passthroughArgs(raw));
+      if (exitCode !== 0) process.exitCode = exitCode;
+    });
   c.command('hook-install')
     .description('register the Pagr PermissionRequest hook in ~/.claude/settings.json')
     .option('--force', 'install even when you already have a PermissionRequest hook of your own')
@@ -289,9 +368,20 @@ export function registerClaude(program: Command, getCtx: () => CliContext): void
   c.command('hook-status')
     .description('report whether the Pagr PermissionRequest hook is installed')
     .action(() => runHookStatus(getCtx()));
+  c.command('channel-install')
+    .description('register the Pagr channel server with Claude Code at user scope (all projects)')
+    .option('--server <path>', 'path to the built channel-server.mjs')
+    .option('--force', 're-register even when the entry already points at this server')
+    .action((opts: { server?: string; force?: boolean }) => runChannelInstall(getCtx(), opts));
+  c.command('channel-remove')
+    .description('remove the user-scope Pagr channel registration')
+    .action(() => runChannelRemove(getCtx()));
+  c.command('channel-status')
+    .description('report whether the channel is registered, built and bound to a session')
+    .action(() => runChannelStatus(getCtx()));
   c.command('channel-setup')
     .description(
-      'wire the Pagr channel server into a project .mcp.json (research preview, dev flag only)',
+      'wire the channel server into a project .mcp.json (adds a per-project consent dialog; prefer channel-install)',
     )
     .option('--project <path>', 'project directory (default: cwd)')
     .option('--server <path>', 'path to the built channel server.mjs')

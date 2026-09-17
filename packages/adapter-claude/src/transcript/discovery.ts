@@ -4,6 +4,7 @@ import { z } from 'zod';
 import {
   isLiveTranscriptName,
   pidOfSessionFile,
+  pidSessionFile,
   projectsDir,
   sessionIdOfTranscript,
   sessionsDir,
@@ -101,6 +102,19 @@ export function readPidFile(filePath: string): ClaudeProcessInfo | null {
     ...(d.name ? { name: d.name } : {}),
     ...(d.version ? { version: d.version } : {}),
   };
+}
+
+/**
+ * The Claude Code session id belonging to a running pid.
+ *
+ * This is how a channel server binds to ONE terminal: Claude Code spawns it, `process.ppid` is
+ * that `claude`, and `~/.claude/sessions/<pid>.json` names the session it is running. Null when
+ * there is no such file (a build that writes none, a pid that has gone, a pid belonging to
+ * something else entirely) — the caller must then fall back to the directory index.
+ */
+export function claudeSessionIdForPid(home: string, pid: number): string | null {
+  const info = readPidFile(pidSessionFile(home, pid));
+  return info && info.pid === pid ? info.sessionId : null;
 }
 
 /** `process.kill(pid, 0)`; `EPERM` is a live process this user does not own. */

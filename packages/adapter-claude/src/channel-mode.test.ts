@@ -20,10 +20,13 @@ const SES = 'ses_00000000000000000000000000000001';
 const PROJ = 'proj_0000000000000000000000000000000a';
 
 describe('flag', () => {
-  it('is off unless PAGR_CLAUDE_CHANNEL is exactly 1', () => {
-    expect(channelModeEnabled({})).toBe(false);
-    expect(channelModeEnabled({ [CHANNEL_FLAG_ENV]: 'true' })).toBe(false);
+  it('is on unless PAGR_CLAUDE_CHANNEL is exactly 0', () => {
+    expect(channelModeEnabled({})).toBe(true);
+    // `=1` was the old opt-in. It has to stay a no-op: a launchd plist installed before MOB-037
+    // still carries it, and it must not mean anything different from the default.
     expect(channelModeEnabled({ [CHANNEL_FLAG_ENV]: '1' })).toBe(true);
+    expect(channelModeEnabled({ [CHANNEL_FLAG_ENV]: 'true' })).toBe(true);
+    expect(channelModeEnabled({ [CHANNEL_FLAG_ENV]: '0' })).toBe(false);
   });
 });
 
@@ -90,25 +93,28 @@ describe('ClaudeAdapter in channel mode', () => {
     const s = await adapter.probe();
     expect(s.mode).toBe('approved-channel');
     expect(s.capabilities.canReceiveLiveExternalMessages).toBe(true);
-    expect(s.capabilities.canSteerActiveTurn).toBe(true);
+    expect(s.capabilities.canQueueIntoActiveTurn).toBe(true);
+    // Never `canSteerActiveTurn`: a channel event renders instantly and is acted on when the
+    // running turn ends (spike MOB-045), which is a queue, not an interruption.
+    expect(s.capabilities.canSteerActiveTurn).toBe(false);
     expect(s.detail).toContain(CHANNEL_PROBE_DETAIL);
     await adapter.shutdown();
   });
 
-  it('does NOT claim live steering while the flag is on but no channel is attached', async () => {
+  it('does NOT claim a reachable channel while nothing is attached', async () => {
     const adapter = build(true);
     const s = await adapter.probe();
-    // The flag only means the daemon would accept a channel. Reporting `canSteerActiveTurn`
-    // here would make the cloud promise a live interrupt for something that will be queued.
+    // Accepting channels only means the daemon would answer one. Claiming the capability here
+    // would tell the phone it can reach a terminal that is not running the channel server.
     expect(s.mode).toBe('cli-hooks');
-    expect(s.capabilities.canSteerActiveTurn).toBe(false);
+    expect(s.capabilities.canQueueIntoActiveTurn).toBe(false);
     expect(s.capabilities.canReceiveLiveExternalMessages).toBe(false);
     expect(s.detail).toContain(CHANNEL_ARMED_DETAIL);
-    expect(s.detail).toContain('QUEUED');
+    expect(s.detail).toContain('pagr claude');
     await adapter.shutdown();
   });
 
-  it('stops claiming live steering once the channel stops polling', async () => {
+  it('stops claiming a channel once it stops polling (TTL = two missed long polls)', async () => {
     let clock = 1_000_000;
     const ttlBridge = new ChannelBridge(() => clock, 1000);
     const adapter = new ClaudeAdapter({
@@ -118,9 +124,9 @@ describe('ClaudeAdapter in channel mode', () => {
       channelBridge: ttlBridge,
     });
     ttlBridge.attach(project);
-    expect((await adapter.probe()).capabilities.canSteerActiveTurn).toBe(true);
+    expect((await adapter.probe()).capabilities.canQueueIntoActiveTurn).toBe(true);
     clock += 2000;
-    expect((await adapter.probe()).capabilities.canSteerActiveTurn).toBe(false);
+    expect((await adapter.probe()).capabilities.canQueueIntoActiveTurn).toBe(false);
     await adapter.shutdown();
   });
 
@@ -129,11 +135,11 @@ describe('ClaudeAdapter in channel mode', () => {
     const s = await adapter.probe();
     expect(s.mode).toBe('cli-hooks');
     expect(s.capabilities.canReceiveLiveExternalMessages).toBe(false);
-    expect(s.capabilities.canSteerActiveTurn).toBe(false);
+    expect(s.capabilities.canQueueIntoActiveTurn).toBe(false);
     await adapter.shutdown();
   });
 
-  it('steers an attached session by enqueueing for the channel, not spawning claude', async () => {
+  it('delivers to an attached session by enqueueing for the channel, not spawning claude', async () => {
     const adapter = build(true);
     bridge.attach(project);
     bridge.bindSession(SES, { cwd: project, projectId: PROJ });
@@ -143,12 +149,25 @@ describe('ClaudeAdapter in channel mode', () => {
       mode: 'steer',
       localImagePaths: [],
     });
-    expect(res).toEqual({ delivered: 'steered' });
+    // `queued`, never `steered`: it lands at the next turn boundary, and the phone is shown it
+    // moving queued → picked_up → delivered instead of being told the turn was interrupted.
+    expect(res).toEqual({ delivered: 'queued' });
+    const queued = events.find((e) => e.kind === 'frame' && e.meta?.delivery?.state === 'queued');
+    if (queued?.kind !== 'frame') throw new Error('no queued delivery frame');
+    const followupId = queued.meta?.delivery?.followupId;
+    expect(followupId).toMatch(/^fu_[0-9a-f]{16}$/);
     const polled = await bridge.poll(project, 0, 0);
     expect(polled.messages.map((m) => m.text)).toEqual(['switch to the other branch']);
-    expect(events.some((e) => e.kind === 'session_event' && e.type === 'followup_delivered')).toBe(
-      true,
-    );
+    expect(polled.messages[0]?.followupId).toBe(followupId);
+    // The poll handed it out, so it is no longer merely queued.
+    expect(
+      events.some(
+        (e) =>
+          e.kind === 'frame' &&
+          e.meta?.delivery?.state === 'picked_up' &&
+          e.meta.delivery.followupId === followupId,
+      ),
+    ).toBe(true);
     await adapter.shutdown();
   });
 
@@ -182,7 +201,7 @@ describe('ClaudeAdapter in channel mode', () => {
     await adapter.shutdown();
   });
 
-  it('queues instead of steering when the flag is off, even with a live channel', async () => {
+  it('ignores a live channel entirely when channel mode is off', async () => {
     const adapter = build(false);
     bridge.attach(project);
     bridge.bindSession(SES, { cwd: project, projectId: PROJ });
@@ -200,13 +219,13 @@ describe('ClaudeAdapter in channel mode', () => {
 });
 
 describe('createClaudeAdapter', () => {
-  it('turns channel mode on from the environment', async () => {
+  it('has channel mode on by default and off under PAGR_CLAUDE_CHANNEL=0', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-chanenv-'));
     try {
       const on = createClaudeAdapter({
         home,
         claudeCommand: ['node', FIXTURE],
-        processEnv: { [CHANNEL_FLAG_ENV]: '1' },
+        processEnv: {},
       });
       // Armed but nothing polling: the mode only flips once a channel is really there.
       expect((await on.probe()).detail).toContain(CHANNEL_ARMED_DETAIL);
@@ -217,7 +236,7 @@ describe('createClaudeAdapter', () => {
       const off = createClaudeAdapter({
         home,
         claudeCommand: ['node', FIXTURE],
-        processEnv: {},
+        processEnv: { [CHANNEL_FLAG_ENV]: '0' },
       });
       expect((await off.probe()).mode).toBe('cli-hooks');
       await off.shutdown();

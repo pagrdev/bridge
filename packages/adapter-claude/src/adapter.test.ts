@@ -690,6 +690,25 @@ describe('ClaudeAdapter approval options (MOB-035)', () => {
           .map((l) => JSON.parse(l) as Record<string, unknown>)
       : [];
 
+  /**
+   * Wait for the fake Claude to have written a control line.
+   *
+   * `approval_resolved_locally` is emitted when the adapter hands the answer to the process, not
+   * when the process has flushed it to disk, so reading `controlLines()[0]` straight after that
+   * event is a race — PR #19 saw it fail. Polling the file is the only deterministic way to wait
+   * for another process's write; a fixed sleep would be the same race with better odds.
+   */
+  const waitForControlLine = async (index = 0, ms = 20_000): Promise<Record<string, unknown>> => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      const line = controlLines()[index];
+      if (line) return line;
+      if (Date.now() >= deadline)
+        throw new Error(`timeout waiting for control line ${index} in ${controlFile}`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+
   it('offers "allow always" only when the request carried permission suggestions', async () => {
     const { req } = await ask(make(), 'write always please');
     expect(req.options).toEqual([
@@ -719,7 +738,7 @@ describe('ClaudeAdapter approval options (MOB-035)', () => {
       optionId: 'allow_always',
     });
     await c.waitFor((e) => e.kind === 'approval_resolved_locally');
-    const response = controlLines()[0]?.response as {
+    const response = (await waitForControlLine(0)).response as {
       response: { behavior: string; updatedPermissions?: unknown[] };
     };
     expect(response.response).toMatchObject({
@@ -752,7 +771,7 @@ describe('ClaudeAdapter approval options (MOB-035)', () => {
     await c.waitFor(
       (e) => e.kind === 'approval_resolved_locally' && e.approvalId === again.approvalId,
     );
-    const onceResponse = controlLines()[0]?.response as {
+    const onceResponse = (await waitForControlLine(0)).response as {
       response: { behavior: string; updatedPermissions?: unknown[] };
     };
     expect(onceResponse.response.behavior).toBe('allow');

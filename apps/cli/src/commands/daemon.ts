@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import {
   type BackfillSource,
   type CodingAgentAdapter,
@@ -32,6 +33,7 @@ import {
   launchAgentPlan,
 } from '../launchd.js';
 import { bad, dim, kv, ok, printJson, warn } from '../output.js';
+import { removeChannelRegistration } from './claudeChannel.js';
 
 /** Mirrors core's launchAgent label (not re-exported from the core index). */
 export const LAUNCH_AGENT_LABEL = 'dev.pagr.bridge';
@@ -175,12 +177,18 @@ async function runForeground(ctx: CliContext, opts: { mock: boolean }): Promise<
       error: err instanceof Error ? err.message : String(err),
     });
   }
+  // How the daemon turns a channel server's `process.ppid` into the Claude session it belongs to.
+  // The reader lives in the Claude adapter (`~/.claude/sessions/<pid>.json`, MOB-034); core must
+  // not import an adapter, so it is handed in here, where both are already in scope.
+  const claudeHome = ctx.env.HOME ?? homedir();
+  const { claudeSessionIdForPid } = await import('@pagr/bridge-adapter-claude');
   await startDaemon({
     home: ctx.home,
     adapters,
     secretStore: await ctx.secretStore(),
     logger,
     bridgeVersion: ctx.bridgeVersion,
+    claudeSessionForPid: (pid) => claudeSessionIdForPid(claudeHome, pid),
     ...(config.gatewayUrl ? { gatewayUrl: config.gatewayUrl } : {}),
     ...(backfill ? { backfill } : {}),
   });
@@ -307,15 +315,20 @@ export function runDaemonUninstall(ctx: CliContext): boolean {
   const hook = removeHookForUser(ctx, (l) => {
     if (!ctx.json) ctx.out(l);
   });
+  // Same reasoning for the channel: a registered server whose daemon is gone would be spawned by
+  // every `pagr claude`, fail to reach a socket, and say nothing useful about why.
+  const channelRemoved = removeChannelRegistration(ctx);
   if (ctx.json) {
     printJson(ctx, {
       removed,
       plist,
       label: LAUNCH_AGENT_LABEL,
       claudeHookRemoved: hook.removed.length > 0,
+      claudeChannelRemoved: channelRemoved,
     });
     return removed;
   }
+  if (channelRemoved) ctx.out(ok('Claude Code channel registration removed'));
   ctx.out(removed ? ok('launch agent removed') : warn('launch agent was not installed'));
   if (removed) ctx.out(dim('  put it back with `pagr daemon install` (no re-pairing needed)'));
   return removed;

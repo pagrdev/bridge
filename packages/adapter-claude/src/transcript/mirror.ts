@@ -328,11 +328,12 @@ export class ClaudeMirror {
    */
   private controlLevelFor(s: MirroredSession): ControlLevel {
     if (s.project.status === 'unregistered') return 'none';
-    const bound = this.o.channel?.resolve(s.sessionId, {
-      cwd: s.project.path,
-      projectId: s.project.projectId,
-    });
-    if (bound) return 'full';
+    // No cwd fallback here on purpose. Since MOB-037 the daemon binds a channel to the Claude
+    // SESSION id it read from `~/.claude/sessions/<ppid>.json`, so "this exact terminal can be
+    // given a turn" is answerable exactly. Falling back to "something in this directory is
+    // polling" would tell the phone it can drive a second `claude` in the same project that has
+    // no channel at all, and the follow-up would land in the wrong window.
+    if (this.o.channel?.resolve(s.sessionId)) return 'full';
     return this.o.hookInstalled?.() ? 'approvals_only' : 'mirror_only';
   }
 
@@ -459,6 +460,14 @@ export class ClaudeMirror {
     blocks.forEach((b, i) => {
       const id = blockFrameId(rec.uuid, i);
       if (b.type === 'text') {
+        // A follow-up Pagr itself injected, arriving back as an ordinary user turn. This is the
+        // only proof the bridge ever gets that Claude Code really took it, so it closes the
+        // delivery report instead of being echoed back to the phone that wrote it.
+        const followup = channelFollowupIn(b.text);
+        if (followup) {
+          this.onChannelFollowup(s, followup, t, id, rec.timestamp);
+          return;
+        }
         // What the person typed. On the stdio path the bridge already knows, because it sent it;
         // here it is the only record of the half of the conversation Pagr did not write.
         if (!b.text.trim()) return;
@@ -497,6 +506,40 @@ export class ClaudeMirror {
           );
       }
     });
+  }
+
+  /** `queued`/`picked_up` → `delivered`: the injected turn is in the transcript. */
+  private onChannelFollowup(
+    s: MirroredSession,
+    followup: { followupId?: string; text: string },
+    t: TailedRecord,
+    blockId: string | undefined,
+    at?: string,
+  ): void {
+    this.o.emit({
+      kind: 'session_event',
+      sessionId: s.sessionId,
+      projectId: s.project.projectId,
+      type: 'followup_delivered',
+      summary: followup.text.slice(0, 500),
+    });
+    this.frame(
+      s,
+      {
+        kind: 'system',
+        subtype: 'followup_delivered',
+        text: 'Claude Code picked it up; it runs at the next turn boundary.',
+      },
+      t,
+      {
+        delivery: {
+          state: 'delivered',
+          ...(followup.followupId ? { followupId: followup.followupId } : {}),
+        },
+      },
+      followup.followupId ? `${followup.followupId}:delivered` : blockId,
+      at,
+    );
   }
 
   private emitTerminal(
@@ -572,6 +615,26 @@ export class ClaudeMirror {
     });
     this.lastFrameAt = this.now().toISOString();
   }
+}
+
+/**
+ * Recognise a turn Pagr injected through the channel.
+ *
+ * Claude Code wraps a `notifications/claude/channel` event as
+ * `<channel source="pagr" origin="pagr" seq="3" followup="fu_…">text</channel>` and hands the
+ * model exactly that, so it lands in the transcript as an ordinary `user` record. `source="pagr"`
+ * is the server name on the command line, which only a Pagr channel can have been given.
+ *
+ * Returns null for anything else, including a channel event from somebody else's server — a
+ * `<channel>` tag written by the user themselves is matched too, and reporting one message
+ * delivered that never was is a far smaller failure than an un-parseable regex on every line.
+ */
+export function channelFollowupIn(text: string): { followupId?: string; text: string } | null {
+  const open = /<channel\s[^>]*source="pagr"[^>]*>/i.exec(text);
+  if (!open?.[0]) return null;
+  const id = /\bfollowup="([A-Za-z0-9_-]{1,200})"/.exec(open[0])?.[1];
+  const body = text.slice(open.index + open[0].length).replace(/<\/channel>[\s\S]*$/i, '');
+  return { ...(id ? { followupId: id } : {}), text: body.trim() || text.trim() };
 }
 
 /**

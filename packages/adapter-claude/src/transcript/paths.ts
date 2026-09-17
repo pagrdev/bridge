@@ -38,6 +38,11 @@ export function sessionsDir(home: string): string {
   return path.join(home, '.claude', 'sessions');
 }
 
+/** `~/.claude/sessions/<pid>.json` — what Claude Code writes for every interactive process. */
+export function pidSessionFile(home: string, pid: number): string {
+  return path.join(sessionsDir(home), `${pid}.json`);
+}
+
 export function projectDirFor(home: string, cwd: string): string {
   return path.join(projectsDir(home), encodeProjectDir(cwd));
 }
