@@ -8,6 +8,8 @@ import {
 
 export const newEventId = (): string => `evt_${randomBytes(12).toString('hex')}`;
 export const newApprovalId = (): string => `apr_${randomBytes(16).toString('hex')}`;
+/** v2. A question the agent asked, pending an answer from the phone or the Mac. */
+export const newQuestionId = (): string => `qst_${randomBytes(16).toString('hex')}`;
 
 export interface MakeEventOptions {
   inReplyTo?: string;

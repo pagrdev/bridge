@@ -233,6 +233,9 @@ export function referencedIds(body: CommandBody): { projectId?: string; sessionI
     case 'agent.send_instruction':
     case 'agent.stop_session':
     case 'agent.respond_to_approval':
+    // v2. The `qst_` id is checked by the question registry, which is the only thing that knows
+    // whether it is still pending; what must exist before dispatch is the session it names.
+    case 'agent.answer_question':
       return { sessionId: body.payload.sessionId };
     case 'agent.get_status':
       return body.payload.sessionId ? { sessionId: body.payload.sessionId } : {};

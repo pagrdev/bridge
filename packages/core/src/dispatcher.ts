@@ -44,6 +44,16 @@ import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
 import { PublicPolicy, readPolicy, writePolicy } from './policy.js';
 import { ProjectError, type ProjectRegistry } from './projects.js';
+import {
+  type PendingQuestion,
+  type PendingQuestionInput,
+  PendingQuestionRegistry,
+  type QuestionAnswer,
+  type QuestionOutcome,
+  type QuestionResolution,
+  type QuestionSource,
+  questionBodyFor,
+} from './questions.js';
 import { handleFor, RepoHandleCache, scanRepos } from './repoScan.js';
 import { importRecipientKeys, type RecipientKeySet, sealFrame } from './seal.js';
 import { isAdopted, isReportable, type SessionStore } from './sessions.js';
@@ -129,6 +139,24 @@ export interface ApprovalRequest extends Omit<PendingApprovalInput, 'onResolve' 
     outcome: ApprovalOutcome,
   ) => Promise<void> | void;
 }
+/**
+ * A question an agent asked, on its way to the phone. Mirrors `ApprovalRequest`, minus everything
+ * about risk: there is no device floor for a question, because a question runs nothing.
+ */
+export interface QuestionRequest extends Omit<PendingQuestionInput, 'onResolve'> {
+  /** The provider's own id for the `question` frame, so the same ask is journaled once. */
+  providerRecordId?: string;
+  /** Frame metadata. Defaults to `{ source: 'stdio' }`. */
+  meta?: JournalMeta;
+  /** Resolved exactly once. `answers` is null on every ending that is not the person's answer. */
+  onAnswer: (
+    answers: QuestionAnswer[] | null,
+    resolution: QuestionResolution,
+    source: QuestionSource,
+    outcome: QuestionOutcome,
+  ) => Promise<void> | void;
+}
+
 type AckErrorCode = NonNullable<AckPayload['errorCode']>;
 
 export class DispatchError extends Error {
@@ -180,6 +208,11 @@ export interface DispatcherOptions {
    * awake while somebody still has a prompt to answer; nothing in the dispatcher depends on it.
    */
   onApprovalsChange?: () => void;
+  /**
+   * Called whenever the set of pending questions changes. Separate from `onApprovalsChange` so the
+   * Mac's keep-awake can say which kind of work is holding it open.
+   */
+  onQuestionsChange?: () => void;
   /**
    * Transcript frames. Absent on a bridge with no journal wired up (the CLI's one-shot
    * dispatchers, and tests that do not care), in which case `emitFrame` returns null rather than
@@ -242,6 +275,8 @@ export interface ResumableFrame {
  */
 export class Dispatcher {
   readonly approvals: PendingApprovalRegistry;
+  /** Questions the agents are blocked on, waiting for a person. */
+  readonly questions: PendingQuestionRegistry;
   readonly guard: SessionGuard;
   /**
    * The device-side approval floor. Built once at construction from local files and the
@@ -276,6 +311,12 @@ export class Dispatcher {
       onResolveError: (approvalId, err) =>
         this.logger.warn('approval resolution failed', { approvalId, error: String(err) }),
       ...(o.onApprovalsChange ? { onChange: o.onApprovalsChange } : {}),
+    });
+    this.questions = new PendingQuestionRegistry({
+      now: this.now,
+      onResolveError: (questionId, err) =>
+        this.logger.warn('question resolution failed', { questionId, error: String(err) }),
+      ...(o.onQuestionsChange ? { onChange: o.onQuestionsChange } : {}),
     });
     for (const adapter of o.adapters.values()) {
       this.unsubscribes.push(
@@ -557,6 +598,8 @@ export class Dispatcher {
         return this.getStatus(body.payload.sessionId);
       case 'agent.respond_to_approval':
         return this.respondToApproval(body.payload);
+      case 'agent.answer_question':
+        return this.answerQuestion(body.payload);
       case 'repo.scan':
         return this.scanRepositories();
       case 'project.register_handle':
@@ -1039,6 +1082,43 @@ export class Dispatcher {
   }
 
   /**
+   * The person's answer to a question the agent asked.
+   *
+   * Unlike an approval there is no device floor here and no preview hash: a question runs nothing,
+   * and what binds the answer to the prompt is the pair of indexes — the phone sends positions,
+   * this Mac resolves them against the questions it retained, and the agent is handed labels it
+   * wrote itself. Text never round-trips.
+   */
+  private async answerQuestion(p: CommandPayload<'agent.answer_question'>) {
+    const r = await this.questions.answer({
+      questionId: p.questionId,
+      sessionId: p.sessionId,
+      providerRequestId: p.providerRequestId,
+      answers: p.answers.map((a) => ({
+        questionIndex: a.questionIndex,
+        optionIndexes: a.optionIndexes,
+        ...(a.freeText !== undefined ? { freeText: a.freeText } : {}),
+      })),
+    });
+    if (!r.ok) {
+      const message =
+        r.message ??
+        {
+          unknown: 'no pending question (expired or already answered)',
+          session_mismatch: 'question belongs to another session',
+          request_mismatch: 'provider request id mismatch',
+          not_answerable: 'this question can only be answered on the Mac',
+          invalid_answer: 'the answer does not fit this question',
+        }[r.error];
+      // A question that lapsed is not a session that vanished, exactly as for approvals.
+      if (r.error === 'unknown') throw new DispatchError('unknown_question', message);
+      if (r.error === 'not_answerable') throw new DispatchError('capability_unsupported', message);
+      throw new DispatchError('invalid_payload', message);
+    }
+    return { questionId: p.questionId };
+  }
+
+  /**
    * Validate a v2 answer's `optionId` against the prompt it claims to answer, and return the kind
    * it means. `decision` stays required on the wire (a v1 bridge has never heard of options), so
    * the two must agree: an `optionId: 'allow_always'` arriving with `decision: 'deny'` is a
@@ -1308,6 +1388,83 @@ export class Dispatcher {
     return record;
   }
 
+  // ---------- questions (v2) ----------
+
+  /**
+   * Register a question, seal it into a `question` frame, and announce it.
+   *
+   * The frame carries the words (the question text, the option labels, any preview the model
+   * attached); `question.asked` carries only the shape the phone needs to lay the sheet out
+   * before it has decrypted anything — how many options each question has, which take more than
+   * one, which must never be echoed back.
+   */
+  requestQuestion(input: QuestionRequest): PendingQuestion {
+    const { onAnswer, providerRecordId, meta, ...rest } = input;
+    const record = this.questions.register(
+      {
+        ...rest,
+        onResolve: async (resolution, answers, source, outcome) => {
+          try {
+            await onAnswer(answers, resolution, source, outcome);
+          } catch (err) {
+            const message = (err instanceof Error ? err.message : String(err)).slice(0, 500);
+            this.logger.warn('question relay failed', {
+              questionId: record.questionId,
+              sessionId: record.sessionId,
+              resolution,
+              message,
+            });
+            // One coherent failure: the phone must not be told the agent got an answer it never
+            // received, so `question.answered` is not sent on this path.
+            this.send('session.event', {
+              sessionId: record.sessionId,
+              projectId: record.projectId,
+              provider: record.provider,
+              kind: 'failed',
+              summary: `Could not deliver the answer to ${record.provider}: ${message}`,
+              at: this.now().toISOString(),
+            });
+            throw err;
+          }
+          this.send('question.answered', {
+            questionId: record.questionId,
+            ...(outcome.answeredElsewhere ? { answeredElsewhere: true } : {}),
+            ...(outcome.reason ? { reason: outcome.reason } : {}),
+          });
+        },
+      },
+      this.approvalTimeoutMs,
+    );
+    // `seq` is required on the event because the words live in the frame. With no journal wired
+    // up (a one-shot CLI dispatcher) or a v1 link there is no frame, and 0 says so honestly
+    // rather than naming a sequence number nothing will ever serve.
+    const frame = this.frameProtocolV2()
+      ? this.emitFrame(record.sessionId, questionBodyFor({ questions: record.questions }), {
+          projectId: record.projectId,
+          provider: record.provider,
+          meta: meta ?? { source: 'stdio' },
+          ...(providerRecordId ? { providerRecordId } : {}),
+        })
+      : null;
+    this.send('question.asked', {
+      questionId: record.questionId,
+      sessionId: record.sessionId,
+      projectId: record.projectId,
+      provider: record.provider,
+      providerRequestId: record.providerRequestId,
+      seq: frame?.seq ?? 0,
+      meta: {
+        answerable: record.answerable,
+        ...(record.reason ? { reason: record.reason } : {}),
+        multiSelect: record.multiSelect,
+        optionCount: record.optionCount,
+        secret: record.secret,
+      },
+      expiresAt: record.expiresAt,
+    });
+    return record;
+  }
+
   // ---------- adapter events ----------
 
   private async onAdapterEvent(provider: Provider, e: AdapterEvent): Promise<void> {
@@ -1399,15 +1556,56 @@ export class Dispatcher {
         });
         return;
       }
-      case 'question_asked':
-        // B7 (MOB-036) owns the question registry and the `question.asked` event; the adapters
-        // already produce the event so that wiring is a dispatcher change and nothing else.
-        this.logger.debug('agent asked a question', {
+      case 'question_asked': {
+        const adapter = this.o.adapters.get(provider);
+        this.requestQuestion({
           sessionId: e.sessionId,
-          answerable: e.answerable,
-          questions: e.questions.length,
+          projectId: e.projectId,
+          provider,
+          providerRequestId: e.providerRequestId,
+          questions: e.questions,
+          answerable: e.answerable && typeof adapter?.answerQuestion === 'function',
+          ...(e.reason
+            ? { reason: e.reason }
+            : adapter?.answerQuestion
+              ? {}
+              : { reason: 'not_supported' }),
+          secret: e.secret,
+          expiresAt: e.expiresAt,
+          ...(e.providerRecordId ? { providerRecordId: e.providerRecordId } : {}),
+          ...(e.meta ? { meta: e.meta } : {}),
+          onAnswer: async (answers, _resolution, source) => {
+            // Only the person's own answer is written back. A local timeout, a shutdown, or an
+            // answer given in the terminal must leave the agent's prompt exactly as it found it —
+            // the adapter owns the deny it writes on its own timer (see the Claude adapter), and
+            // a mirrored thread's owner is the one sitting in front of it.
+            if (source !== 'cloud' || !answers) return;
+            await adapter?.answerQuestion?.({
+              providerRequestId: e.providerRequestId,
+              answers,
+            });
+          },
         });
         return;
+      }
+      case 'question_resolved_locally': {
+        const record = this.questions.findByRequest(e.sessionId, e.providerRequestId);
+        if (!record) return;
+        const answeredElsewhere = e.answeredElsewhere === true;
+        if (answeredElsewhere)
+          await this.questions.resolveExternally(
+            record.questionId,
+            e.source ?? 'provider',
+            e.resolution,
+          );
+        else
+          await this.questions.resolveLocally(
+            record.questionId,
+            e.resolution,
+            e.reason ?? e.resolution,
+          );
+        return;
+      }
       case 'approval_resolved_locally': {
         // Somebody else already resolved it; do not call back into the adapter.
         const answeredElsewhere = e.answeredElsewhere === true;
@@ -1439,6 +1637,7 @@ export class Dispatcher {
     // Every session ends with the daemon, so no agent is going to read these files again.
     this.leases.releaseAll();
     await this.approvals.cancelAll();
+    await this.questions.cancelAll();
     for (const a of this.o.adapters.values()) {
       try {
         await a.shutdown();

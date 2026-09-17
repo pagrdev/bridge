@@ -45,6 +45,7 @@ import {
 } from './mirrorBridge.js';
 import { ensurePaths, PagrHomeError, type PagrPaths } from './paths.js';
 import { nearestGitRoot, ProjectError, ProjectRegistry, projectIdFor } from './projects.js';
+import { ASK_USER_QUESTION, askUserQuestionUpdatedInput, questionBodyFor } from './questions.js';
 import { type ReconciledSession, reconcileSessions } from './reconcile.js';
 import { ReplayCache } from './replay.js';
 import {
@@ -193,6 +194,17 @@ const ApprovalRequestParams = z.object({
    * there is no such option to offer. They never leave this Mac.
    */
   permissionSuggestions: z.array(z.unknown()).max(50).optional(),
+  /**
+   * Which tool the prompt is about. Only `AskUserQuestion` changes anything here: it is a
+   * question, not a permission decision, and answering it as one ends the turn with
+   * "The user did not answer the questions." (spike MOB-044).
+   */
+  toolName: z.string().max(100).optional(),
+  /**
+   * `tool_input.questions`, forwarded by the hook for `AskUserQuestion` alone. Unparsed here —
+   * `questionBodyFor` is the one thing that decides what a question is.
+   */
+  questions: z.array(z.unknown()).max(50).optional(),
 });
 
 const AgentEventParams = z.object({
@@ -254,10 +266,10 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   );
   const registry = new ProjectRegistry({ file: paths.projectsFile, pagrHome: paths.home });
   /**
-   * Keep the Mac awake while Pagr has live work. Reference-counted by reason, so the two the
-   * daemon owns (`sessions`, `approvals`) are restated from the truth after every change rather
-   * than paired hold-for-release across every path that can end a session — and any later source
-   * of work (`questions`, `backfill`) holds its own reason through `daemon.keepAwake`.
+   * Keep the Mac awake while Pagr has live work. Reference-counted by reason, so the three the
+   * daemon owns (`sessions`, `approvals`, `questions`) are restated from the truth after every
+   * change rather than paired hold-for-release across every path that can end a session — and any
+   * later source of work (`backfill`) holds its own reason through `daemon.keepAwake`.
    */
   const keepAwake = new KeepAwake({
     env: o.env ?? process.env,
@@ -356,6 +368,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       imessageLinked: () => transport?.features?.imessage ?? false,
     },
     onApprovalsChange: () => syncKeepAwake(),
+    onQuestionsChange: () => syncKeepAwake(),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
   /**
@@ -366,6 +379,9 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   syncKeepAwake = () => {
     keepAwake.setCount('sessions', dispatcher.activeSessionCount());
     keepAwake.setCount('approvals', dispatcher.approvals.list().length);
+    // A blocked agent waiting on a question is work in progress exactly as an approval is: the
+    // child process is idling on a control request and nothing moves until somebody answers.
+    keepAwake.setCount('questions', dispatcher.questions.list().length);
   };
   syncKeepAwake();
   if (dispatcher.floor.lifted.length > 0)
@@ -713,6 +729,62 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       sessionId = rec.sessionId;
       emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
     }
+    /** Put the synthetic session back to idle once the prompt is done with (hook path only). */
+    const releaseInteractive = () => {
+      if (p.sessionId) return;
+      const rec = sessions.setStatus(sessionId, 'idle');
+      if (rec) emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
+    };
+
+    // `AskUserQuestion` comes through this same IPC method — the PermissionRequest hook fires for
+    // it like any other tool — but it is a question, and answering it with a bare allow is the
+    // bug MOB-036 exists to fix. The hook is told to return `updatedInput`, which is the same
+    // encoding the bridge-spawned path writes on the control response.
+    const asked =
+      p.toolName === ASK_USER_QUESTION ? questionBodyFor({ questions: p.questions }) : null;
+    if (asked && asked.questions.length > 0) {
+      return new Promise<{
+        approvalId: string;
+        decision: 'allow' | 'deny' | null;
+        resolution: string;
+        updatedInput?: Record<string, unknown>;
+      }>((resolve) => {
+        const record = dispatcher.requestQuestion({
+          sessionId,
+          projectId,
+          provider: p.provider,
+          providerRequestId: p.providerRequestId,
+          questions: asked.questions,
+          answerable: true,
+          secret: asked.questions.map(() => false),
+          providerRecordId: p.providerRequestId,
+          meta: { source: 'stdio' },
+          ...(p.timeoutMs
+            ? { expiresAt: new Date(now().getTime() + p.timeoutMs).toISOString() }
+            : {}),
+          onAnswer: (answers, resolution) => {
+            releaseInteractive();
+            // No answer means no decision: the hook prints nothing and the prompt in the user's
+            // own terminal behaves exactly as it does with Pagr uninstalled.
+            resolve({
+              approvalId: record.questionId,
+              decision: answers ? 'allow' : null,
+              resolution,
+              ...(answers
+                ? {
+                    updatedInput: askUserQuestionUpdatedInput(
+                      { questions: p.questions },
+                      asked.questions,
+                      answers,
+                    ),
+                  }
+                : {}),
+            });
+          },
+        });
+      });
+    }
+
     // The hook relays a prompt from the person's own `claude`, so it gets the same options a
     // bridge-spawned session would: "allow always" exactly when Claude offered rules to persist.
     const options =
@@ -742,11 +814,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
           ? { expiresAt: new Date(now().getTime() + p.timeoutMs).toISOString() }
           : {}),
         onDecision: (decision, resolution, _source, outcome) => {
-          if (!p.sessionId) {
-            const rec = sessions.setStatus(sessionId, 'idle');
-            if (rec)
-              emit(makeEvent(dispatcherDeviceId(), 'session.updated', interactive(rec), { now }));
-          }
+          releaseInteractive();
           // The hook is the one that answers Claude here, so it is told which option won: an
           // `allow_always` is the difference between allowing the call and writing a rule.
           resolve({

@@ -14,7 +14,14 @@ import type {
   SessionSummary,
   StartSessionInput,
 } from '@pagr/bridge-core';
-import { claudeApprovalOptions } from '@pagr/bridge-core';
+import {
+  ASK_USER_QUESTION,
+  askUserQuestionUpdatedInput,
+  claudeApprovalOptions,
+  type FrameQuestion,
+  type QuestionAnswer,
+  questionBodyFor,
+} from '@pagr/bridge-core';
 import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.js';
 import { ClaudeProcess, sealedModeEnabled } from './claude-process.js';
 import {
@@ -145,6 +152,26 @@ interface PendingApproval {
   timer: NodeJS.Timeout;
 }
 
+/**
+ * One `AskUserQuestion` waiting for an answer.
+ *
+ * It arrives on the SAME `can_use_tool` control request an ordinary permission prompt does, and
+ * that request id is the only chance to answer it (spike MOB-044): the tool executes the moment a
+ * `control_response` lands, with whatever `updatedInput` carries. So the original input is kept
+ * verbatim — `questions` has to go back unchanged — alongside the normalised copy the phone saw.
+ */
+interface PendingQuestion {
+  requestId: string;
+  sessionId: string;
+  providerRequestId: string;
+  /** The control request's own `input`, passed back untouched inside `updatedInput`. */
+  input: Record<string, unknown>;
+  /** The same questions as the phone sees them; indexes from the phone resolve against these. */
+  questions: FrameQuestion[];
+  toolUseId: string | null;
+  timer: NodeJS.Timeout;
+}
+
 export const newApprovalId = (): string => `apr_${randomUUID().replace(/-/g, '')}`;
 
 const now = () => new Date().toISOString();
@@ -204,6 +231,8 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private readonly logger: FileLogger;
   private readonly sessions = new Map<string, LiveSession>();
   private readonly pending = new Map<string, PendingApproval>();
+  /** Pending `AskUserQuestion` prompts, keyed by the id the dispatcher answers with. */
+  private readonly pendingQuestions = new Map<string, PendingQuestion>();
   private readonly listeners = new Set<(e: AdapterEvent) => void>();
   private readonly map: SessionMap;
   /** Non-null only under `PAGR_CLAUDE_CHANNEL=1` (ADR 0001 `approved-channel`, dev flag only). */
@@ -517,6 +546,17 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     this.mirror?.stop();
+    for (const p of [...this.pendingQuestions.values()]) {
+      clearTimeout(p.timer);
+      this.pendingQuestions.delete(p.providerRequestId);
+      this.emit({
+        kind: 'question_resolved_locally',
+        sessionId: p.sessionId,
+        providerRequestId: p.providerRequestId,
+        resolution: 'canceled',
+        reason: 'shutdown',
+      });
+    }
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
       this.pending.delete(p.approvalId);
@@ -777,6 +817,20 @@ export class ClaudeAdapter implements CodingAgentAdapter {
             resolution: 'canceled',
           });
         }
+        // `control_cancel_request` is Claude withdrawing the prompt — it is already unwinding the
+        // tool use itself, so nothing is written back here, exactly as for an approval.
+        for (const p of [...this.pendingQuestions.values()]) {
+          if (p.requestId !== ev.requestId) continue;
+          clearTimeout(p.timer);
+          this.pendingQuestions.delete(p.providerRequestId);
+          this.emit({
+            kind: 'question_resolved_locally',
+            sessionId: p.sessionId,
+            providerRequestId: p.providerRequestId,
+            resolution: 'canceled',
+            reason: 'canceled',
+          });
+        }
         if (!this.hasPendingFor(live.summary.sessionId)) this.setStatus(live, 'working');
         return;
       }
@@ -827,6 +881,24 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private noteExternalAnswers(rec: Extract<StreamRecord, { type: 'user_blocks' }>): void {
     for (const b of rec.blocks) {
       if (b.type !== 'tool_result') continue;
+      // The same reasoning for a question: `AskUserQuestion` produces its `tool_result` only once
+      // the permission request has been answered, so one arriving for a prompt we are still
+      // holding means the person answered it in their terminal.
+      for (const p of [...this.pendingQuestions.values()]) {
+        if (p.toolUseId !== b.toolUseId) continue;
+        clearTimeout(p.timer);
+        this.pendingQuestions.delete(p.providerRequestId);
+        this.emit({
+          kind: 'question_resolved_locally',
+          sessionId: p.sessionId,
+          providerRequestId: p.providerRequestId,
+          resolution: 'answered',
+          source: 'terminal',
+          answeredElsewhere: true,
+        });
+        const live = this.sessions.get(p.sessionId);
+        if (live && !this.hasPendingFor(p.sessionId)) this.setStatus(live, 'working');
+      }
       for (const p of [...this.pending.values()]) {
         if (p.toolUseId !== b.toolUseId) continue;
         clearTimeout(p.timer);
@@ -1044,6 +1116,12 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     live: LiveSession,
     ev: Extract<StreamEvent, { type: 'permission_request' }>,
   ): void {
+    // `AskUserQuestion` rides the same `can_use_tool` request as every other tool, and that is
+    // exactly the trap: an ordinary "allow" answers it with the original input, which Claude
+    // reads as "The user did not answer the questions." and the turn ends without the person
+    // ever seeing the question (spike MOB-044, run 2). It is a question, not an approval, and
+    // it leaves here as one.
+    if (ev.toolName === ASK_USER_QUESTION && this.onQuestionRequest(live, ev)) return;
     const approvalId = newApprovalId();
     const timeoutMs = this.opts.approvalTimeoutMs ?? 600_000;
     const timer = setTimeout(() => this.timeoutApproval(approvalId), timeoutMs);
@@ -1095,6 +1173,111 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     });
   }
 
+  /**
+   * Relay an `AskUserQuestion` as a question. Returns false — and falls back to the ordinary
+   * approval card — when the request carries nothing answerable, because a prompt with no
+   * questions in it is a permission decision however it is labelled.
+   */
+  private onQuestionRequest(
+    live: LiveSession,
+    ev: Extract<StreamEvent, { type: 'permission_request' }>,
+  ): boolean {
+    const { questions } = questionBodyFor(ev.input);
+    if (questions.length === 0) return false;
+    const providerRequestId = (ev.toolUseId ?? ev.requestId).slice(0, 200);
+    const timeoutMs = this.opts.approvalTimeoutMs ?? 600_000;
+    const timer = setTimeout(() => this.timeoutQuestion(providerRequestId), timeoutMs);
+    timer.unref();
+    this.pendingQuestions.set(providerRequestId, {
+      requestId: ev.requestId,
+      sessionId: live.summary.sessionId,
+      providerRequestId,
+      input: ev.input,
+      questions,
+      toolUseId: ev.toolUseId || null,
+      timer,
+    });
+    this.setStatus(live, 'waiting_for_user');
+    this.emit({
+      kind: 'question_asked',
+      sessionId: live.summary.sessionId,
+      projectId: live.summary.projectId,
+      providerRequestId,
+      questions,
+      // A session the bridge spawned owns its own stdin, so the answer has somewhere to go.
+      answerable: true,
+      // Claude's AskUserQuestion has no notion of a secret answer; Codex's `isSecret` does.
+      secret: questions.map(() => false),
+      expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
+      // Not the bare tool_use id: the same assistant block already produced a `tool_call` frame
+      // under it, and the journal would treat this as that frame arriving twice.
+      providerRecordId: `${providerRequestId}#question`,
+      meta: { source: 'stdio' },
+    });
+    return true;
+  }
+
+  /**
+   * Answer the question by allowing its control request with the answers inside `updatedInput`.
+   * One line, on the request id the question arrived on; there is no later opportunity.
+   */
+  async answerQuestion(input: {
+    providerRequestId: string;
+    answers: QuestionAnswer[];
+  }): Promise<void> {
+    const p = this.pendingQuestions.get(input.providerRequestId);
+    if (!p) throw new Error(`unknown or expired question ${input.providerRequestId}`);
+    const live = this.sessions.get(p.sessionId);
+    if (!live?.proc?.alive) throw new Error('claude process not running');
+    this.pendingQuestions.delete(input.providerRequestId);
+    clearTimeout(p.timer);
+    live.proc.answerPermission(p.requestId, {
+      behavior: 'allow',
+      updatedInput: askUserQuestionUpdatedInput(p.input, p.questions, input.answers),
+    });
+    if (!this.hasPendingFor(p.sessionId)) this.setStatus(live, 'working');
+  }
+
+  /**
+   * Nobody answered in time. A deny is the only honest ending: Claude is blocked on this request
+   * and will sit there for as long as the process lives (spike MOB-044, run 1).
+   */
+  private timeoutQuestion(providerRequestId: string): void {
+    const p = this.pendingQuestions.get(providerRequestId);
+    if (!p) return;
+    this.pendingQuestions.delete(providerRequestId);
+    const live = this.sessions.get(p.sessionId);
+    if (live?.proc?.alive)
+      live.proc.answerPermission(p.requestId, {
+        behavior: 'deny',
+        message: 'No answer received from the user in time (Pagr)',
+      });
+    this.emit({
+      kind: 'question_resolved_locally',
+      sessionId: p.sessionId,
+      providerRequestId,
+      resolution: 'timed_out',
+      reason: 'timed_out',
+    });
+    if (live && !this.hasPendingFor(p.sessionId)) this.setStatus(live, 'working');
+  }
+
+  /** Drop every question of a session without writing anything back (stop, exit, shutdown). */
+  private cancelQuestionsFor(sessionId: string): void {
+    for (const p of [...this.pendingQuestions.values()]) {
+      if (p.sessionId !== sessionId) continue;
+      clearTimeout(p.timer);
+      this.pendingQuestions.delete(p.providerRequestId);
+      this.emit({
+        kind: 'question_resolved_locally',
+        sessionId,
+        providerRequestId: p.providerRequestId,
+        resolution: 'canceled',
+        reason: 'canceled',
+      });
+    }
+  }
+
   private timeoutApproval(approvalId: string): void {
     const p = this.pending.get(approvalId);
     if (!p) return;
@@ -1117,10 +1300,12 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       this.pending.delete(p.approvalId);
       this.emit({ kind: 'approval_resolved_locally', approvalId: p.approvalId, resolution });
     }
+    this.cancelQuestionsFor(sessionId);
   }
 
   private hasPendingFor(sessionId: string): boolean {
     for (const p of this.pending.values()) if (p.sessionId === sessionId) return true;
+    for (const p of this.pendingQuestions.values()) if (p.sessionId === sessionId) return true;
     return false;
   }
 

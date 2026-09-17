@@ -222,7 +222,7 @@ describe('approval options', () => {
     expect(asked.kind === 'approval_requested' && asked.options).toEqual([
       { optionId: 'allow_once', kind: 'allow_once', label: 'Allow once' },
       { optionId: 'allow_session', kind: 'allow_session', label: 'Allow for this session' },
-      { optionId: 'reject_once', kind: 'reject_once', label: "Don't allow" },
+      { optionId: 'reject_once', kind: 'reject_once', label: 'Reject' },
     ]);
     expect(asked.kind === 'approval_requested' && asked.source).toBe('owned');
   }, 30_000);
