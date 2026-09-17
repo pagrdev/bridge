@@ -550,6 +550,11 @@ export class CodexAdapter implements CodingAgentAdapter {
       });
     }
     this.starting = null;
+    // Hand back every mirrored thread's subscription BEFORE the link goes. A thread we resumed
+    // and never unsubscribed stays attached on the user's own shared daemon, where the writer
+    // lock then belongs to a Pagr that is no longer running — so `pagr logout` and
+    // `pagr daemon uninstall` would leave the person's `codex` TUI worse than they found it.
+    await this.mirror?.stop().catch(() => {});
     await this.client?.stop();
     this.client = null;
     this.logger.close();
@@ -908,6 +913,7 @@ export class CodexAdapter implements CodingAgentAdapter {
         body: f.body,
         meta: f.meta,
         ...(f.providerRecordId ? { providerRecordId: f.providerRecordId } : {}),
+        ...(f.endsTurn ? { endsTurn: true } : {}),
       });
     }
   }

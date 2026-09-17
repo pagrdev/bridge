@@ -1,6 +1,6 @@
 {
   "name": "@pagr/claude-channel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DEPRECATED \u2014 the Pagr channel server now ships inside @pagr/cli (dist/channel-server.mjs). This package re-exports it so existing registrations keep resolving.",
   "keywords": [
     "pagr",

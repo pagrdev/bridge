@@ -1,6 +1,6 @@
 {
   "name": "@pagr/bridge-adapter-codex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex adapter for the Pagr bridge \u2014 drives `codex app-server` threads and relays their approval requests as typed approvals.",
   "keywords": [
     "pagr",

@@ -1,6 +1,6 @@
 {
   "name": "@pagr/protocol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pagr device protocol — typed, versioned schemas for cloud→bridge commands and bridge→cloud events. Public so anyone can audit exactly what the bridge can be asked to do.",
   "keywords": [
     "pagr",

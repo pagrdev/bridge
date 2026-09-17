@@ -132,6 +132,15 @@ export type AdapterEvent =
       at?: string;
       /** Plaintext one-liner for the iMessage thread; only sent when iMessage is linked. */
       imessage?: string;
+      /**
+       * The agent's last word of this turn: an assistant message that calls no tool.
+       *
+       * Both agents end a turn that way, so the adapter can say it at the moment it produces the
+       * frame rather than the dispatcher inferring it from a status change that arrives later.
+       * It decides which single frame of a turn carries the plaintext `imessage` line — without
+       * it the thread would get one message per paragraph the model wrote.
+       */
+      endsTurn?: boolean;
     }
   | {
       kind: 'approval_resolved_locally';

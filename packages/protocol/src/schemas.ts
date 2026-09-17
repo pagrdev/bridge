@@ -608,11 +608,28 @@ export const EventPayloads = {
     capabilities: z.array(z.string().min(1).max(64)).max(64).optional(),
     /** v2. Approval classes the user has lifted off the floor on this Mac. */
     floor: z.object({ lifted: z.array(z.string().min(1).max(64)).max(64) }).optional(),
-    /** v2. State of the Claude channel install, for `pagr doctor` and the app's Security screen. */
+    /**
+     * v2. State of the Claude channel on this Mac, for `pagr doctor` and the app's Security
+     * screen. Four separate truths that are routinely confused, so each is its own field:
+     *
+     *   - `serverInstalled` — the channel server file is present in this install.
+     *   - `registered` — the bridge has the channel registered and ready (the daemon's
+     *     `channel.*` IPC is on and the server is installed), so `pagr claude` can attach one.
+     *   - `boundSessions` — Claude sessions bound by session id right now. This is the number
+     *     that decides whether any single terminal can be given a turn from a phone.
+     *   - `mode` — `queued_next_turn` when the channel is registered, `off` when it is not.
+     *     Never `steered`: a channel line is surfaced to Claude at the next turn boundary.
+     *
+     * `shimOnPath` is the field the shim-based design used before the launcher replaced it
+     * (there is no `claude` shim any more — see `pagr claude`). It is optional and no longer
+     * sent; it stays in the schema so a hello from an older bridge still parses.
+     */
     channel: z
       .object({
         serverInstalled: z.boolean(),
-        shimOnPath: z.boolean(),
+        registered: z.boolean().optional(),
+        /** @deprecated replaced by `registered`; never sent by a bridge that has the launcher. */
+        shimOnPath: z.boolean().optional(),
         boundSessions: z.number().int().nonnegative(),
         mode: z.string().max(40),
       })

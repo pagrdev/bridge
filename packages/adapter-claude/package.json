@@ -1,6 +1,6 @@
 {
   "name": "@pagr/bridge-adapter-claude",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude Code adapter for the Pagr bridge — drives headless `claude` sessions and relays their permission prompts as typed approvals.",
   "keywords": [
     "pagr",

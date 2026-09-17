@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { basename } from 'node:path';
-import type {
-  DeviceEvent,
-  EventPayload,
-  Provider,
-  SessionStatus,
-  SessionSummary,
+import {
+  type AgentConnectionStatus,
+  canonicalize,
+  type DeviceEvent,
+  type EventPayload,
+  type Provider,
+  type SessionStatus,
+  type SessionSummary,
 } from '@pagr/protocol';
 import { z } from 'zod';
 import type { CodingAgentAdapter } from './adapters/types.js';
@@ -30,6 +32,7 @@ import {
   ADOPTED_SESSION_NAME,
   DispatchError,
   Dispatcher,
+  type HelloChannelStatus,
   type RemoteProjectPickStatus,
 } from './dispatcher.js';
 import { makeEvent } from './events.js';
@@ -112,6 +115,14 @@ export interface CreateDaemonOptions {
   /** How long the power assertion outlives the last piece of work. Default 60 s. */
   keepAwakeHysteresisMs?: number;
   /**
+   * Whether the Claude channel server file is present in this install. Supplied by the CLI, which
+   * is the layer that knows where its own `dist` is; absent means "cannot tell", reported as
+   * false. Never a fork — `device.hello` is sent on every connect.
+   */
+  channelServerInstalled?: () => boolean;
+  /** How often both adapters are re-probed for `agent.connection`. Default 60 s; tests shorten it. */
+  agentConnectionPollMs?: number;
+  /**
    * How the daemon ends its own process when it hits something only a human can fix. Defaults to
    * `process.exit`; tests pass a recorder. See `DAEMON_EXIT`.
    */
@@ -176,6 +187,17 @@ export interface DaemonStatus {
   mirror?: MirrorStatus;
   /** Whether a phone may list and add repositories, and how many handles are cached right now. */
   remoteProjectPick: RemoteProjectPickStatus;
+  /**
+   * The protocol version in force on the gateway link. 1 until a v2 gateway answers 2; optional
+   * so a newer `pagr` CLI still parses the status of a daemon that predates negotiation.
+   */
+  protocolVersion?: number;
+  /** Fingerprints of the phones this Mac seals to, sorted. Empty means nothing can be sealed. */
+  recipientKeyIds?: string[];
+  /** The Claude channel, as `device.hello` v2 reports it. */
+  channel?: HelloChannelStatus;
+  /** Total bytes of `~/.pagr/journal/` — the plaintext transcript archive on this disk. */
+  journalBytes?: number;
   socketPath: string;
   pid: number;
   startedAt: string;
@@ -291,6 +313,18 @@ export interface ChannelStatus {
   boundSessions?: number;
 }
 
+/**
+ * How often the daemon re-probes both agents for `agent.connection`.
+ *
+ * A minute, because what it catches — a CLI installed, upgraded or signed into, a Codex shared
+ * daemon appearing, a channel going away — is human-paced, and both probes are memoised inside
+ * the adapters so a tick that changes nothing costs an object compare.
+ */
+export const AGENT_CONNECTION_POLL_MS = 60_000;
+
+/** Opt out of the Claude Code channel entirely: the daemon registers no `channel.*` IPC. */
+export const CLAUDE_CHANNEL_ENV = 'PAGR_CLAUDE_CHANNEL';
+
 /** Stable `ses_…` id for a provider session the bridge did not spawn (hook path). */
 export function syntheticSessionId(provider: Provider, providerSessionId?: string): string {
   const seed = providerSessionId ?? randomUUID();
@@ -368,6 +402,17 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
    * session whose journal has gone also loses its cursors: keeping a `{sent, acked}` row for a
    * transcript that no longer exists would leave a resume asking for frames nobody has.
    */
+  /** Total bytes of the journal directory. Zero when nothing has been journaled (or it is gone). */
+  const journalBytes = (): number => {
+    try {
+      let total = 0;
+      for (const stat of journalSessions(paths.journalDir, paths.outboxFile)) total += stat.bytes;
+      return total;
+    } catch {
+      return 0;
+    }
+  };
+
   const pruneJournal = (): void => {
     try {
       const result = journal.prune({
@@ -408,6 +453,12 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     // The live set, not a snapshot: the transport repins it from `auth.result` / `keys.updated`,
     // and it is built after the dispatcher, so this reads through to whatever is current.
     recipientKeyIds: () => transport?.recipientKeyIds() ?? Object.keys(recipientKeys).sort(),
+    // All three are read at hello time, not captured: the version belongs to the connection, the
+    // keep-awake to the platform and the environment, and the channel to whatever `pagr claude`
+    // has attached this minute.
+    negotiatedVersion: () => transport?.negotiatedVersion ?? 1,
+    keepAwakeEnabled: () => !keepAwake.disabled,
+    channelHello: () => helloChannel(),
     frames: {
       journal,
       cursors: outbox,
@@ -666,6 +717,10 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     keepAwake: keepAwake.status(),
     ...(mirrorStatus() ? { mirror: mirrorStatus() as MirrorStatus } : {}),
     remoteProjectPick: dispatcher.remoteProjectPick(),
+    protocolVersion: transport?.negotiatedVersion ?? 1,
+    recipientKeyIds: transport?.recipientKeyIds() ?? Object.keys(recipientKeys).sort(),
+    channel: helloChannel(),
+    journalBytes: journalBytes(),
     socketPath: paths.socketPath,
     pid: process.pid,
     startedAt,
@@ -1055,7 +1110,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   // actually connects, and one only exists because the user ran `pagr claude`. `PAGR_CLAUDE_CHANNEL=0`
   // takes the methods away entirely for anyone who wants the old behaviour back.
   const channelEnv = o.env ?? process.env;
-  const channelEnabled = channelEnv.PAGR_CLAUDE_CHANNEL !== '0';
+  const channelEnabled = channelEnv[CLAUDE_CHANNEL_ENV] !== '0';
   let channelBridge: ChannelBridge | null = null;
   const channelStatus = (): ChannelStatus => {
     const attachedProjects = channelBridge?.attachedProjects() ?? [];
@@ -1076,12 +1131,17 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
           ? { claudeSessionId, sessionId: syntheticSessionId('claude', claudeSessionId) }
           : null;
       },
-      onBound: ({ sessionId, claudeSessionId, projectId }) =>
+      onBound: ({ sessionId, claudeSessionId, projectId }) => {
         logger.debug('channel bound to a Claude session', {
           sessionId,
           claudeSessionId,
           projectId,
-        }),
+        });
+        // A binding is the moment "this Mac can take a turn" becomes true. Saying it now rather
+        // than up to a poll later is the difference between the phone offering the composer while
+        // the person is still looking at the terminal they just launched.
+        nudgeConnections();
+      },
       resolveProject: (cwd) => {
         const rec = registry.findByPath(cwd);
         return rec ? { projectId: rec.projectId, path: rec.path } : null;
@@ -1142,27 +1202,70 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     logger.info('Claude Code channel IPC registered (attaches only when `pagr claude` is used)');
   }
 
+  /** What `device.hello` v2 says about the channel. Local facts only; nothing here forks. */
+  const helloChannel = (): HelloChannelStatus => {
+    const serverInstalled = o.channelServerInstalled?.() ?? false;
+    const registered = channelEnabled && serverInstalled;
+    return {
+      serverInstalled,
+      registered,
+      boundSessions: channelBridge?.boundSessions().length ?? 0,
+      // Never `steered`. A channel line is surfaced to Claude at the next turn boundary, and the
+      // app labels it Queued on the strength of this word.
+      mode: registered ? 'queued_next_turn' : 'off',
+    };
+  };
+
   /**
-   * Tell the cloud when live steering appears or disappears.
+   * Tell the cloud when an agent's connection status changes, and only then.
    *
-   * Attaching is observable (a poll arrives); detaching is a silence — two missed long polls —
-   * so it has to be watched for. Without this the phone would keep an "I can take the turn"
-   * affordance for a terminal that was closed twenty minutes ago.
+   * Three things move it and none of them announce themselves: a channel attaching or detaching
+   * (attaching is observable, detaching is a silence — two missed long polls), a Codex shared
+   * daemon appearing or going away, and the person installing, upgrading or signing in to either
+   * CLI. So the watcher re-probes both adapters on a timer and diffs the answer; the probes are
+   * memoised inside the adapters, so the cost of a tick that changes nothing is an object
+   * compare. The channel poll, which is faster, nudges it rather than emitting on its own.
+   *
+   * `agent.connection` is emitted once per change, never per tick: the phone's "this Mac can take
+   * a turn" affordance is driven by it, and a repeated identical event is a wasted push.
    */
+  const lastConnection = new Map<Provider, string>();
+  let connectionWatch: NodeJS.Timeout | null = null;
+  let probing = false;
+  const probeConnections = async (): Promise<void> => {
+    if (probing) return; // a slow probe must not stack behind the next tick
+    probing = true;
+    try {
+      for (const adapter of o.adapters.values()) {
+        let status: AgentConnectionStatus;
+        try {
+          status = await adapter.probe();
+        } catch {
+          // A probe that failed says nothing new; the next tick tries again.
+          continue;
+        }
+        const fingerprint = canonicalize(status);
+        if (lastConnection.get(adapter.provider) === fingerprint) continue;
+        lastConnection.set(adapter.provider, fingerprint);
+        emit(makeEvent(dispatcherDeviceId(), 'agent.connection', status, { now }));
+      }
+    } finally {
+      probing = false;
+    }
+  };
+  const nudgeConnections = (): void => {
+    void probeConnections().catch(() => {});
+  };
+
   let lastCanSteer = false;
   let channelWatch: NodeJS.Timeout | null = null;
   const watchChannel = (): void => {
     const canSteer = (channelBridge?.boundSessions().length ?? 0) > 0;
     if (canSteer === lastCanSteer) return;
     lastCanSteer = canSteer;
-    const adapter = o.adapters.get('claude');
-    if (!adapter) return;
-    void adapter
-      .probe()
-      .then((st) => emit(makeEvent(dispatcherDeviceId(), 'agent.connection', st, { now })))
-      .catch(() => {
-        // A probe that fails says nothing new; the next flip will try again.
-      });
+    // The channel changes what the Claude adapter reports (`approved-channel` vs `cli-hooks`), so
+    // the diff above is what decides whether anything is actually sent.
+    nudgeConnections();
   };
 
   let cleanupTimer: NodeJS.Timeout | null = null;
@@ -1225,6 +1328,11 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         channelWatch = setInterval(watchChannel, CHANNEL_POLL_TIMEOUT_MS);
         channelWatch.unref();
       }
+      connectionWatch = setInterval(
+        nudgeConnections,
+        o.agentConnectionPollMs ?? AGENT_CONNECTION_POLL_MS,
+      );
+      connectionWatch.unref();
       if (transport) transport.start();
       else logger.warn('not paired: run `pagr connect`; IPC available, gateway idle');
       logger.info('daemon started', {
@@ -1237,6 +1345,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       if (cleanupTimer) clearInterval(cleanupTimer);
       if (channelWatch) clearInterval(channelWatch);
       channelWatch = null;
+      if (connectionWatch) clearInterval(connectionWatch);
+      connectionWatch = null;
       // Before the dispatcher, so the assertion goes even if an adapter shutdown hangs or throws.
       keepAwake.dispose();
       await dispatcher.shutdown();

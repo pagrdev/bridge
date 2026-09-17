@@ -13,9 +13,10 @@ sentence an agent may act on. So the honest statement is not "the cloud cannot m
 anything"; it is that **the cloud cannot, by itself, make a high-risk action succeed**.
 
 **What it cannot do.** It cannot send a shell command, a filesystem path, or a binary to run —
-there is no command for it (`packages/protocol/src/schemas.ts`). It cannot name a directory: a project is
-an opaque id that resolves only to a folder something running on this Mac put in the registry, and
-an id the registry does not know is refused without the filesystem being touched. It can now ask
+there is no command for it (`packages/protocol/src/schemas.ts`). It cannot *choose* a directory:
+every folder Pagr can reach was named by something running on this Mac, a project is an opaque id
+that resolves only against the local registry, and an id the registry does not know is refused
+without the filesystem being touched. It can now ask
 this Mac to *list* the git repositories under your conventional code folders and register one of
 them by an opaque handle — it still never names one, and it never learns where any of them are
 (see "Projects a phone can add"). It cannot relay its own `allow` for anything this Mac classified as high risk
@@ -126,6 +127,75 @@ the above:
   Code has none, so read-only there is enforced by withholding tools (below). That is a deny-list
   against a tool set that can change between releases.
 
+## What changed for the iPhone app
+
+Protocol v2 added the phone. It is the largest change to this document since the bridge shipped,
+so the whole of it is stated here in one place rather than left to be assembled from the sections
+below.
+
+### The sealing boundary
+
+Content is sealed **on this Mac** for the set of phone keys the gateway delivered. The cloud
+stores and relays the envelope and holds no key for it.
+
+| Sealed — the cloud cannot read it | Plaintext — the cloud can | Why it has to be |
+| --- | --- | --- |
+| transcript frames: your messages, the agent's, thinking, tool calls, tool output, diffs, terminal blocks | session / project / device ids, `seq`, frame **kind**, timestamps, size, whether it was clipped | routing, ordering, de-duplication and the session list |
+| the approval **preview** (its own sealed frame) | approval id, action type, `previewHash`, the risk hints (`networkAccess`, `destructive`, `gitPush`, …), `riskTier`, expiry | the cloud re-checks the tier and decides whether to ask for Face ID, without reading the command |
+| a question's text, its option **labels**, any preview the model attached | question id, how many options each question has, which take more than one, which must never be echoed | the phone lays the answer sheet out before it has decrypted anything |
+| — | project display names, git remote host/name, the Mac's name, session display names | you have to be able to tell your Macs and projects apart |
+| — | approval option **ids and kinds** (`allow_once`, `reject_always`, …) | the phone renders the agent's real buttons; the words on them are the bridge's own generic labels |
+
+Two deliberate exceptions, both stated rather than buried:
+
+- **The phone → Mac direction is plaintext.** Instructions, answers and decisions travel in the
+  command payloads the existing signed dispatcher carries, and those are not sealed. What you type
+  on your phone is readable by the cloud. Sealing that direction would need the phone to hold a key
+  for *the Mac*, which is a second key-distribution problem for a message the cloud must in any
+  case queue, re-mint and audit.
+- **`imessage` is plaintext, when you have linked a thread.** One field on `session.frame`,
+  `approval.requested` and `question.asked`, carrying the line your iMessage thread shows. It only
+  exists while `auth.result.features.imessage` is true, it stops on the next event when you unlink,
+  and on frames it is the agent's final message of a turn clipped to 500 characters. iMessage is
+  plaintext by nature; this field is how the thread keeps working now that the transcript is sealed.
+
+`~/.pagr/journal/` is plaintext on your own disk. That is local, and `docs/PRIVACY.md` says so in
+full.
+
+### Recipient-key trust, and its limit
+
+The phone key set arrives in `auth.result.recipientKeys` and live in `keys.updated`, and is
+accepted under the same rule as the server key set: a set that grants no new trust — the same set
+again, or a narrower one — is taken as it stands; **adding a phone, or re-pointing a pinned
+fingerprint at a different key, requires `recipientKeysSignature`** from a server key this bridge
+already pins. The bridge re-derives each fingerprint from the key and refuses a set where the two
+disagree. `pagr status` prints the pinned fingerprints in full so you can compare them with what
+your phone shows.
+
+**What that does not defend against, stated plainly:** the signing key belongs to the Pagr API. An
+attacker who holds it — or Pagr under legal compulsion — can sign a set containing one extra
+recipient, and this bridge will accept it and seal to that recipient from then on. The
+fingerprints in `pagr status` are what makes it *visible*; nothing here makes it impossible. If
+that matters to you, check the list after every phone you pair and after anything unexpected.
+
+### Everything else v2 added
+
+- **Repository scan.** A paired phone can ask this Mac to list the git repositories under your
+  conventional code folders and register one by opaque handle. This widens what the cloud can
+  reach and has its own section below; `PAGR_REMOTE_PROJECT_PICK=0` removes both commands.
+- **`allow_always` writes Claude Code's own settings.** Choosing a persistent grant on your phone
+  makes Claude Code write the rule into **your** settings, where it applies to every future session
+  including ones Pagr knows nothing about. The device floor judges a persistent grant harder than a
+  one-off for exactly that reason, and `PAGR_ALLOW_ALWAYS=0` removes the option entirely.
+- **Floor rules for persistent grants.** A floored class refuses a standing grant even where the
+  host allow-list would have permitted the same action once. The classes lifted on this Mac travel
+  in `device.hello.floor.lifted`, by name, so the app can show what is lifted and never guess.
+- **The Claude channel is opt-in twice**, and a bound channel is a prompt-injection surface —
+  see "The Claude Code channel" below, which states that in full.
+- **Codex terminal threads are `mirror_only`.** The bridge mirrors them and relays their prompts;
+  it never writes a turn, never steers, and never answers a request that was addressed to every
+  subscriber rather than to Pagr — the person in front of that terminal owns it.
+
 ## What the bridge can be asked to do
 
 Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
@@ -141,9 +211,15 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | `settings.sync_public_policy` | update the approval timeout. Nothing else: there is no cloud setting that makes the bridge answer a prompt |
 | `repo.scan` | list the git repositories under your conventional code folders as opaque handles — names, not paths. Rate limited to one every 30 s (see "Projects a phone can add") |
 | `project.register_handle` | register one of those handles as a project. The handle resolves only in this daemon's memory, and only for an hour |
+| `agent.answer_question` | answer a question the agent asked (`AskUserQuestion`, `requestUserInput`), bound to the exact prompt and the exact options it offered. Answering a question runs nothing |
+| `session.list_history` | list this Mac's sessions for a time window — ids, project ids, names, statuses, timestamps. Never a path, and never a session outside a registered project |
+| `session.backfill` | re-send part of a session's own transcript from `~/.pagr/journal/`, sealed, capped, one at a time. It reads the same files the mirror already reads and opens no new ones |
+| `keys.sync` | ask the gateway to re-send the phone key set. Carries nothing and changes nothing on this Mac by itself |
 
-That table is the whole surface; it is not fixed at nine rows, and a bridge that gains a command
-gains a row here in the same change.
+That table is the whole surface — **fifteen commands** at this version, counting the three
+read-only ones grouped in the first row. It is not fixed at that number: a bridge that gains a
+command gains a row here in the same change, and `pagr doctor` reports which of the optional ones
+this Mac will actually honour.
 
 There is deliberately **no** `shell.exec`, `fs.read`, `fs.write`, `process.spawn`, or "run this
 binary". The cloud cannot send a filesystem path: project references are opaque `proj_…` ids that

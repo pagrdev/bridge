@@ -1,6 +1,7 @@
 # Device protocol
 
-Canonical source: `packages/protocol/src/schemas.ts` (`PROTOCOL_VERSION = 1`). This page walks through
+Canonical source: `packages/protocol/src/schemas.ts`. One file describes **both** versions: v1, the
+baseline every deployed gateway speaks, and v2, which adds the iPhone app. This page walks through
 it; if they disagree, the schema wins.
 
 ## Identifiers
@@ -18,10 +19,14 @@ bridge → gateway            gateway → bridge
 auth.request {deviceId}
                             auth.challenge {nonce}
 auth.response {deviceId, nonce, signature, bridgeVersion, protocolVersion}
-                            auth.result {ok, error?, serverKeys?, serverKeysSignature?, minBridgeVersion?}
+                            auth.result {ok, error?, serverKeys?, serverKeysSignature?,
+                                         minBridgeVersion?, protocolVersion?,
+                                         recipientKeys?, recipientKeysSignature?, features?}
 event {event: DeviceEvent}  command {envelope: CommandEnvelope}
 pong                        ping
                             ack {cursors} (v2)
+                            keys.updated {recipientKeys, recipientKeysSignature?} (v2)
+                            settings.updated {features} (v2)
 ```
 
 - `signature` is base64url Ed25519 over the UTF-8 string `${deviceId}.${nonce}` using the device key.
@@ -55,6 +60,101 @@ pong                        ping
 | 1009 | frame over the gateway's 256 KiB cap | never provoked: the bridge measures every frame and refuses to send an oversized one |
 
 Implementation: `packages/core/src/transport.ts`.
+
+## Protocol v2
+
+v2 is strictly additive. No v1 shape was narrowed, every field v2 introduces is optional, and one
+schema describes both — because a bridge and a gateway of different vintages have to understand
+each other's frames on the same socket.
+
+### Version negotiation
+
+| Step | Who | What |
+| --- | --- | --- |
+| offer | bridge | `auth.response.protocolVersion` — the highest version this bridge speaks (2) |
+| answer | gateway | `auth.result.protocolVersion` — the version it accepts. **Absent means 1** |
+| in force | both | `min(offer, answer)`. Nothing v2-only may be sent until it is 2 |
+| refusal | gateway | `auth.result{ok:false, error:'protocol_version'}` — the bridge retries **once**, offering 1, and stays there for the life of the process |
+| reset | bridge | back to 1 the moment the socket closes: a version is a property of a connection, not of a daemon |
+
+A gateway cannot promote a bridge past what it offered — it answers an offer, it does not make one.
+
+### What each version carries
+
+| | v1 | v2 |
+| --- | --- | --- |
+| session content | `session.event.summary` ≤ 2000 chars, `approval.requested.preview` ≤ 1500 chars, both plaintext | sealed `session.frame`s; the preview moves into its own sealed frame and `preview` goes out empty |
+| approvals | `allow` / `deny` | the agent's own option list, `optionId`, `approval.applied` |
+| questions | none — a question is an approval-shaped prompt or nothing | `question.asked` / `agent.answer_question` / `question.answered` |
+| history | whatever the cloud kept | `session.list_history`, `session.backfill` from this Mac's journal |
+| projects | added on the Mac | `repo.scan` + `project.register_handle`, by opaque handle |
+| key material | pinned server keys | + the recipient (phone) key set, signed |
+
+### Capability gating
+
+The negotiated version says what the *link* can carry. `device.hello.capabilities` says what this
+*Mac* will actually do, and the cloud gates features on it so a button is never offered for
+something that would fail:
+
+| Capability | Present when | Gates |
+| --- | --- | --- |
+| `frames.v1` | the daemon has a frame journal | `session.frame` |
+| `seal.v1` | frames, and somewhere to learn phone keys from | sealing at all; `recipientKeyIds` says which phones are pinned right now |
+| `questions.v1` | an adapter can write an answer back | `question.asked`, `agent.answer_question` |
+| `approval_options.v1` | always, on a v2 bridge | `approval.requested.options`, `agent.respond_to_approval.optionId`, `approval.applied` |
+| `backfill.v1` | a history source is wired up | `session.list_history`, `session.backfill` |
+| `repo_scan.v1` | `PAGR_REMOTE_PROJECT_PICK` is not `0` | `repo.scan`, `project.register_handle` |
+| `keep_awake.v1` | macOS, and `PAGR_KEEP_AWAKE` is not `0` | the "your Mac will not idle-sleep while this runs" promise |
+| `channel.v1` | the Claude channel is registered on this Mac | giving a terminal Claude session a turn from the phone |
+
+A v2-only command sent on a v1 link acks `failed` / `not_negotiated`; one whose capability is
+absent acks `failed` / `capability_unsupported`. The two are different answers to different
+questions — "this connection cannot carry that" and "this Mac will not do that" — and neither is
+ever answered with a quiet success.
+
+### Sealing, in one paragraph
+
+Frame bodies, the approval preview and a question's words are sealed on the Mac for the set of
+phone keys the gateway delivered (`auth.result.recipientKeys`, refreshed live by `keys.updated`).
+The envelope is `pagr.seal.v1`: X25519 + HKDF-SHA256 + ChaCha20-Poly1305, one wrapped content key
+per phone, with `canonicalize({sessionId, seq, kind, chunk?})` as the AAD, so a frame cannot be
+replayed as another session's, another sequence number's or another chunk's. The cloud stores and
+relays the envelope opaquely and holds no key for it. Everything **outside** the seal is plaintext
+by design — ids, statuses, timestamps, project and Mac names, option ids and kinds, approval hints
+— because routing, push and the session list have to work without the cloud reading content.
+`docs/SECURITY.md` § "What changed for the iPhone app" states the boundary exactly, and is the
+public counterpart of the platform's ADR 0018.
+
+The recipient key set is trusted under the same rule as the server key set: a set that grants no
+new trust (the same set, or a narrower one) is accepted as it stands; adding a phone, or
+re-pointing a pinned `kid`, needs `recipientKeysSignature` from a server key the bridge already
+pins. See `docs/SECURITY.md` § "Server key rotation" for the mechanism and its limits.
+
+### Control levels
+
+Every v2 session summary carries how much of it Pagr may drive. It is a fact about the session,
+not a permission the cloud grants, and the bridge refuses anything above it regardless of what it
+is asked:
+
+| Level | Which sessions | The phone may |
+| --- | --- | --- |
+| `full` | started by Pagr, or a terminal Claude session with a channel bound | everything: instruct, steer (queued), stop, answer prompts |
+| `approvals_only` | your own `claude`, no channel bound | answer its prompts, and see that it exists |
+| `mirror_only` | a Codex thread the shared daemon owns | watch it and answer its prompts; the writer lock forbids writing to it |
+| `none` | a session in a directory no project covers | nothing — it is never described to the cloud at all |
+
+### Delivery states
+
+`agent.send_instruction` acks `{ delivered }`, because "sent" is not one thing:
+
+| `delivered` | meaning |
+| --- | --- |
+| `steered` | the agent took it mid-turn |
+| `queued` | accepted, and the agent will see it at the next turn boundary. Channel delivery to a terminal Claude is **always** this |
+| `new_turn` | there was no turn running; it started one |
+
+The phone labels `queued` as *Queued* until a `session.event` of kind `followup_delivered` says
+otherwise. Nothing anywhere claims an interruption the bridge cannot perform.
 
 ## Command envelope (cloud → bridge)
 
@@ -196,19 +296,19 @@ Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payl
 
 | `type` | when | payload |
 | --- | --- | --- |
-| `device.hello` | after each successful auth | bridge/OS version, `agents: AgentConnectionStatus[]`, `projects: ProjectSummary[]`, `sessions` (bounded — see below), `capabilities?` (v2 names such as `repo_scan.v1`, present only when that command will run) |
+| `device.hello` | after each successful auth, before anything else | see *`device.hello`, field by field* below |
 | `device.heartbeat` | every 20 s | `{ activeSessions }` |
 | `command.ack` | exactly once per received command (`inReplyTo = commandId`) | `{ commandId, status: accepted\|rejected\|completed\|failed\|duplicate, errorCode?, message?, result? }` |
 | `project.registered` / `project.removed` | local CLI or `project.remove` | `ProjectSummary` / `{ projectId }` |
 | `agent.connection` | adapter status change | `AgentConnectionStatus` |
-| `session.updated` | session created or state changed | `SessionSummary` |
+| `session.updated` | session created or state changed | `SessionSummaryV2` — `SessionSummary` plus `controlLevel?`, `origin?`, `projectStatus?`, `lastSeq?`, `repoHandle?` |
 | `session.event` | progress, messages, completion… | `{ sessionId, projectId, provider, kind, summary ≤ 2000, providerEventId?, at }` |
-| `approval.requested` | agent asked permission | `{ approvalId, sessionId, projectId, provider, providerRequestId, actionType, preview ≤ 1500, previewHash, hints, expiresAt, options?, frameSeq? }` |
+| `approval.requested` | agent asked permission | `{ approvalId, sessionId, projectId, provider, providerRequestId, actionType, preview ≤ 1500, previewHash, hints, expiresAt, options?, riskTier?, frameSeq?, imessage? }` |
 | `approval.resolved_locally` | timeout, terminal answer, or shutdown | `{ approvalId, resolution: allowed\|denied\|timed_out\|canceled, source?, answeredElsewhere }` |
 | `approval.applied` | after the agent was told (v2 only) | `{ approvalId, sessionId, optionId, applied, appliedAs?, error? }` |
 | `question.asked` | agent asked the user something (v2 only) | `{ questionId, sessionId, projectId, provider, providerRequestId, seq, meta: { answerable, reason?, multiSelect[], optionCount[], secret[] }, expiresAt, imessage? }` |
 | `question.answered` | the question is no longer pending (v2 only) | `{ questionId, answeredElsewhere, reason? }` |
-| `session.frame` | one transcript frame, v2 only | `{ sessionId, projectId, provider, seq, kind, at, providerRecordId?, sealed, meta }` — see *Transcript frames and cursors* |
+| `session.frame` | one transcript frame, v2 only | `{ sessionId, projectId, provider, seq, kind, at, providerRecordId?, sealed, meta, imessage? }` — see *Transcript frames and cursors* |
 | `attachment.consumed` | after a download attempt | `{ attachmentId, ok, error? }` |
 
 `errorCode` values: `bad_signature`, `expired`, `replayed`, `wrong_device`, `unknown_project`,
@@ -324,6 +424,27 @@ when it was not the phone's own answer.
 `docs/TROUBLESHOOTING.md` § "A question never reached my phone" covers what to check when one does
 not arrive.
 
+### `device.hello`, field by field
+
+Sent once per connection, before any frame, so the gateway knows what this Mac is before it is
+handed a transcript.
+
+| Field | Version | What it says |
+| --- | --- | --- |
+| `bridgeVersion`, `platform`, `osVersion?` | 1 | what is running here |
+| `protocolVersion` | 1 | the version **in force on this connection** — the negotiated value, not an offer |
+| `agents` | 1 | `AgentConnectionStatus[]`: install, version, sign-in and per-agent capabilities |
+| `projects` | 1 | `ProjectSummary[]`: ids, display names, git remote host/name. Never a path |
+| `sessions` | 1 / 2 | `SessionSummaryV2[]`, bounded (below). On v1 the v2 fields are absent |
+| `capabilities?` | 2 | the names in *Capability gating* above, and only those that are true right now |
+| `floor?` | 2 | `{ lifted: [...] }` — the device-floor classes lifted **on this Mac**, by class name. Present and empty when nothing is lifted, because "nothing is lifted" is a fact the app states |
+| `channel?` | 2 | `{ serverInstalled, registered, boundSessions, mode }`, `mode ∈ queued_next_turn \| off`. Four separate truths; never `steered` |
+| `recipientKeyIds?` | 2 | fingerprints of the phones this Mac seals to, sorted. Omitted when there are none |
+
+On a link that negotiated v1 the hello is byte-identical to what a pre-v2 bridge sent: the v2
+fields are simply not there, because a gateway that answered 1 has told us it has never heard of
+them. `capabilities` on v1 carries `repo_scan.v1` alone, exactly as it did before.
+
 ### `device.hello` is bounded
 
 The hello is sent on **every** connect, so it can never be allowed to grow past the frame cap — an
@@ -391,6 +512,27 @@ how much is waiting).
 
 Implementation: `packages/core/src/{frames,journal}.ts`, `Dispatcher.emitFrame`,
 `GatewayClient.resume`.
+
+### The one plaintext field: `imessage`
+
+`session.frame`, `approval.requested` and `question.asked` may each carry an `imessage` string
+(≤ 1500 chars). It is the line the user's **iMessage thread** shows, and iMessage is plaintext by
+nature, so this one field is not sealed. Three rules keep that honest:
+
+- **Only when a thread is linked.** The gateway says so in `auth.result.features.imessage`, and
+  changes it mid-connection with `settings.updated {features}`. The bridge re-reads the flag on
+  every event, so unlinking stops the plaintext on the very next event, without a reconnect. With
+  the flag false the field is absent — not empty, absent.
+- **Only the agent's last word of a turn.** On frames it appears exactly once per turn, on the
+  final `assistant` frame — the message that calls no tool, which is how both agents end a turn —
+  clipped to 500 characters. Not once per paragraph, and never on a backfilled frame: replaying
+  last week's transcript must not put last week's answers back into the thread.
+- **Only what the thread already showed.** For an approval it is the same one-liner preview the
+  thread has always carried; for a question it is `"<Agent> asked: <header>"`, never the options,
+  because answering happens on the phone where they are legible.
+
+Nothing else about this changes what is journaled: `~/.pagr/journal/` is plaintext on your own
+disk either way, and that is local (`docs/PRIVACY.md`).
 
 ### Frame bodies
 
