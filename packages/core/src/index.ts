@@ -15,6 +15,7 @@ export * from './heuristics.js';
 export * from './identity.js';
 export * from './ipc.js';
 export * from './jsonFile.js';
+export * from './keepAwake.js';
 export * from './keychain.js';
 // `daemon.js` already re-exports the older half of this module, so the new symbols are listed
 // explicitly rather than star-exported twice.

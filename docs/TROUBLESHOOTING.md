@@ -362,6 +362,31 @@ research preview.
   channel server is actually polling, and back to `false` within ~50 s of it stopping. Pagr never
   says it interrupted your agent when it merely queued a message.
 
+## Mac keeps sleeping while Pagr works
+
+While a session is live or a prompt is waiting for an answer, the bridge holds a power assertion
+so your Mac does not idle-sleep out from under the agent. It runs one child process for this:
+
+```
+/usr/bin/caffeinate -i -w <daemon pid>
+```
+
+- **Idle sleep only.** `-i` is the only assertion taken. **Closing the lid still sleeps the Mac** —
+  that is a deliberate instruction from you, and Pagr will not override it. If you need a session
+  to keep running, leave the lid open (plugged in, or with "Prevent automatic sleeping on power
+  adapter" set in System Settings → Battery).
+- **It dies with the daemon.** `-w <pid>` ties the assertion to the daemon process, so it cannot
+  outlive a crash or a force-quit and leave your laptop awake forever.
+- **It is released 60 s after the last piece of work**, not instantly, so back-to-back turns do
+  not churn the child.
+- `pagr doctor` reports it as **keep-awake**: `active (2 sessions, 1 approval)`, `idle`, or
+  `disabled (PAGR_KEEP_AWAKE=0)`.
+
+To turn it off entirely: `launchctl setenv PAGR_KEEP_AWAKE 0`, then `pagr daemon start` (the
+daemon reads its environment once, at start; see "Many projects, many sessions" for why launchd
+never sees your shell profile). Nothing else changes — sessions still run, they just stop holding
+the Mac awake.
+
 ## Exit codes
 
 | Code | Meaning |

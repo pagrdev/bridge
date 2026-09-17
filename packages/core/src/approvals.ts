@@ -89,6 +89,11 @@ export class PendingApprovalRegistry {
        * The entry is consumed either way — an approval is never answerable twice.
        */
       onResolveError?: (approvalId: string, err: unknown) => void;
+      /**
+       * Called after the pending set changes (registered, or consumed by any path). "An approval
+       * is waiting" is a reason to keep the Mac awake, and this is the one choke point for it.
+       */
+      onChange?: () => void;
     } = {},
   ) {}
 
@@ -137,6 +142,7 @@ export class PendingApprovalRegistry {
     );
     timer.unref();
     this.pending.set(approvalId, { record, input, timer });
+    this.opts.onChange?.();
     return record;
   }
 
@@ -199,6 +205,7 @@ export class PendingApprovalRegistry {
     if (!entry) return;
     this.pending.delete(approvalId);
     clearTimeout(entry.timer);
+    this.opts.onChange?.();
     if (source === 'timeout') this.opts.onTimeout?.(entry.record);
     await entry.input.onResolve(resolution, decision, source);
   }

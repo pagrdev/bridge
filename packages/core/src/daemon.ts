@@ -25,6 +25,7 @@ import {
   IpcSocketBusyError,
   registerChannelMethods,
 } from './ipc.js';
+import { KeepAwake, type KeepAwakeSpawn, type KeepAwakeStatus } from './keepAwake.js';
 import { type SecretStore, SecretStoreError } from './keychain.js';
 import { DAEMON_EXIT } from './launchAgent.js';
 import { type Logger, silentLogger } from './logging.js';
@@ -69,6 +70,13 @@ export interface CreateDaemonOptions {
   /** Environment for security checks (`PAGR_ENV`, `PAGR_ALLOW_INSECURE_WS`); defaults to process.env. */
   env?: NodeJS.ProcessEnv;
   /**
+   * How keep-awake starts `caffeinate`. Injected so tests never run a real one; defaults to
+   * `child_process.spawn`.
+   */
+  spawn?: KeepAwakeSpawn;
+  /** How long the power assertion outlives the last piece of work. Default 60 s. */
+  keepAwakeHysteresisMs?: number;
+  /**
    * How the daemon ends its own process when it hits something only a human can fix. Defaults to
    * `process.exit`; tests pass a recorder. See `DAEMON_EXIT`.
    */
@@ -94,6 +102,11 @@ export interface DaemonStatus {
   /** Adopted sessions whose directory is in no registered project, so the cloud never sees them. */
   unregisteredSessions: number;
   pendingApprovals: number;
+  /**
+   * Whether this Mac is being held awake, and what for. Optional so a newer `pagr` CLI still
+   * parses the status of an older daemon that has no keep-awake at all.
+   */
+  keepAwake?: KeepAwakeStatus;
   socketPath: string;
   pid: number;
   startedAt: string;
@@ -107,6 +120,11 @@ export interface Daemon {
   readonly sessions: SessionStore;
   readonly dispatcher: Dispatcher;
   readonly ipc: IpcServer;
+  /**
+   * The Mac's power assertion. Hold a reason on it (`questions`, `backfill`, …) for any work
+   * that must not be interrupted by idle sleep; `sessions` and `approvals` are held for you.
+   */
+  readonly keepAwake: KeepAwake;
   /** Null until paired (no deviceId / gatewayUrl). */
   readonly transport: GatewayClient | null;
   /** The phones sealed frames are encrypted for: `kid` → base64url raw X25519 public key. */
@@ -203,7 +221,22 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     config.deviceId ? { deviceId: config.deviceId } : {},
   );
   const registry = new ProjectRegistry({ file: paths.projectsFile, pagrHome: paths.home });
-  const sessions = new SessionStore(paths.sessionsFile, now);
+  /**
+   * Keep the Mac awake while Pagr has live work. Reference-counted by reason, so the two the
+   * daemon owns (`sessions`, `approvals`) are restated from the truth after every change rather
+   * than paired hold-for-release across every path that can end a session — and any later source
+   * of work (`questions`, `backfill`) holds its own reason through `daemon.keepAwake`.
+   */
+  const keepAwake = new KeepAwake({
+    env: o.env ?? process.env,
+    logger: logger.child({ mod: 'keep-awake' }),
+    clock: now,
+    ...(o.spawn ? { spawn: o.spawn } : {}),
+    ...(o.keepAwakeHysteresisMs !== undefined ? { hysteresisMs: o.keepAwakeHysteresisMs } : {}),
+  });
+  // Assigned once the dispatcher exists; the session store is built first and may fire before.
+  let syncKeepAwake = (): void => {};
+  const sessions = new SessionStore(paths.sessionsFile, now, () => syncKeepAwake());
   const replay = new ReplayCache({ file: paths.replayFile, now: () => now().getTime() });
   const commands = new CommandTracker();
   let serverKeys: Record<string, string> = { ...config.serverKeys };
@@ -251,8 +284,19 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     // The live set, not a snapshot: the transport repins it from `auth.result` / `keys.updated`,
     // and it is built after the dispatcher, so this reads through to whatever is current.
     recipientKeyIds: () => transport?.recipientKeyIds() ?? Object.keys(recipientKeys).sort(),
+    onApprovalsChange: () => syncKeepAwake(),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
+  /**
+   * Restate both derived reasons from the truth. Idempotent, so it is safe to call from every
+   * change hook — and it cannot drift the way a hold/release pair spread across the dispatcher,
+   * the reconciler, the hook path and the pruner would.
+   */
+  syncKeepAwake = () => {
+    keepAwake.setCount('sessions', dispatcher.activeSessionCount());
+    keepAwake.setCount('approvals', dispatcher.approvals.list().length);
+  };
+  syncKeepAwake();
   if (dispatcher.floor.lifted.length > 0)
     logger.warn('device approval floor partially lifted by local policy', {
       lifted: dispatcher.floor.lifted.join(','),
@@ -412,6 +456,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     unregisteredSessions: sessions.list().filter((r) => r.projectId === UNREGISTERED_PROJECT)
       .length,
     pendingApprovals: dispatcher.approvals.list().length,
+    keepAwake: keepAwake.status(),
     socketPath: paths.socketPath,
     pid: process.pid,
     startedAt,
@@ -734,6 +779,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     sessions,
     dispatcher,
     ipc,
+    keepAwake,
     get transport() {
       return transport;
     },
@@ -786,6 +832,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     },
     async stop() {
       if (cleanupTimer) clearInterval(cleanupTimer);
+      // Before the dispatcher, so the assertion goes even if an adapter shutdown hangs or throws.
+      keepAwake.dispose();
       await dispatcher.shutdown();
       await transport?.stop();
       await ipc.close(); // unlinks the socket only if this instance bound it
