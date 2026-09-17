@@ -589,6 +589,75 @@ describe('doctor · keep-awake', () => {
   });
 });
 
+describe('doctor · the transcript mirror', () => {
+  it('skips when the daemon is down, and when nothing has been mirrored yet', async () => {
+    let r = await report(['--offline']);
+    expect(check(r, 'mirror')?.status).toBe('skip');
+    expect(check(r, 'mirror')?.detail).toContain('daemon not running');
+    server = await fakeDaemon(h.home, { status: () => daemonStatus() });
+    r = await report(['--offline']);
+    expect(check(r, 'mirror')?.status).toBe('skip');
+    expect(check(r, 'mirror')?.detail).toContain('no Claude sessions mirrored yet');
+  });
+
+  it('reports what is being watched and how fresh it is', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () =>
+        daemonStatus({
+          mirror: {
+            enabled: true,
+            sessions: 2,
+            filesWatched: 3,
+            lastFrameAt: new Date(Date.now() - 12_000).toISOString(),
+            unknownRecordTypes: 0,
+          },
+        }),
+    });
+    const r = await report(['--offline']);
+    const c = check(r, 'mirror');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('2 session(s)');
+    expect(c?.detail).toContain('3 file(s) watched');
+    expect(c?.detail).toMatch(/last frame 1[12]s ago/);
+  });
+
+  it('says so when it has seen a record type it has no frame for', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () =>
+        daemonStatus({
+          mirror: {
+            enabled: true,
+            sessions: 1,
+            filesWatched: 1,
+            lastFrameAt: null,
+            unknownRecordTypes: 2,
+          },
+        }),
+    });
+    const r = await report(['--offline']);
+    expect(check(r, 'mirror')?.detail).toContain('no frames yet');
+    expect(check(r, 'mirror')?.detail).toContain('2 unrecognised record type(s)');
+  });
+
+  it('calls PAGR_MIRROR=0 a choice, not a fault', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () =>
+        daemonStatus({
+          mirror: {
+            enabled: false,
+            sessions: 0,
+            filesWatched: 0,
+            lastFrameAt: null,
+            unknownRecordTypes: 0,
+          },
+        }),
+    });
+    const r = await report(['--offline']);
+    expect(check(r, 'mirror')?.status).toBe('ok');
+    expect(check(r, 'mirror')?.detail).toContain('PAGR_MIRROR=0');
+  });
+});
+
 describe('doctor · Claude Code live steering', () => {
   it('says follow-ups are queued when channel mode is off', async () => {
     server = await fakeDaemon(h.home, {

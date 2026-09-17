@@ -39,7 +39,22 @@ export type AdapterEvent =
    * a mirrored Codex TUI thread is `mirror_only`, `origin: 'terminal'`. Every added field is
    * optional, so an adapter that only knows v1 keeps compiling and keeps meaning what it meant.
    */
-  | { kind: 'session'; session: SessionSummaryV2 }
+  | {
+      kind: 'session';
+      session: SessionSummaryV2;
+      /**
+       * The bridge did not start this one — it is the person's own terminal or IDE session, found
+       * by the permission hook or the transcript mirror. It can be reported and its prompts can be
+       * relayed; it cannot be instructed, stopped or resumed (`Dispatcher.assertOurSession`).
+       */
+      adopted?: boolean;
+      /**
+       * The session's working directory. Stays on this Mac: it is recorded so `pagr sessions` can
+       * name the folder and so the working-tree rules still apply, and it is never part of any
+       * event that leaves the device.
+       */
+      localCwd?: string;
+    }
   | {
       kind: 'session_event';
       sessionId: string;

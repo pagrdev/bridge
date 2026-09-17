@@ -27,10 +27,12 @@ import {
   terminalBodyFor,
 } from './diffs.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
+import { claudeHookState } from './hooks/install.js';
 import { FileLogger } from './logger.js';
 import { type PersistedSession, SessionMap } from './session-map.js';
 import {
   actionTypeForTool,
+  blockFrameId as blockId,
   filePathsOf,
   mapToolKind,
   type PermissionSuggestion,
@@ -39,6 +41,7 @@ import {
   type StreamRecord,
   type UserBlock,
 } from './stream-json.js';
+import { ClaudeMirror, type ClaudeMirrorOptions } from './transcript/mirror.js';
 
 export interface ClaudeAdapterOptions {
   home: string;
@@ -69,6 +72,14 @@ export interface ClaudeAdapterOptions {
   channel?: boolean;
   /** Test seam; defaults to the daemon's process-wide bridge. */
   channelBridge?: ChannelBridge;
+  /**
+   * Mirror the Claude Code sessions the user started themselves (B5). Defaults to on, off with
+   * `PAGR_MIRROR=0`. The mirror produces frames through this adapter's own emitter and never
+   * touches a spawned session — `ClaudeMirror` skips any Claude session id this adapter owns.
+   */
+  mirror?: boolean;
+  /** Test seam: options handed to the mirror on top of the ones the adapter supplies. */
+  mirrorOptions?: Partial<ClaudeMirrorOptions>;
 }
 
 export const DEFAULT_MAX_CLAUDE_PROCESSES = 6;
@@ -79,6 +90,8 @@ const VERSION_CACHE_MS = 5 * 60_000;
 const MISSING_CACHE_MS = 30_000;
 /** Sign-in state changes under the user, so it is re-read far more often than the version. */
 const AUTH_CACHE_MS = 60_000;
+/** How long "is the permission hook installed" is trusted. Short: the user can install it live. */
+const HOOK_CACHE_MS = 30_000;
 
 /** Presence-only check; the files are never opened. */
 const credentialsPresent = (): boolean => {
@@ -134,13 +147,6 @@ interface PendingApproval {
 
 export const newApprovalId = (): string => `apr_${randomUUID().replace(/-/g, '')}`;
 
-/**
- * Dedupe key for one block of one line. A transcript read twice — a resume, a re-tail — must
- * produce the frame once, and the line's `uuid` plus the block's position is what says "the same
- * block", where Claude gives no per-block id of its own.
- */
-const blockId = (uuid: string | undefined, index: number): string | undefined =>
-  uuid ? `${uuid}:${index}` : undefined;
 const now = () => new Date().toISOString();
 
 const TERMINAL = new Set<SessionSummary['status']>(['completed', 'failed', 'stopped']);
@@ -202,6 +208,9 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private readonly map: SessionMap;
   /** Non-null only under `PAGR_CLAUDE_CHANNEL=1` (ADR 0001 `approved-channel`, dev flag only). */
   private readonly channel: ChannelMode | null;
+  /** Null when `PAGR_MIRROR=0` or the embedder turned it off. */
+  readonly mirror: ClaudeMirror | null;
+  private hookCache: { value: boolean; atMs: number } | null = null;
   private shuttingDown = false;
   private versionCache: { value: string | null; atMs: number } | null = null;
   private readonly unknownBlockTypes = new Set<string>();
@@ -215,6 +224,56 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     this.channel = opts.channel
       ? new ChannelMode(...(opts.channelBridge ? [opts.channelBridge] : []))
       : null;
+    this.mirror =
+      opts.mirror === false
+        ? null
+        : new ClaudeMirror({
+            home: this.claudeHome(),
+            pagrHome: opts.home,
+            emit: (e) => this.emit(e),
+            // The one rule the mirror needs from the adapter: a session this adapter is driving
+            // is already streaming the same records over its pipe, so the tailer stays out of it.
+            ownsClaudeSession: (id) => this.ownsClaudeSession(id),
+            hookInstalled: () => this.hookInstalled(),
+            channel: this.channel,
+            log: (level, message, fields) => this.logger.log(level, message, fields ?? {}),
+            ...(opts.env ? { env: opts.env } : {}),
+            ...opts.mirrorOptions,
+          });
+    this.mirror?.start();
+  }
+
+  /** True while this adapter is driving that Claude session itself. */
+  ownsClaudeSession(claudeSessionId: string): boolean {
+    for (const live of this.sessions.values())
+      if (live.claudeSessionId === claudeSessionId) return true;
+    return false;
+  }
+
+  /**
+   * Whether the permission hook is installed for this user, memoised briefly.
+   *
+   * It decides whether a mirrored terminal session is `approvals_only` or only `mirror_only`, and
+   * it is a settings-file read, so it is answered from a short-lived memo rather than on every
+   * control-level refresh of every session.
+   */
+  private hookInstalled(): boolean {
+    const nowMs = Date.now();
+    if (this.hookCache && nowMs - this.hookCache.atMs < HOOK_CACHE_MS) return this.hookCache.value;
+    let value = false;
+    try {
+      const env = this.opts.env ?? process.env;
+      const state = claudeHookState({
+        pagrHome: this.opts.home,
+        settingsPath: path.join(this.claudeHome(), '.claude', 'settings.json'),
+        env,
+      });
+      value = state.scriptInstalled && state.entryInstalled;
+    } catch {
+      value = false;
+    }
+    this.hookCache = { value, atMs: nowMs };
+    return value;
   }
 
   subscribe(emit: (e: AdapterEvent) => void): () => void {
@@ -457,6 +516,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.mirror?.stop();
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
       this.pending.delete(p.approvalId);

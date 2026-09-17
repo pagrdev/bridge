@@ -1,0 +1,12 @@
+{
+  "pid": 4242,
+  "sessionId": "11111111-2222-3333-4444-555555555555",
+  "cwd": "/tmp/pagr-mirror-fixture",
+  "startedAt": "2026-09-17T10:00:00.000Z",
+  "version": "2.1.220",
+  "kind": "interactive",
+  "entrypoint": "claude",
+  "name": "health endpoint",
+  "messagingSocketPath": "/tmp/pagr-mirror-fixture-claude.sock",
+  "updatedAt": "2026-09-17T10:00:10.000Z"
+}

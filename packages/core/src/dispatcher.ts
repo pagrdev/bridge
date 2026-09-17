@@ -14,6 +14,7 @@ import {
   type SealAad,
   type SessionStatus,
   type SessionSummary,
+  type SessionSummaryV2,
 } from '@pagr/protocol';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
 import {
@@ -43,7 +44,7 @@ import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
 import { PublicPolicy, readPolicy, writePolicy } from './policy.js';
 import { ProjectError, type ProjectRegistry } from './projects.js';
-import { RepoHandleCache, scanRepos } from './repoScan.js';
+import { handleFor, RepoHandleCache, scanRepos } from './repoScan.js';
 import { importRecipientKeys, type RecipientKeySet, sealFrame } from './seal.js';
 import { isAdopted, isReportable, type SessionStore } from './sessions.js';
 
@@ -356,6 +357,41 @@ export class Dispatcher {
     for (const event of this.frameEvents(entry, input.imessage)) this.o.emit(event);
     channel.cursors.noteSent(sessionId, seq);
     return { seq, emitted: true };
+  }
+
+  /**
+   * Stamp a summary with how far this Mac's journal for that session goes.
+   *
+   * It is the number the phone asks a `session.backfill` from, so it belongs on every summary the
+   * bridge sends rather than only on the ones a mirror happens to build. Omitted when there is no
+   * journal or nothing in it: `lastSeq: 0` would say "this session has a transcript and it is
+   * empty", and absent says "this bridge is not telling you", which is the truth on v1.
+   */
+  private withLastSeq(s: SessionSummaryV2): SessionSummaryV2 {
+    const channel = this.o.frames;
+    if (!channel || s.lastSeq !== undefined) return s;
+    let lastSeq = 0;
+    try {
+      lastSeq = channel.journal.lastSeq(s.sessionId);
+    } catch {
+      return s;
+    }
+    return lastSeq > 0 ? { ...s, lastSeq } : s;
+  }
+
+  /**
+   * Offer an unregistered directory to the phone as a `project.register_handle` handle.
+   *
+   * Same handle, same cache and same hour-long life as the ones `repo.scan` mints — this is the
+   * other way a folder gets offered: not "list my repositories" but "somebody is working in this
+   * one right now, add it?". Returns null when remote project pick is off, in which case the
+   * session is still reported and simply has nothing to tap.
+   */
+  offerRepoHandle(realPath: string): string | null {
+    if (!this.remotePickEnabled()) return null;
+    const handle = handleFor(realPath, this.o.registry.deviceSalt());
+    this.repoHandles.put(handle, realPath);
+    return handle;
   }
 
   /**
@@ -1280,6 +1316,8 @@ export class Dispatcher {
         const s = e.session;
         this.noteTurnStatus(s.sessionId, s.status, s.activeTurn);
         const rec = this.o.sessions.get(s.sessionId);
+        const adopted = e.adopted ?? rec?.adopted;
+        const cwd = e.localCwd ?? rec?.cwd;
         this.o.sessions.upsert({
           sessionId: s.sessionId,
           provider,
@@ -1289,10 +1327,15 @@ export class Dispatcher {
           // Never widen a read-only session, or forget which tree it holds, on a status update.
           ...(rec?.readOnly !== undefined ? { readOnly: rec.readOnly } : {}),
           ...(rec?.projectPath !== undefined ? { projectPath: rec.projectPath } : {}),
+          // Nor forget that Pagr did not start it: a status update that silently dropped
+          // `adopted` would turn "your own terminal session" into one the cloud believes it may
+          // steer, and `assertOurSession` would stop refusing.
+          ...(adopted !== undefined ? { adopted, adoptedAt: rec?.adoptedAt ?? s.startedAt } : {}),
+          ...(cwd !== undefined ? { cwd } : {}),
           startedAt: s.startedAt,
           updatedAt: s.updatedAt,
         });
-        this.send('session.updated', s);
+        this.send('session.updated', this.withLastSeq(s));
         return;
       }
       case 'session_event':

@@ -25,6 +25,7 @@ import {
   launchAgentStaleReason,
   MAX_SOCKET_PATH_BYTES,
   MAX_TOLERABLE_CLOCK_SKEW_MS,
+  MIRROR_ENV,
   probeSecretStore,
   REMOTE_PROJECT_PICK_ENV,
   readDaemonLock,
@@ -353,6 +354,7 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
   });
 
   add(remoteProjectPickCheck(status));
+  add(mirrorCheck(status));
 
   const sock = socketPath(ctx);
   add({
@@ -592,6 +594,43 @@ function remoteProjectPickCheck(status: DaemonStatus | null): Check {
     detail: pick.enabled
       ? `on — your phone can list and add git repositories under your code folders (${pick.handles} handle(s) cached)`
       : `off (${REMOTE_PROJECT_PICK_ENV}=0) — projects can only be added on this Mac`,
+  };
+}
+
+/**
+ * The Claude sessions you started yourself.
+ *
+ * Reported as counts and an age, never as a path or a session name: what a person needs from this
+ * line is "is it following anything, and is anything still arriving?". `PAGR_MIRROR=0` is a
+ * deliberate choice, so it reports `ok` and says so rather than complaining.
+ */
+function mirrorCheck(status: DaemonStatus | null): Check {
+  const mirror = status?.mirror;
+  if (!mirror)
+    return {
+      name: 'mirror',
+      status: 'skip',
+      detail: status ? 'no Claude sessions mirrored yet' : 'daemon not running',
+    };
+  if (!mirror.enabled)
+    return {
+      name: 'mirror',
+      status: 'ok',
+      detail: `off (${MIRROR_ENV}=0) — your own terminal sessions are not mirrored`,
+    };
+  const age = mirror.lastFrameAt ? Date.now() - Date.parse(mirror.lastFrameAt) : null;
+  const last =
+    age === null || Number.isNaN(age)
+      ? 'no frames yet'
+      : `last frame ${Math.round(age / 1000)}s ago`;
+  const unknown =
+    mirror.unknownRecordTypes > 0
+      ? `; ${mirror.unknownRecordTypes} unrecognised record type(s) — Claude Code writes something this bridge has no frame for`
+      : '';
+  return {
+    name: 'mirror',
+    status: 'ok',
+    detail: `${mirror.sessions} session(s), ${mirror.filesWatched} file(s) watched, ${last}${unknown}`,
   };
 }
 

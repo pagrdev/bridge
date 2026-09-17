@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { basename } from 'node:path';
 import type {
   DeviceEvent,
   EventPayload,
@@ -36,8 +37,14 @@ import { KeepAwake, type KeepAwakeSpawn, type KeepAwakeStatus } from './keepAwak
 import { type SecretStore, SecretStoreError } from './keychain.js';
 import { DAEMON_EXIT } from './launchAgent.js';
 import { type Logger, silentLogger } from './logging.js';
+import {
+  getMirrorBridge,
+  type MirrorStatus,
+  resetMirrorBridge,
+  setMirrorBridge,
+} from './mirrorBridge.js';
 import { ensurePaths, PagrHomeError, type PagrPaths } from './paths.js';
-import { ProjectError, ProjectRegistry } from './projects.js';
+import { nearestGitRoot, ProjectError, ProjectRegistry, projectIdFor } from './projects.js';
 import { type ReconciledSession, reconcileSessions } from './reconcile.js';
 import { ReplayCache } from './replay.js';
 import {
@@ -118,6 +125,12 @@ export interface DaemonStatus {
    * parses the status of an older daemon that has no keep-awake at all.
    */
   keepAwake?: KeepAwakeStatus;
+  /**
+   * The Claude transcript mirror: how many of your own sessions it is following, how many files
+   * that is, and how long ago it last produced a frame. Optional so a newer `pagr` CLI still
+   * parses the status of an older daemon that has no mirror at all.
+   */
+  mirror?: MirrorStatus;
   /** Whether a phone may list and add repositories, and how many handles are cached right now. */
   remoteProjectPick: RemoteProjectPickStatus;
   socketPath: string;
@@ -308,6 +321,9 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   };
 
   let transport: GatewayClient | null = null;
+  /** Last status the Claude transcript mirror published; null until one runs in this process. */
+  let mirror: MirrorStatus | null = null;
+  const mirrorStatus = (): MirrorStatus | null => mirror ?? getMirrorBridge().status();
   const emit = (event: DeviceEvent) => {
     if (transport) transport.sendEvent(event);
     else logger.debug('event (unpaired, dropped)', { type: event.type });
@@ -356,6 +372,47 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     logger.warn('device approval floor partially lifted by local policy', {
       lifted: dispatcher.floor.lifted.join(','),
     });
+
+  /**
+   * The transcript mirror's one question, answered by the registry: which project is this
+   * directory, and may the phone be told about it?
+   *
+   * The adapter asks; the answer is built here, where the device salt and the handle cache live.
+   * A registered directory comes back with the project's own id. An unregistered one comes back
+   * with the id its NEAREST GIT ROOT would get — so a terminal three folders deep inside a
+   * repository is reported under the repository, not under a different id per subdirectory — plus
+   * a `rh_…` handle, which is what turns "Pagr does not know this folder" into one tap.
+   *
+   * `ProjectRegistry.ensure` is never called from here. Registering a folder because somebody ran
+   * `claude` in it would add projects nobody asked for; the handle exists precisely so the person
+   * decides.
+   */
+  setMirrorBridge({
+    wired: true,
+    projectFor: (cwd) => {
+      const rec = registry.findByPath(cwd);
+      if (rec)
+        return {
+          projectId: rec.projectId,
+          path: rec.path,
+          displayName: rec.displayName,
+          status: 'registered' as const,
+        };
+      const root = nearestGitRoot(cwd, { home: registry.homeDirectory }) ?? cwd;
+      const handle = dispatcher.offerRepoHandle(root);
+      return {
+        projectId: projectIdFor(root, registry.deviceSalt()),
+        path: root,
+        displayName: basename(root) || root,
+        status: 'unregistered' as const,
+        ...(handle ? { handle } : {}),
+      };
+    },
+    report: (s) => {
+      mirror = s;
+    },
+    status: () => mirror,
+  });
 
   const handleEnvelope = async (envelope: unknown): Promise<DeviceEvent> => {
     const deviceId = identity.deviceId;
@@ -518,6 +575,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       .length,
     pendingApprovals: dispatcher.approvals.list().length,
     keepAwake: keepAwake.status(),
+    ...(mirrorStatus() ? { mirror: mirrorStatus() as MirrorStatus } : {}),
     remoteProjectPick: dispatcher.remoteProjectPick(),
     socketPath: paths.socketPath,
     pid: process.pid,
@@ -919,6 +977,9 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       journal.closeAll();
       outbox.flush();
       await transport?.stop();
+      // The mirror's bridge is process-wide; a daemon that has stopped must not keep answering
+      // "which project is this?" out of a registry it no longer owns.
+      resetMirrorBridge();
       await ipc.close(); // unlinks the socket only if this instance bound it
       lock?.release(); // unlinks the lock only if it still records our pid
       lock = null;
