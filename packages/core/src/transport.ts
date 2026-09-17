@@ -3,12 +3,18 @@ import {
   type BridgeFrame,
   canonicalize,
   type DeviceEvent,
+  type EventType,
   GatewayFrame,
+  LATEST_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  type ProtocolVersion,
+  RECIPIENT_KEY_SET_CONTEXT,
+  RecipientKeySet as RecipientKeySetSchema,
+  type RecipientKeySetSignature,
   SERVER_KEY_SET_CONTEXT,
 } from '@pagr/protocol';
 import WebSocket from 'ws';
-import { z } from 'zod';
+import type { z } from 'zod';
 import { compareVersions, makeEvent } from './events.js';
 import type { DeviceIdentity } from './identity.js';
 import { verifyRaw } from './identity.js';
@@ -58,6 +64,19 @@ export const FATAL_AUTH_ERRORS = new Set([
   'protocol_version',
 ]);
 
+/**
+ * Events a v1 gateway has never heard of. They are emitted only once `auth.result` has agreed to
+ * protocol 2 — a v1 gateway answers an unknown event type by closing the socket or, worse, by
+ * dropping it silently, and a bridge that kept sending them would reconnect forever. Frames held
+ * back this way are not lost: the journal keeps them and they replay when a v2 link is up (B3).
+ */
+export const V2_ONLY_EVENTS: ReadonlySet<EventType> = new Set<EventType>([
+  'session.frame',
+  'question.asked',
+  'question.answered',
+  'approval.applied',
+]);
+
 export interface AuthFailure {
   /** The gateway's machine-readable `auth.result.error`, or `unknown` when it sent none. */
   code: string;
@@ -72,6 +91,8 @@ const AUTH_REASONS: Record<string, string> = {
   bad_signature: 'the gateway does not recognise this device key — re-pair with `pagr connect`',
   device_mismatch: 'the gateway answered for a different device id — re-pair with `pagr connect`',
   protocol_version: 'this bridge is too old for the gateway — update the pagr CLI',
+  protocol_version_downgrade:
+    'the gateway does not accept protocol v2 — offering v1 and reconnecting',
   rate_limited:
     'too many authentication attempts from this network — backing off, this is not a revocation',
   nonce_expired: 'the handshake took too long (clock skew or a slow link) — retrying',
@@ -164,10 +185,7 @@ export function assertSecureGatewayUrl(url: string, env: NodeJS.ProcessEnv = pro
 }
 
 /** `{keyId, signature}` — a detached Ed25519 signature by a key the bridge already trusts. */
-export interface KeySetSignature {
-  keyId: string;
-  signature: string;
-}
+export type KeySetSignature = RecipientKeySetSignature;
 /** The original name, kept so nothing downstream has to be renamed. */
 export type ServerKeySignature = KeySetSignature;
 
@@ -256,37 +274,16 @@ export function evaluateServerKeys(
 // ---------- recipient keys (the phones a frame is sealed for) ----------
 
 /**
- * Domain separator for `recipientKeysSignature`, so no other Pagr signature can be replayed as
- * one. Moves to `@pagr/protocol` when MOB-030 merges.
- */
-export const RECIPIENT_KEY_SET_CONTEXT = 'pagr.recipient-keys.v1:';
-
-/**
- * The recipient key set as the cloud issues it. Moves to `@pagr/protocol` when MOB-030 merges.
+ * The domain separator and the shape of the set are the protocol's — one definition, byte-synced
+ * to the cloud and mirrored in Swift. They are re-exported here because this module is where the
+ * bridge decides whether to TRUST a set, which is a different question from whether it parses.
  *
- * Parsed permissively on purpose: the SIGNATURE is checked over the object exactly as it arrived,
- * never over this parse, because zod strips unknown keys and a newer gateway that adds a field
- * would otherwise fail to verify against its own signature.
+ * The parse is deliberately not the last word: the SIGNATURE is checked over the object exactly
+ * as it arrived, never over the parsed copy, because zod strips unknown keys and a newer gateway
+ * that adds a field would otherwise fail to verify against its own signature.
  */
-export const RecipientKeyEntry = z.object({
-  kid: z.string().min(1).max(64),
-  x25519: z.string().min(1).max(128),
-  name: z.string().max(120).optional(),
-  registeredAt: z.string().optional(),
-});
-export const RecipientKeySetDoc = z.object({
-  v: z.literal(1),
-  userId: z.string().min(1),
-  keys: z.array(RecipientKeyEntry).max(32),
-  features: z.object({ imessage: z.boolean() }).optional(),
-  issuedAt: z.string().optional(),
-});
-export type RecipientKeySetDoc = z.infer<typeof RecipientKeySetDoc>;
-
-export const KeySetSignatureSchema = z.object({
-  keyId: z.string().min(1).max(32),
-  signature: z.string().min(1).max(200),
-});
+export { RECIPIENT_KEY_SET_CONTEXT, RecipientKeySetSchema };
+export type RecipientKeySetDoc = z.infer<typeof RecipientKeySetSchema>;
 
 export type RecipientKeyDecision =
   | {
@@ -317,7 +314,7 @@ export function evaluateRecipientKeys(
   signature: KeySetSignature | undefined,
   serverKeys: Record<string, string>,
 ): RecipientKeyDecision {
-  const parsed = RecipientKeySetDoc.safeParse(incoming);
+  const parsed = RecipientKeySetSchema.safeParse(incoming);
   if (!parsed.success)
     return {
       accept: false,
@@ -353,19 +350,16 @@ export function evaluateRecipientKeys(
   };
 }
 
-/** The v2 fields on `auth.result`. A v1 gateway sends none of them. Moves to `@pagr/protocol`. */
-const AuthResultV2Extras = z.object({
-  recipientKeys: z.unknown().optional(),
-  recipientKeysSignature: KeySetSignatureSchema.optional(),
-  features: z.object({ imessage: z.boolean() }).optional(),
-});
-
-/** The gateway's live key-set push. Moves to `@pagr/protocol` when MOB-030 merges. */
-const KeysUpdatedFrame = z.object({
-  kind: z.literal('keys.updated'),
-  recipientKeys: z.unknown(),
-  recipientKeysSignature: KeySetSignatureSchema.optional(),
-});
+/**
+ * One field of the frame as it arrived, before zod touched it.
+ *
+ * A signed document has to be verified over the bytes the signer signed. `GatewayFrame` strips
+ * keys it does not know about, so a set from a newer cloud would verify against a shorter
+ * document than the one it signed and every rotation would fail on the next release.
+ */
+function rawField(json: unknown, key: string): unknown {
+  return (json as Record<string, unknown> | null)?.[key];
+}
 
 export interface GatewayClientEvents {
   connected: [];
@@ -413,6 +407,19 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
   features: { imessage: boolean } | null = null;
   /** Why the transport is in a terminal state, for `pagr status` and the logs. */
   lastFailure: AuthFailure | null = null;
+  /**
+   * What the next `auth.response` OFFERS. It starts at the newest version this bridge speaks and
+   * drops to the baseline for good once a gateway has refused the offer — a gateway that says
+   * `protocol_version` to v2 will say it again, and flapping between offers would turn a working
+   * v1 connection into a reconnect every time.
+   */
+  private offeredVersion: ProtocolVersion = LATEST_PROTOCOL_VERSION;
+  /**
+   * What this connection actually agreed on. Always the baseline until an `auth.result` says
+   * otherwise, and back to it the moment the socket is gone: nothing v2-only may be put on a wire
+   * whose other end has not said it understands v2.
+   */
+  private negotiated: ProtocolVersion = PROTOCOL_VERSION;
 
   constructor(private readonly opts: GatewayClientOptions) {
     super();
@@ -448,6 +455,14 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
   get sealsToNobody(): boolean {
     return Object.keys(this.recipientKeys).length === 0;
   }
+  /** The protocol version in force on the current connection. 1 until a gateway answers 2. */
+  get negotiatedVersion(): ProtocolVersion {
+    return this.negotiated;
+  }
+  /** What the next handshake will offer; drops to 1 after a gateway refuses 2. */
+  get offeredProtocolVersion(): ProtocolVersion {
+    return this.offeredVersion;
+  }
 
   /** States the client will never leave on its own; only `start()` clears them. */
   private terminal(): boolean {
@@ -477,9 +492,16 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
     } else ws?.terminate();
   }
 
-  /** Queue or send an event. Returns false if the event was dropped (buffer full, or oversized). */
+  /**
+   * Queue or send an event. Returns false if the event was dropped (buffer full, oversized, or
+   * v2-only on a link that negotiated v1).
+   *
+   * While offline a v2-only event is still buffered, because the version is not known until the
+   * handshake finishes; `flush` drops it then if the gateway turned out to speak v1.
+   */
   sendEvent(event: DeviceEvent): boolean {
     if (this.state_ === 'connected' && this.ws?.readyState === this.WS.OPEN) {
+      if (!this.mayEmit(event)) return false;
       return this.sendFrame({ kind: 'event', event });
     }
     if (this.buffer.length >= this.bufferLimit) {
@@ -539,23 +561,6 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
       this.logger.warn('gateway sent non-JSON frame');
       return;
     }
-    // `keys.updated` is a v2 frame and `GatewayFrame` is a closed v1 union, so it is handled
-    // before the union sees it. It moves into `GatewayFrame` when MOB-030 merges.
-    if ((json as { kind?: unknown } | null)?.kind === 'keys.updated') {
-      const update = KeysUpdatedFrame.safeParse(json);
-      if (!update.success) {
-        this.logger.warn('gateway sent an invalid keys.updated frame', {
-          issue: update.error.issues[0]?.message,
-        });
-        return;
-      }
-      this.applyRecipientKeys(
-        update.data.recipientKeys,
-        update.data.recipientKeysSignature,
-        'keys.updated',
-      );
-      return;
-    }
     const parsed = GatewayFrame.safeParse(json);
     if (!parsed.success) {
       this.logger.warn('gateway sent invalid frame', { issue: parsed.error.issues[0]?.message });
@@ -571,7 +576,7 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
           nonce: frame.nonce,
           signature,
           bridgeVersion: this.opts.bridgeVersion,
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: this.offeredVersion,
         });
         return;
       }
@@ -594,18 +599,25 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
           return;
         }
         if (frame.serverKeys) this.applyServerKeys(frame.serverKeys, frame.serverKeysSignature);
-        // The v2 fields are read from the raw frame: `GatewayFrame` is the v1 union and zod has
-        // already stripped anything it does not know about. A v1 gateway sends none of them.
-        const v2 = AuthResultV2Extras.safeParse(json);
-        if (v2.success) {
-          if (v2.data.features) this.features = v2.data.features;
-          if (v2.data.recipientKeys !== undefined)
-            this.applyRecipientKeys(
-              v2.data.recipientKeys,
-              v2.data.recipientKeysSignature,
-              'auth.result',
-            );
-        }
+        if (frame.features) this.features = frame.features;
+        // The set is taken from the RAW frame, not from `frame.recipientKeys`: zod strips keys it
+        // does not know, and the signature covers the bytes the gateway actually sent. A v1
+        // gateway sends no set at all and nothing here runs.
+        if (frame.recipientKeys !== undefined)
+          this.applyRecipientKeys(
+            rawField(json, 'recipientKeys'),
+            frame.recipientKeysSignature,
+            'auth.result',
+          );
+        // Absent means 1: that is what every gateway older than protocol v2 sends. A gateway
+        // cannot promote us past what we offered, either — it answers an offer, it does not make
+        // one.
+        this.negotiated = Math.min(
+          frame.protocolVersion ?? PROTOCOL_VERSION,
+          this.offeredVersion,
+        ) as ProtocolVersion;
+        if (this.negotiated > PROTOCOL_VERSION)
+          this.logger.debug('protocol negotiated', { version: this.negotiated });
         this.state_ = 'connected';
         this.attempt = 0;
         this.retryFloorMs = 0;
@@ -623,6 +635,23 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
         // Guarding happens downstream; the transport only enforces the frame shape.
         this.opts.onCommand(frame.envelope);
         return;
+      case 'keys.updated':
+        // Live push: a phone was added or revoked. Same trust rule as the set on `auth.result`,
+        // and the same reason for reading the raw field rather than the parsed one.
+        this.applyRecipientKeys(
+          rawField(json, 'recipientKeys'),
+          frame.recipientKeysSignature,
+          'keys.updated',
+        );
+        return;
+      case 'settings.updated':
+        this.features = frame.features;
+        return;
+      case 'ack':
+        // Frame cursors. The journal that resumes from them is MOB-032; until it exists there is
+        // nothing to move, and an unhandled frame kind would be indistinguishable from a bug.
+        this.logger.debug('gateway acked frames', { sessions: Object.keys(frame.cursors).length });
+        return;
     }
   }
 
@@ -632,7 +661,18 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
    * every bridge behind one office NAT trips that limiter together (BR-5, BR-23).
    */
   private onAuthRefused(error: string | undefined): void {
-    const failure = classifyAuthFailure(error);
+    let failure = classifyAuthFailure(error);
+    // A gateway that refuses the v2 offer is not refusing this bridge: it is an older gateway
+    // than this CLI. Drop the offer to the baseline and try once more before calling it fatal,
+    // or an upgraded CLI would strand every Mac on a cloud that has not been deployed yet.
+    if (failure.code === 'protocol_version' && this.offeredVersion > PROTOCOL_VERSION) {
+      this.offeredVersion = PROTOCOL_VERSION;
+      failure = {
+        code: failure.code,
+        fatal: false,
+        reason: AUTH_REASONS.protocol_version_downgrade as string,
+      };
+    }
     this.lastFailure = failure;
     const ws = this.ws;
     if (failure.fatal) {
@@ -719,10 +759,20 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
     this.opts.onRecipientKeys?.({ ...decision.keys });
   }
 
+  /** Whether the negotiated version allows this event on the wire at all. */
+  private mayEmit(event: DeviceEvent): boolean {
+    if (!V2_ONLY_EVENTS.has(event.type) || this.negotiated >= 2) return true;
+    this.logger.debug('holding back a v2-only event; this gateway speaks protocol v1', {
+      eventType: event.type,
+      negotiatedVersion: this.negotiated,
+    });
+    return false;
+  }
+
   private flush(): void {
     while (this.buffer.length && this.ws?.readyState === this.WS.OPEN) {
       const ev = this.buffer.shift();
-      if (ev) this.sendFrame({ kind: 'event', event: ev });
+      if (ev && this.mayEmit(ev)) this.sendFrame({ kind: 'event', event: ev });
     }
   }
 
@@ -796,6 +846,8 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
 
   private onClose(reason: string, code?: number): void {
     const wasConnected = this.state_ === 'connected';
+    // The agreement belonged to that socket; the next one negotiates again from the baseline.
+    this.negotiated = PROTOCOL_VERSION;
     this.stopHeartbeat();
     this.clearAuthDeadline();
     this.ws = null;

@@ -248,6 +248,9 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     now,
     logger: logger.child({ mod: 'dispatcher' }),
     guard: SessionGuard.fromEnv(o.env ?? process.env),
+    // The live set, not a snapshot: the transport repins it from `auth.result` / `keys.updated`,
+    // and it is built after the dispatcher, so this reads through to whatever is current.
+    recipientKeyIds: () => transport?.recipientKeyIds() ?? Object.keys(recipientKeys).sort(),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
   if (dispatcher.floor.lifted.length > 0)

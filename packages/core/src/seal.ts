@@ -10,8 +10,16 @@ import {
   type KeyObject,
   randomBytes,
 } from 'node:crypto';
-import { canonicalize } from '@pagr/protocol';
-import { z } from 'zod';
+import {
+  canonicalize,
+  SEAL_CONTEXT,
+  SEAL_ENVELOPE_VERSION,
+  SealAad as SealAadSchema,
+  FrameChunk as SealChunkSchema,
+  SealedEnvelope as SealedEnvelopeSchema,
+  SealedRecipient as SealedRecipientSchema,
+} from '@pagr/protocol';
+import type { z } from 'zod';
 
 /**
  * Sealed frames (`pagr.seal.v1`).
@@ -39,10 +47,21 @@ import { z } from 'zod';
  * `node:crypto` only.
  */
 
-/** Domain separator mixed into every wrap key. Moves to `@pagr/protocol` when MOB-030 merges. */
-export const SEAL_CONTEXT = 'pagr.seal.v1';
-/** Envelope format version. Moves to `@pagr/protocol` when MOB-030 merges. */
-export const SEAL_VERSION = 1 as const;
+/**
+ * The wire contract lives in `@pagr/protocol` — one definition, byte-synced to the platform and
+ * mirrored in Swift. This module owns the CRYPTO; the shapes it reads and writes are the
+ * protocol's, re-exported here under the names this package has always used for them.
+ */
+export {
+  /** Domain separator mixed into every wrap key. */
+  SEAL_CONTEXT,
+  SealAadSchema,
+  SealChunkSchema,
+  SealedEnvelopeSchema,
+  SealedRecipientSchema,
+};
+/** Envelope format version. */
+export const SEAL_VERSION = SEAL_ENVELOPE_VERSION;
 
 export const CONTENT_KEY_BYTES = 32;
 export const NONCE_BYTES = 12;
@@ -66,19 +85,10 @@ const X25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex
 // ---------- AAD ----------
 
 /** A frame body split across several envelopes; every part carries the same `group`. */
-export interface SealChunk {
-  group: string;
-  index: number;
-  total: number;
-}
+export type SealChunk = z.infer<typeof SealChunkSchema>;
 
 /** What both crypto layers authenticate, and what the cloud is allowed to read and index. */
-export interface SealAad {
-  sessionId: string;
-  seq: number;
-  kind: string;
-  chunk?: SealChunk;
-}
+export type SealAad = z.infer<typeof SealAadSchema>;
 
 /**
  * The exact bytes signed into both AEAD layers: `canonicalize({sessionId, seq, kind, chunk?})`.
@@ -95,56 +105,14 @@ export function sealAadFor(meta: SealAad): string {
 
 // ---------- envelope ----------
 
-export interface SealedRecipient {
-  /** `sha256(rawX25519Pub).hex[0:16]` grouped by 4 with ':'. */
-  kid: string;
-  /** base64url, 12 bytes. */
-  nonce: string;
-  /** base64url, 48 bytes: the content key plus its tag. */
-  wrap: string;
-}
+/** One phone's wrapped copy of the content key. */
+export type SealedRecipient = z.infer<typeof SealedRecipientSchema>;
 
-export interface SealedEnvelope {
-  v: typeof SEAL_VERSION;
-  /** base64url raw X25519 ephemeral public key, 32 bytes. */
-  epk: string;
-  recipients: SealedRecipient[];
-  /** base64url, 12 bytes. */
-  nonce: string;
-  /** base64url ciphertext with the 16-byte tag appended. */
-  ct: string;
-  aad: SealAad;
-}
+/** A sealed frame body as it travels: opaque to the cloud apart from its `aad`. */
+export type SealedEnvelope = z.infer<typeof SealedEnvelopeSchema>;
 
-const B64U = z.string().regex(/^[A-Za-z0-9_-]+$/);
-/** `kid` shape: four colon-separated hex quads. */
+/** `kid` shape: four colon-separated hex quads. The protocol's `KeyFingerprint` says the same. */
 export const KID_PATTERN = /^[0-9a-f]{4}(:[0-9a-f]{4}){3}$/;
-
-/** Zod shapes for the sealed envelope. These move to `@pagr/protocol` when MOB-030 merges. */
-export const SealChunkSchema = z.object({
-  group: z.string().min(1).max(64),
-  index: z.number().int().nonnegative(),
-  total: z.number().int().positive(),
-});
-export const SealAadSchema = z.object({
-  sessionId: z.string().min(1),
-  seq: z.number().int().nonnegative(),
-  kind: z.string().min(1),
-  chunk: SealChunkSchema.optional(),
-});
-export const SealedRecipientSchema = z.object({
-  kid: z.string().regex(KID_PATTERN),
-  nonce: B64U,
-  wrap: B64U,
-});
-export const SealedEnvelopeSchema = z.object({
-  v: z.literal(SEAL_VERSION),
-  epk: B64U,
-  recipients: z.array(SealedRecipientSchema).min(1),
-  nonce: B64U,
-  ct: B64U,
-  aad: SealAadSchema,
-});
 
 // ---------- recipients ----------
 

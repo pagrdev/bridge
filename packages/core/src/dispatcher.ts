@@ -22,7 +22,7 @@ import { AttachmentLeaseRegistry } from './attachmentLease.js';
 import { deleteAttachment, type FetchLike, fetchAttachment } from './attachments.js';
 import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.js';
 import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFloor.js';
-import { makeEvent } from './events.js';
+import { type EventPayloadInput, makeEvent } from './events.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
 import { PublicPolicy, readPolicy, writePolicy } from './policy.js';
@@ -119,6 +119,12 @@ export interface DispatcherOptions {
   maxHelloSessions?: number;
   /** Byte ceiling for a `device.hello` payload. Default `MAX_HELLO_BYTES`. */
   maxHelloBytes?: number;
+  /**
+   * The phones this Mac currently seals frames for (`GatewayClient.recipientKeyIds()`), reported
+   * in `device.hello` v2. Read at hello time, not at construction: the set arrives with
+   * `auth.result` and changes live on `keys.updated`.
+   */
+  recipientKeyIds?: () => string[];
 }
 
 /**
@@ -174,7 +180,8 @@ export class Dispatcher {
 
   private send<T extends DeviceEvent['type']>(
     type: T,
-    payload: EventPayload<T>,
+    // The caller's shape: defaults the protocol supplies are not the emitter's to repeat.
+    payload: EventPayloadInput<T>,
     inReplyTo?: string,
   ): DeviceEvent {
     const ev = makeEvent(this.o.deviceId, type, payload, {
@@ -298,6 +305,7 @@ export class Dispatcher {
         updatedAt: rec.updatedAt,
       });
     }
+    const recipientKeyIds = [...(this.o.recipientKeyIds?.() ?? [])].sort();
     const hello: EventPayload<'device.hello'> = {
       bridgeVersion: this.o.bridgeVersion,
       protocolVersion: 1,
@@ -306,6 +314,9 @@ export class Dispatcher {
       agents,
       projects: this.o.registry.summaries(),
       sessions: rankHelloSessions(sessions).slice(0, this.o.maxHelloSessions ?? MAX_HELLO_SESSIONS),
+      // v2, and omitted when empty: a hello with no phones in it says the same thing to a v2
+      // gateway as it does to a v1 one that has never heard of the field.
+      ...(recipientKeyIds.length > 0 ? { recipientKeyIds } : {}),
     };
     const dropped = sessions.length - hello.sessions.length;
     if (dropped > 0)

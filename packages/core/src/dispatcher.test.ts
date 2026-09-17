@@ -1078,6 +1078,19 @@ describe('device.hello is bounded (BR-3, BR-4)', () => {
     sessions = new SessionStore();
   });
 
+  it('reports the phones it seals to, and says nothing when there are none (hello v2)', async () => {
+    // The fingerprints are shown in `pagr status` and on the phone's Security screen, so a set
+    // the user never verified is visible on both ends rather than inferred from silence.
+    const kids = ['0011:2233:4455:6677', 'aabb:ccdd:eeff:0011'];
+    const withKeys = await dispatcher({ recipientKeyIds: () => [...kids].reverse() }).probe();
+    expect(withKeys.recipientKeyIds).toEqual(kids);
+    // No phones registered: the field is absent, which is what a v1 gateway expects to see.
+    expect((await dispatcher().probe()).recipientKeyIds).toBeUndefined();
+    expect(
+      (await dispatcher({ recipientKeyIds: () => [] }).probe()).recipientKeyIds,
+    ).toBeUndefined();
+  });
+
   it('keeps a 1200-session hello inside the gateway frame cap, newest first', async () => {
     // A heavy user reaches this in weeks. Unbounded, this hello was ~1 MB: the gateway closed
     // with 1009, the bridge reconnected and sent the identical frame again, forever.

@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import {
   type DeviceEvent,
-  type EventPayload,
+  type EventPayloads,
   type EventType,
   PROTOCOL_VERSION,
 } from '@pagr/protocol';
@@ -15,11 +15,21 @@ export interface MakeEventOptions {
   idGen?: () => string;
 }
 
+/**
+ * What a CALLER has to supply for an event payload.
+ *
+ * `EventPayload<T>` is `z.infer`, so every field the protocol gives a `.default()` reads as
+ * required — which would make emitters spell out the default the schema was written to supply
+ * (and, worse, make adding a defaulted field to the protocol a breaking change for every call
+ * site). `z.input` is the shape before defaults apply, which is exactly what an emitter has.
+ */
+export type EventPayloadInput<T extends EventType> = import('zod').input<(typeof EventPayloads)[T]>;
+
 /** Build a well-formed `DeviceEvent` for this device. */
 export function makeEvent<T extends EventType>(
   deviceId: string,
   type: T,
-  payload: EventPayload<T>,
+  payload: EventPayloadInput<T>,
   opts: MakeEventOptions = {},
 ): DeviceEvent {
   const base = {
