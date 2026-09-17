@@ -5,7 +5,9 @@ import type {
   CommandPayload,
   DeviceEvent,
   EventPayload,
+  ProjectSummary,
   Provider,
+  RepoScanResult,
   SessionStatus,
   SessionSummary,
 } from '@pagr/protocol';
@@ -27,6 +29,7 @@ import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
 import { PublicPolicy, readPolicy, writePolicy } from './policy.js';
 import { ProjectError, type ProjectRegistry } from './projects.js';
+import { RepoHandleCache, scanRepos } from './repoScan.js';
 import { isAdopted, isReportable, type SessionStore } from './sessions.js';
 
 /**
@@ -37,6 +40,30 @@ import { isAdopted, isReportable, type SessionStore } from './sessions.js';
 export const ADOPTED_SESSION_NAME = 'Your own session';
 
 type AckPayload = EventPayload<'command.ack'>;
+
+// ---------- remote project pick (`repo.scan`, `project.register_handle`) ----------
+
+/**
+ * Off switch for the whole feature. Default ON: picking a repository from the phone is the point
+ * of the pair of commands. `=0` removes both from this bridge — they ack `capability_unsupported`
+ * and `repo_scan.v1` disappears from `device.hello`, so a cloud that respects capabilities stops
+ * offering the button rather than hitting a wall.
+ */
+export const REMOTE_PROJECT_PICK_ENV = 'PAGR_REMOTE_PROJECT_PICK';
+
+/**
+ * Shortest gap between two accepted `repo.scan`s. A scan opens directories, so a command that can
+ * be sent in a loop is a command that can be made to grind the disk; one every 30 seconds is far
+ * more than a person tapping "add a project" needs.
+ */
+export const REPO_SCAN_MIN_INTERVAL_MS = 30_000;
+
+/** What `pagr doctor` prints for the remote-pick line. */
+export interface RemoteProjectPickStatus {
+  enabled: boolean;
+  /** Live handles held in memory right now. Never a path, and never written to disk. */
+  handles: number;
+}
 
 /**
  * Most sessions the bridge will describe in a `device.hello`. The adapters already prune their
@@ -150,6 +177,10 @@ export class Dispatcher {
   private readonly unsubscribes: Array<() => void> = [];
   private readonly capabilities = new Map<Provider, AgentConnectionStatus>();
   private readonly leases: AttachmentLeaseRegistry;
+  /** handle → path for the repositories the last `repo.scan` found. In memory only. */
+  private readonly repoHandles: RepoHandleCache;
+  /** When the last accepted `repo.scan` started, for `REPO_SCAN_MIN_INTERVAL_MS`. */
+  private lastRepoScanAt = Number.NEGATIVE_INFINITY;
 
   constructor(private readonly o: DispatcherOptions) {
     this.logger = o.logger ?? silentLogger;
@@ -160,6 +191,7 @@ export class Dispatcher {
       now: () => this.now(),
       ...(o.attachmentLeaseTtlMs ? { ttlMs: o.attachmentLeaseTtlMs } : {}),
     });
+    this.repoHandles = new RepoHandleCache({ now: () => this.now() });
     this.policy = readPolicy(o.policyFile);
     this.floor = o.deviceFloor ?? DeviceFloor.fromFile(o.devicePolicyFile, o.env ?? process.env);
     this.approvals = new PendingApprovalRegistry({
@@ -259,6 +291,10 @@ export class Dispatcher {
         return this.getStatus(body.payload.sessionId);
       case 'agent.respond_to_approval':
         return this.respondToApproval(body.payload);
+      case 'repo.scan':
+        return this.scanRepositories();
+      case 'project.register_handle':
+        return this.registerRepoHandle(body.payload);
       case 'settings.sync_public_policy': {
         // Re-parsed rather than spread: a key the cloud sends that this bridge no longer honours
         // (`smartApprovalsTierA`) must not survive into `policy.json` looking like a live setting.
@@ -311,6 +347,9 @@ export class Dispatcher {
         updatedAt: rec.updatedAt,
       });
     }
+    // v2 capabilities. Only facts: a name appears here exactly when the command behind it will
+    // actually run on this Mac, so a cloud that gates a button on one is never lying to a user.
+    const capabilityNames = this.remotePickEnabled() ? ['repo_scan.v1'] : [];
     const recipientKeyIds = [...(this.o.recipientKeyIds?.() ?? [])].sort();
     const hello: EventPayload<'device.hello'> = {
       bridgeVersion: this.o.bridgeVersion,
@@ -320,6 +359,7 @@ export class Dispatcher {
       agents,
       projects: this.o.registry.summaries(),
       sessions: rankHelloSessions(sessions).slice(0, this.o.maxHelloSessions ?? MAX_HELLO_SESSIONS),
+      ...(capabilityNames.length > 0 ? { capabilities: capabilityNames } : {}),
       // v2, and omitted when empty: a hello with no phones in it says the same thing to a v2
       // gateway as it does to a v1 one that has never heard of the field.
       ...(recipientKeyIds.length > 0 ? { recipientKeyIds } : {}),
@@ -723,6 +763,93 @@ export class Dispatcher {
       throw new DispatchError('capability_unsupported', refusal.message);
     }
     return { approvalId: p.approvalId, decision: p.decision };
+  }
+
+  // ---------- remote project pick ----------
+  //
+  // Self-contained on purpose: `repo.scan` and `project.register_handle` are the only pair of
+  // commands that widen what the cloud can REACH, so everything that decides whether they run,
+  // what they may see, and how often, lives here where it can be read in one sitting.
+
+  /** `PAGR_REMOTE_PROJECT_PICK=0` turns both commands off; anything else (or unset) leaves them on. */
+  private remotePickEnabled(): boolean {
+    return (this.o.env ?? process.env)[REMOTE_PROJECT_PICK_ENV] !== '0';
+  }
+
+  /** On/off plus the number of live handles, for `pagr doctor`. Never the paths behind them. */
+  remoteProjectPick(): RemoteProjectPickStatus {
+    return { enabled: this.remotePickEnabled(), handles: this.repoHandles.size };
+  }
+
+  private assertRemotePick(): void {
+    if (!this.remotePickEnabled())
+      throw new DispatchError(
+        'capability_unsupported',
+        `remote project pick is off on this Mac (${REMOTE_PROJECT_PICK_ENV}=0)`,
+      );
+  }
+
+  /**
+   * List the git repositories under this Mac's conventional code folders as opaque handles.
+   *
+   * The payload is `{}` and stays `{}`: the cloud never supplies roots, because a root is a path,
+   * and the whole guarantee is that no path travels in either direction. What comes back is a
+   * folder name, the git remote's host/name if there is one, and a handle only this Mac can
+   * resolve — see `repoScan.ts`.
+   */
+  private async scanRepositories(): Promise<RepoScanResult> {
+    this.assertRemotePick();
+    const at = this.now().getTime();
+    if (at - this.lastRepoScanAt < REPO_SCAN_MIN_INTERVAL_MS)
+      throw new DispatchError(
+        'rate_limited',
+        `a repository scan was run less than ${REPO_SCAN_MIN_INTERVAL_MS / 1000}s ago`,
+      );
+    // Stamped before the walk, not after: two scans arriving together must not both run.
+    this.lastRepoScanAt = at;
+    const res = await scanRepos({ registry: this.o.registry, cache: this.repoHandles });
+    this.logger.info('repository scan', {
+      repos: res.repos.length,
+      roots: res.scannedRoots,
+      truncated: res.truncated,
+    });
+    return { repos: res.repos, truncated: res.truncated };
+  }
+
+  /**
+   * Turn a handle from the last scan into a registered project.
+   *
+   * The handle is resolved against this bridge's own in-memory cache, so the only folders that
+   * can be registered this way are ones this Mac offered within the last hour. An unknown or
+   * expired handle is `unknown_project` — the same answer a made-up `proj_…` gets, and for the
+   * same reason: the cloud is not allowed to learn whether a folder it guessed at exists.
+   */
+  private registerRepoHandle(payload: CommandPayload<'project.register_handle'>): ProjectSummary {
+    this.assertRemotePick();
+    const path = this.repoHandles.get(payload.handle);
+    if (!path)
+      throw new DispatchError('unknown_project', 'that repository handle is unknown or expired');
+    let ensured: ReturnType<ProjectRegistry['ensure']>;
+    try {
+      ensured = this.o.registry.ensure(path, {
+        ...(payload.displayName ? { displayName: payload.displayName } : {}),
+      });
+    } catch (err) {
+      // A name the phone chose that is already taken is a bad argument, not a missing project.
+      if (err instanceof ProjectError && err.code === 'duplicate')
+        throw new DispatchError('invalid_payload', err.message);
+      throw err;
+    }
+    // Every cached handle now carries a stale `registeredAs`, so the next scan is the truth.
+    this.repoHandles.clear();
+    const summary: ProjectSummary = {
+      projectId: ensured.projectId,
+      displayName: ensured.displayName,
+      aliases: ensured.aliases,
+      ...(ensured.repoHint ? { repoHint: ensured.repoHint } : {}),
+    };
+    if (ensured.created) this.send('project.registered', summary);
+    return summary;
   }
 
   // ---------- approvals ----------

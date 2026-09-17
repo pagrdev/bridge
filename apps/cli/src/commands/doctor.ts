@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import type { ChannelStatus } from '@pagr/bridge-core';
+import type { ChannelStatus, DaemonStatus } from '@pagr/bridge-core';
 import {
   auditPermissions,
   checkHomeWritable,
@@ -19,6 +19,7 @@ import {
   MAX_SOCKET_PATH_BYTES,
   MAX_TOLERABLE_CLOCK_SKEW_MS,
   probeSecretStore,
+  REMOTE_PROJECT_PICK_ENV,
   readDaemonLock,
   repairPermissions,
   SecretStoreError,
@@ -316,6 +317,8 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
         : { fix: 'run `pagr connect`, then `pagr daemon install`' }),
   });
 
+  add(remoteProjectPickCheck(status));
+
   const sock = socketPath(ctx);
   add({
     name: 'socket path',
@@ -527,6 +530,24 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
     addAgentEnvCheck(ctx, add, plist);
   }
   return checks;
+}
+
+/**
+ * What a phone may ADD, not just reach. With this on, a paired phone can ask this Mac to list the
+ * git repositories under its conventional code folders and register one — so the state is
+ * reported rather than assumed, exactly like the device floor above. Only the daemon knows it:
+ * the handles live in its memory and nowhere else.
+ */
+function remoteProjectPickCheck(status: DaemonStatus | null): Check {
+  const pick = status?.remoteProjectPick;
+  if (!pick) return { name: 'remote pick', status: 'skip', detail: 'daemon not running' };
+  return {
+    name: 'remote pick',
+    status: 'ok',
+    detail: pick.enabled
+      ? `on — your phone can list and add git repositories under your code folders (${pick.handles} handle(s) cached)`
+      : `off (${REMOTE_PROJECT_PICK_ENV}=0) — projects can only be added on this Mac`,
+  };
 }
 
 /**

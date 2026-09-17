@@ -236,6 +236,13 @@ export function referencedIds(body: CommandBody): { projectId?: string; sessionI
       return { sessionId: body.payload.sessionId };
     case 'agent.get_status':
       return body.payload.sessionId ? { sessionId: body.payload.sessionId } : {};
+    // `repo.scan` names nothing, and `project.register_handle` names an `rh_…` handle, which is
+    // NOT a registry id: it is resolved against the dispatcher's in-memory scan cache, where an
+    // unknown or expired one is refused as `unknown_project` without the filesystem being read.
+    // Checking it here would need that cache, and would answer the same question twice.
+    case 'repo.scan':
+    case 'project.register_handle':
+      return {};
     default:
       return {};
   }

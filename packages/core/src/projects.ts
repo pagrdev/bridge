@@ -173,12 +173,26 @@ export class ProjectRegistry {
   }
 
   /**
+   * The home directory this registry vets paths against, realpath-resolved.
+   *
+   * LOCAL CALLERS ONLY, and only to decide where to LOOK: `repoScan.ts` needs it to build the
+   * conventional scan roots. Nothing derived from it may be sent anywhere.
+   */
+  get homeDirectory(): string {
+    return this.home;
+  }
+
+  /**
    * The salt this device derives ids with, created on first use. Re-read from disk on a miss so
    * a CLI invocation and the daemon agree on one salt instead of each minting its own. A race
    * cannot break anything already registered: the persisted path→id record is the authority,
    * and the salt only decides what a brand new id looks like.
+   *
+   * LOCAL CALLERS ONLY, and never emitted: `repoScan.ts` reads it so a repository handle and the
+   * project id that folder would get are bound to the SAME device secret. A salt that reached the
+   * cloud would make every id and handle a path it could confirm by guessing.
    */
-  private deviceSalt(): string {
+  deviceSalt(): string {
     if (this.salt) return this.salt;
     const stored = this.saltFile ? readJson<{ salt?: string }>(this.saltFile, {}).salt : undefined;
     if (typeof stored === 'string' && stored.length >= 32) {
