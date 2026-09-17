@@ -91,7 +91,7 @@ Implementation: `packages/core/src/transport.ts`.
 | `agent.send_instruction` | `{ sessionId, instruction, mode: auto\|steer\|queue, attachments[≤4] }` | `{ sessionId, mode, delivered: steered\|queued\|new_turn }` |
 | `agent.stop_session` | `{ sessionId }` | `{ sessionId }` |
 | `agent.get_status` | `{ sessionId? }` | `{ sessions: SessionSummary[] }` |
-| `agent.respond_to_approval` | `{ approvalId, sessionId, providerRequestId, previewHash, decision: allow\|deny }` | `{ approvalId, decision }` |
+| `agent.respond_to_approval` | `{ approvalId, sessionId, providerRequestId, previewHash, decision: allow\|deny, optionId? }` | `{ approvalId, decision }` |
 | `settings.sync_public_policy` | `{ approvalTimeoutSeconds }` | the stored policy |
 | `repo.scan` | `{}` | `RepoScanResult`: `{ repos: [{ handle: rh_<32hex>, displayName, repoHint?, registeredAs? }], truncated }` |
 | `project.register_handle` | `{ handle, displayName? }` | `ProjectSummary` |
@@ -100,6 +100,13 @@ Implementation: `packages/core/src/transport.ts`.
 "obviously safe" prompts itself. The bridge no longer decides approvals at all, so the field was
 removed. A cloud that still sends it is **not** rejected — unknown keys are dropped by the payload
 schema — it simply has no effect.
+
+`agent.respond_to_approval.optionId` (v2) names one of the options the matching
+`approval.requested` published. `decision` stays required and the two must agree — `allow_once`,
+`allow_always` and `allow_session` mean `allow`, `reject_once` and `reject_always` mean `deny` —
+and a disagreement, or an id this prompt never offered, is `invalid_payload`. A row without
+`optionId` is the v1 shape and behaves exactly as it always has: the agent is told allow or deny,
+once.
 
 `sessionId` for `agent.start_session` is pre-allocated by the cloud so both sides share one id.
 `mode: auto` resolves to `steer` when the adapter reports `canSteerActiveTurn` **and** the session has an
@@ -136,8 +143,9 @@ Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payl
 | `agent.connection` | adapter status change | `AgentConnectionStatus` |
 | `session.updated` | session created or state changed | `SessionSummary` |
 | `session.event` | progress, messages, completion… | `{ sessionId, projectId, provider, kind, summary ≤ 2000, providerEventId?, at }` |
-| `approval.requested` | agent asked permission | `{ approvalId, sessionId, projectId, provider, providerRequestId, actionType, preview ≤ 1500, previewHash, hints, expiresAt }` |
-| `approval.resolved_locally` | timeout, terminal answer, or shutdown | `{ approvalId, resolution: allowed\|denied\|timed_out\|canceled }` |
+| `approval.requested` | agent asked permission | `{ approvalId, sessionId, projectId, provider, providerRequestId, actionType, preview ≤ 1500, previewHash, hints, expiresAt, options?, frameSeq? }` |
+| `approval.resolved_locally` | timeout, terminal answer, or shutdown | `{ approvalId, resolution: allowed\|denied\|timed_out\|canceled, source?, answeredElsewhere }` |
+| `approval.applied` | after the agent was told (v2 only) | `{ approvalId, sessionId, optionId, applied, appliedAs?, error? }` |
 | `session.frame` | one transcript frame, v2 only | `{ sessionId, projectId, provider, seq, kind, at, providerRecordId?, sealed, meta }` — see *Transcript frames and cursors* |
 | `attachment.consumed` | after a download attempt | `{ attachmentId, ok, error? }` |
 
@@ -150,6 +158,45 @@ execution (waiting for it if it is still running), so the same `commandId` can b
 with the same result. (`duplicate` remains a valid status in the schema for older bridges; a bridge at
 this version answers a duplicate with the genuine terminal status instead.) `unknown_approval` distinguishes an approval that expired or was already answered
 from a session that no longer exists.
+
+### Approval options, and what actually happened to them
+
+`approval.requested.options` is the agent's own list, in the agent's order, as
+`[{ optionId, kind, label }]` with `kind ∈ allow_once | allow_always | allow_session | reject_once
+| reject_always`. `optionId === kind` for Claude and Codex; the labels are the bridge's generic
+wording, because the phone renders them verbatim. The phone never invents an option: a request
+with no `options` is answered with `decision` alone.
+
+Which options appear is what the agent can really do, never a Pagr policy:
+
+- **Claude Code** — `allow_once` and `reject_once` always; `allow_always` only when the
+  `can_use_tool` request carried `permission_suggestions`. Those suggestions *are* the rules the
+  grant would write, so answering with `allow_always` sends them straight back as
+  `updatedPermissions` and Claude Code writes them into its own settings.
+- **Codex** — `allow_once`, `allow_session` and `reject_once`, mapped onto the app server's
+  `accept | acceptForSession | decline` (see `adapter-codex/src/approvals.ts`). There is no
+  "always": the enums have none.
+- `PAGR_ALLOW_ALWAYS=0` on the daemon removes `allow_always` everywhere, and an answer naming it
+  is refused rather than downgraded. The device floor refuses a persistent grant for any class it
+  is holding, even one an `allowedHosts` entry would have lifted for a single action — see
+  docs/SECURITY.md.
+
+On v2 the preview travels sealed, in its own `approval_preview` frame: `approval.requested.preview`
+is then `''` and `frameSeq` points at the frame carrying it. `previewHash` is unchanged and is
+still what binds the answer. A v1 gateway, which has never heard of frames, keeps receiving the
+plaintext preview exactly as before.
+
+`approval.applied` is emitted once the agent has actually been told, and is what moves a phone's
+card from *sending* to *acknowledged* — `command.ack` only says the bridge received the tap.
+`applied: false` with `error` is the honest report when the relay failed or the device floor
+refused the answer; `appliedAs` is what the agent was told when that differs from the option
+chosen (a refused persistent grant is relayed as a plain `deny`). It is also emitted, with
+`applied: true`, for a prompt the bridge observed somebody answering elsewhere.
+
+`approval.resolved_locally.source` says where an answer that was not the cloud's came from
+(`terminal`, `provider`, `timeout`, `shutdown`), and `answeredElsewhere: true` marks the case
+where somebody answered in the terminal — or another client of the same agent did — while the
+phone still had the card open. The phone dismisses it rather than reporting an error.
 
 ### `device.hello` is bounded
 
@@ -321,7 +368,10 @@ risk tiering; the bridge only ever reports.
 `~/.pagr/run/daemon.sock`, newline-delimited JSON `{ id, method, params }` → `{ id, result }` |
 `{ id, error: { code, message } }`. Methods: `status`, `projects.list`, `projects.add`, `projects.remove`,
 `sessions.list`, `sessions.reconcile`, `channel.status`, `approvals.list`, `approval.request` (blocks
-until decision/timeout, returns `{ approvalId, decision, resolution }`), `agent.event`. Under
+until decision/timeout, returns `{ approvalId, decision, resolution, optionId? }`; the Claude
+PermissionRequest hook passes `permissionSuggestions` so the prompt can offer "allow always", and
+hands those same rules back to Claude Code itself when `optionId` comes back `allow_always`),
+`agent.event`. Under
 `PAGR_CLAUDE_CHANNEL=1` two more are registered: `channel.poll` and `channel.outbound`.
 See `packages/core/src/ipc.ts` and `daemon.ts`.
 

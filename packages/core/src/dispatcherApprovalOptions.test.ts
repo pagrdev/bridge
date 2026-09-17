@@ -71,7 +71,10 @@ describe('approval options v2', () => {
         ? {
             frames: {
               journal: new JournalStore({ dir: journalDir, now: () => now }),
-              cursors: new OutboxCursors({ file: join(journalDir, 'outbox.json'), writeDelayMs: 0 }),
+              cursors: new OutboxCursors({
+                file: join(journalDir, 'outbox.json'),
+                writeDelayMs: 0,
+              }),
               recipientKeys: () => ({ [phone.kid]: phone.publicKeyB64u }),
               protocolVersion: () => protocolVersion,
             },

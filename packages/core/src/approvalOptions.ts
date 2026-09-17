@@ -1,4 +1,4 @@
-import type { ApprovalOption, ApprovalOptionKind, Provider } from '@pagr/protocol';
+import type { ApprovalOption, ApprovalOptionKind } from '@pagr/protocol';
 
 /**
  * The option list an approval card carries, and the one place the wording lives.

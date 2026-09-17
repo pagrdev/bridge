@@ -17,8 +17,8 @@ import {
 } from '@pagr/protocol';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
 import {
-  allowAlwaysEnabled,
   APPROVAL_OPTION_KINDS,
+  allowAlwaysEnabled,
   decisionForOptionKind,
   defaultOptionId,
   isPersistentOptionKind,

@@ -257,9 +257,12 @@ describe('permission.mjs hook', () => {
       { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git push:*' }] },
     ];
     const d = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
-    await runHook({ ...stdinPayload, permission_suggestions: suggestions }, {
-      PAGR_DAEMON_SOCK: sock,
-    });
+    await runHook(
+      { ...stdinPayload, permission_suggestions: suggestions },
+      {
+        PAGR_DAEMON_SOCK: sock,
+      },
+    );
     await d.close();
     expect(d.seen[0]?.params.permissionSuggestions).toEqual(suggestions);
 
@@ -270,16 +273,19 @@ describe('permission.mjs hook', () => {
     expect(e.seen[0]?.params.permissionSuggestions).toEqual([]);
   });
 
-  it('writes Claude\'s own rules back on allow_always, and nothing extra on a plain allow', async () => {
+  it("writes Claude's own rules back on allow_always, and nothing extra on a plain allow", async () => {
     const suggestions = [
       { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git push:*' }] },
     ];
     const always = fakeDaemon(sock, () => ({
       result: { decision: 'allow', optionId: 'allow_always' },
     }));
-    const r = await runHook({ ...stdinPayload, permission_suggestions: suggestions }, {
-      PAGR_DAEMON_SOCK: sock,
-    });
+    const r = await runHook(
+      { ...stdinPayload, permission_suggestions: suggestions },
+      {
+        PAGR_DAEMON_SOCK: sock,
+      },
+    );
     await always.close();
     expect(JSON.parse(r.stdout)).toEqual({
       hookSpecificOutput: {
@@ -292,9 +298,12 @@ describe('permission.mjs hook', () => {
     const once = fakeDaemon(sock, () => ({
       result: { decision: 'allow', optionId: 'allow_once' },
     }));
-    const r2 = await runHook({ ...stdinPayload, permission_suggestions: suggestions }, {
-      PAGR_DAEMON_SOCK: sock,
-    });
+    const r2 = await runHook(
+      { ...stdinPayload, permission_suggestions: suggestions },
+      {
+        PAGR_DAEMON_SOCK: sock,
+      },
+    );
     await once.close();
     expect(JSON.parse(r2.stdout).hookSpecificOutput.decision).toEqual({ behavior: 'allow' });
 
