@@ -67,7 +67,10 @@ describe('pagr claude channel-setup', () => {
     const out = plain(h.stdout);
     expect(out).toContain('claude --dangerously-load-development-channels server:pagr');
     expect(out).toContain('RESEARCH PREVIEW');
-    expect(out).toContain('PAGR_CLAUDE_CHANNEL=1');
+    // Project scope costs an extra dialog per project; the page has to say so and point at the
+    // user-scope command that does not.
+    expect(out).toContain('New MCP server found in this project');
+    expect(out).toContain('pagr claude channel-install');
   });
 
   it('emits a machine-readable summary with --json', async () => {

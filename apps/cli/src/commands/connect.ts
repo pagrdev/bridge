@@ -33,12 +33,15 @@ import {
 } from '../launchd.js';
 import { bold, cyan, dim, duration, ok, printJson, say, spinner, step, warn } from '../output.js';
 import { resolveApiUrl } from '../urls.js';
+import { installChannelRegistration, LAUNCH_COMMAND } from './claudeChannel.js';
 
 export interface ConnectOptions {
   apiUrl?: string;
   gatewayUrl?: string;
   name?: string;
   daemon: boolean;
+  /** `--no-channel`: pair without registering the Claude Code channel server. */
+  channel?: boolean;
   force?: boolean;
   open: boolean;
   /** Minutes to wait for the browser approval. */
@@ -84,6 +87,8 @@ export async function verifyGatewayConnected(
 interface ConnectResult {
   /** What happened to `~/.claude/settings.json`: installed / already-installed / conflict / failed. */
   claudeHook: string;
+  /** What happened to the user-scope channel registration: installed / already-installed / failed / skipped. */
+  claudeChannel: string;
   deviceId: string;
   userId: string;
   gatewayUrl: string;
@@ -299,6 +304,20 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
         ),
       );
 
+    // Register the channel server at user scope, so `pagr claude` works in every project from
+    // here on. Registering it changes nothing on its own: plain `claude` never loads a channel,
+    // and the server is only spawned by a session that names it on the command line.
+    const channel =
+      opts.channel === false ? ({ action: 'skipped' } as const) : installChannelRegistration(ctx);
+    if (channel.action === 'installed' || channel.action === 'already-installed')
+      say(ctx, ok(`Claude Code channel registered ${dim('(user scope)')}`));
+    if (channel.action === 'failed')
+      warnings.push(
+        stripMarkup(
+          `the Claude Code channel could not be registered (${channel.problem ?? 'unknown error'}); run \`pagr claude channel-install\` later`,
+        ),
+      );
+
     // --- 6. prove the gateway handshake ------------------------------------
     say(ctx, step(6, STEPS, 'Verifying the connection'));
     const gateway = plist
@@ -307,6 +326,7 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
 
     const result: ConnectResult = {
       claudeHook: hook.action,
+      claudeChannel: channel.action,
       deviceId: done.deviceId,
       userId: done.userId,
       gatewayUrl: opts.gatewayUrl ?? done.gatewayUrl,
@@ -404,6 +424,10 @@ function printSummary(ctx: CliContext, r: ConnectResult): void {
     );
   ctx.out(`  2. ${dim('link iMessage from the dashboard (Settings → Messaging)')}`);
   ctx.out(`  3. ${cyan('pagr status')}    ${dim('confirm the gateway stays connected')}`);
+  if (r.claudeChannel === 'installed' || r.claudeChannel === 'already-installed')
+    ctx.out(
+      `  4. ${cyan(LAUNCH_COMMAND)}    ${dim('start Claude Code so your phone can take a turn in it')}`,
+    );
   ctx.out(dim('\nSomething off? `pagr doctor` explains and fixes almost everything.'));
 }
 
@@ -494,6 +518,7 @@ export function registerConnect(program: Command, getCtx: () => CliContext): voi
     .option('--gateway-url <url>', 'override the gateway WebSocket URL returned by pairing')
     .option('--name <deviceName>', 'device name shown in the dashboard (default: hostname)')
     .option('--no-daemon', 'do not install the launchd agent')
+    .option('--no-channel', 'do not register the Claude Code channel server')
     .option('--no-open', 'print the pairing URL without opening a browser')
     .option('--timeout <minutes>', 'how long to wait for browser approval', '10')
     .option('--wait <seconds>', 'how long to wait for the gateway handshake (0 to skip)', '20')

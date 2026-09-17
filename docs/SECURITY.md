@@ -317,6 +317,43 @@ prevent. Codex read-only sessions use the provider's own `sandbox: 'read-only'`.
 
 Cloud-started `claude` children do not receive `PAGR_DAEMON_SOCK`.
 
+## The Claude Code channel (`pagr claude`)
+
+Opt-in, and twice over. Nothing happens until you run `pagr claude channel-install` (which
+registers an MCP server at user scope through `claude mcp add-json`, never by editing
+`~/.claude.json`), and nothing happens in a given session until you start it with `pagr claude`,
+which adds `--dangerously-load-development-channels server:pagr` to the real `claude`. Plain
+`claude` never loads a channel: registration alone changes nothing about it.
+
+`pagr claude` also prints one line before it execs, because Claude Code shows a full-screen
+"Loading development channels" warning on **every** such launch and nothing can pre-accept it (spike
+`docs/spikes/2026-09-17-dev-channels-warning.md` verified this on 2.1.220 and 2.1.274). The launcher
+never automates that keystroke: it is the consent gate, its position in the startup sequence varies,
+and its option numbering differs by version.
+
+The channel server itself is `@pagr/cli`'s `dist/channel-server.mjs`. It has no network listener, no
+credentials, and no filesystem access: it speaks JSON-RPC on the stdio Claude Code gave it and talks
+to exactly one other thing, the local daemon's 0600 Unix socket. The bridge's own headless spawns
+never carry the flag — Claude Code drops channel events silently in `-p` mode — and a test asserts
+`claude-process.ts` cannot grow it.
+
+What a bound channel changes, stated exactly:
+
+- The mirrored session's control level becomes `full`, and `agent.send_instruction` for it is
+  accepted instead of refused. The text is injected as a user turn; it is answered `queued` and the
+  phone watches it move `queued → picked_up → delivered`. Pagr never reports a steer.
+- `agent.stop_session` stays refused. The `claude` process belongs to the terminal it runs in.
+- Permission prompts raised by that session can be relayed to the phone and answered from it, in
+  addition to the local dialog, which stays live the whole time and wins if it is answered first.
+  No decision from the phone means silence: Pagr never invents a `deny`.
+
+**Prompt injection, unchanged.** Anything the daemon relays lands in the model's context, and the
+terminal shows one truncated line per event. Whoever can text your Pagr number can, while a channel
+is bound, put instructions into that session and answer its prompts. That is the trade the warning
+dialog is describing, and it is why the channel is per-session and dies with the terminal rather
+than being a standing grant. Detach (two missed polls, ~50 s) puts the session back to
+`approvals_only`.
+
 ## Filesystem containment (`projects.ts`)
 
 - Registration requires an existing directory that is a git repository (or `--allow-non-git`), resolved
@@ -345,8 +382,9 @@ turn that never ends — after one hour, with `cleanupTmp` sweeping anything old
 
 Third-party runtime dependencies across the published packages are `zod` (all), `ws` and
 `@napi-rs/keyring` (`@pagr/bridge-core`), and `commander` and `picocolors` (`@pagr/cli`). The
-optional `integrations/claude-channel` add-on, which is not part of the default install, also uses
-`@modelcontextprotocol/sdk`.
+Claude Code channel server (`@pagr/cli`'s `dist/channel-server.mjs`) has none of its own: it speaks
+the handful of JSON-RPC messages Claude Code sends directly, rather than pulling an MCP SDK into a
+process that runs inside the user's terminal.
 
 Child processes are spawned with argument arrays, never through a shell. Secrets are never passed
 as argv: the `/usr/bin/security` fallback writes the device private key to the tool's stdin, because

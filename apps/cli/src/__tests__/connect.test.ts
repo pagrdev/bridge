@@ -91,6 +91,37 @@ describe('connect · happy path', () => {
     expect(readConfig(getPaths(h.home).configFile).gatewayUrl).toBe('wss://local:8080');
   });
 
+  /**
+   * Registering the channel changes nothing on its own: plain `claude` never loads a channel, and
+   * the server is spawned only by a session that names it on the command line. What it buys is
+   * that `pagr claude` works in every project from the moment pairing finishes.
+   */
+  it('registers the Claude channel at user scope while pairing, and says how to use it', async () => {
+    h.execImpl = (file, args) => {
+      if (file !== 'claude') return '';
+      if (args[1] === 'get') throw new Error('No MCP server found with name: pagr');
+      return 'Added stdio MCP server pagr to user config\n';
+    };
+    expect(await connect()).toBe(EXIT.ok);
+    const add = h.execCalls.find((c) => c[0] === 'claude' && c[2] === 'add-json');
+    expect(add?.slice(0, 6)).toEqual(['claude', 'mcp', 'add-json', '--scope', 'user', 'pagr']);
+    expect(all()).toContain('pagr claude');
+  });
+
+  it('--no-channel pairs without touching Claude Code’s MCP config', async () => {
+    expect(await connect({}, ['--no-channel'])).toBe(EXIT.ok);
+    expect(h.execCalls.some((c) => c[0] === 'claude' && c[1] === 'mcp')).toBe(false);
+  });
+
+  it('a `claude` that cannot be asked is a warning, never a failed pairing', async () => {
+    h.execImpl = (file) => {
+      if (file === 'claude') throw new Error('command not found: claude');
+      return '';
+    };
+    expect(await connect()).toBe(EXIT.ok);
+    expect(all()).toContain('pagr claude channel-install');
+  });
+
   it('leaves PAGR_HOME 0700 and config.json 0600', async () => {
     expect(await connect()).toBe(EXIT.ok);
     expect(statSync(h.home).mode & 0o777).toBe(0o700);

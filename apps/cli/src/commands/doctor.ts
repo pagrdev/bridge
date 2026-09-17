@@ -48,6 +48,14 @@ import {
 import { bad, bold, dim, ok, printJson, warn } from '../output.js';
 import { configuredApiUrl } from '../urls.js';
 import { LAUNCH_COMMAND, MCP_CONFIG_FILE, MCP_SERVER_KEY } from './claude.js';
+import {
+  CLAUDE_VERSION_FLOOR,
+  channelServerPath,
+  claudeVersionOf,
+  meetsVersionFloor,
+  readRegistration,
+} from './claudeChannel.js';
+import { findRealClaude } from './claudeLauncher.js';
 
 export interface Check {
   name: string;
@@ -474,42 +482,89 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
           : { fix: 'run `pagr daemon install` (or `pagr claude hook-install`)' }),
   });
 
-  // ---- Claude Code live steering ------------------------------------------
-  // Two separate truths, reported separately, because "configured" and "actually able to steer"
-  // are routinely confused and the product must never claim the wrong one.
-  const projectDir = ctx.env.PAGR_DOCTOR_PROJECT ?? process.cwd();
-  const mcpFile = join(projectDir, MCP_CONFIG_FILE);
-  const mcp = readMcpEntry(mcpFile);
+  // ---- Claude Code channel -------------------------------------------------
+  // Four separate truths, reported separately, because "installed", "registered", "bound" and
+  // "what a follow-up actually does" are routinely confused and the product must never claim the
+  // wrong one. See docs/spikes/2026-09-17-dev-channels-warning.md.
+  const channel = status ? await channelStatusOf(ctx) : null;
+
+  // The launcher only works if there is a real `claude` to exec, and the floor is about models,
+  // not channels: 2.1.220 accepts the flag but refuses the current default model outright.
+  const realClaude = findRealClaude(ctx.env, [ctx.binPath]);
+  const claudeVersion = realClaude ? claudeVersionOf(ctx) : null;
+  const meetsFloor = claudeVersion ? meetsVersionFloor(claudeVersion, CLAUDE_VERSION_FLOOR) : null;
   add({
-    name: 'claude channel',
-    status: mcp.present ? 'ok' : 'skip',
-    detail: mcp.present
-      ? `\`${MCP_SERVER_KEY}\` server configured in ${mcpFile}`
-      : mcp.problem
-        ? `${mcpFile}: ${mcp.problem}`
-        : `not configured in ${mcpFile} (optional)`,
-    ...(mcp.present
-      ? {}
-      : { fix: 'run `pagr claude channel-setup --dry-run` to see exactly what it would do' }),
+    name: 'claude launcher',
+    status: !realClaude ? 'warn' : meetsFloor === false ? 'warn' : 'ok',
+    detail: !realClaude
+      ? 'no `claude` on PATH, so `pagr claude` has nothing to start'
+      : meetsFloor === false
+        ? `${realClaude} is ${claudeVersion}; channels need ${CLAUDE_VERSION_FLOOR} or newer`
+        : `${realClaude}${claudeVersion ? ` (${claudeVersion})` : ''}`,
+    ...(!realClaude
+      ? { fix: 'npm i -g @anthropic-ai/claude-code, then run `claude` once and sign in' }
+      : meetsFloor === false
+        ? { fix: 'npm i -g @anthropic-ai/claude-code@latest' }
+        : {}),
   });
 
-  const channel = status ? await channelStatusOf(ctx) : null;
+  const serverPath = channelServerPath(ctx);
+  const registration = readRegistration(ctx);
+  const serverBuilt = existsSync(serverPath);
   add({
-    name: 'live steering',
-    status: !status ? 'skip' : channel?.canSteerLive ? 'ok' : channel?.enabled ? 'warn' : 'skip',
+    name: 'claude channel',
+    status: registration.registered && serverBuilt ? 'ok' : registration.problem ? 'warn' : 'warn',
+    detail: registration.problem
+      ? `could not ask Claude Code: ${registration.problem}`
+      : !registration.registered
+        ? `\`${MCP_SERVER_KEY}\` is not registered at user scope`
+        : serverBuilt
+          ? `\`${MCP_SERVER_KEY}\` registered at user scope → ${serverPath}`
+          : `registered, but the server file is missing at ${serverPath}`,
+    ...(registration.registered && serverBuilt ? {} : { fix: 'run `pagr claude channel-install`' }),
+  });
+
+  add({
+    name: 'channel sessions',
+    status: !status ? 'skip' : (channel?.boundSessions ?? 0) > 0 ? 'ok' : 'warn',
     detail: !status
       ? 'daemon not running'
       : channel === null
         ? 'the daemon did not answer channel.status (older bridge?)'
-        : channel.canSteerLive
-          ? `can steer live — ${channel.attachedProjects.length} channel(s) attached`
+        : channel.boundSessions
+          ? `${channel.boundSessions} Claude session(s) bound, ${channel.attachedProjects.length} project(s) attached`
           : channel.enabled
-            ? 'PAGR_CLAUDE_CHANNEL=1 but no channel is attached: follow-ups will be QUEUED'
-            : 'follow-ups are queued, not steered (channel mode off — this is the default)',
-    ...(status && channel?.enabled && !channel.canSteerLive
+            ? 'no Claude session is bound to a channel right now'
+            : 'channel IPC is off (PAGR_CLAUDE_CHANNEL=0)',
+    ...(status && channel?.enabled && !channel.boundSessions
       ? { fix: `start Claude Code with \`${LAUNCH_COMMAND}\` inside a registered project` }
       : {}),
   });
+
+  add({
+    name: 'live steering',
+    status: 'ok',
+    // Never "steered". The spike timed it: the line renders in the terminal instantly and the
+    // model acts on it when the turn it was already running ends. Saying otherwise would sell an
+    // interruption the bridge cannot perform.
+    detail: channel?.boundSessions
+      ? 'queued, surfaced at the next turn boundary'
+      : 'queued, surfaced at the next turn boundary (no channel bound: after the current turn)',
+  });
+
+  // The per-project `.mcp.json` path is still supported and still reported, but it is no longer
+  // the recommendation: it adds a consent dialog per project on top of the per-launch warning.
+  const projectDir = ctx.env.PAGR_DOCTOR_PROJECT ?? process.cwd();
+  const mcpFile = join(projectDir, MCP_CONFIG_FILE);
+  const mcp = readMcpEntry(mcpFile);
+  if (mcp.present || mcp.problem)
+    add({
+      name: 'claude channel (project)',
+      status: mcp.problem ? 'warn' : 'ok',
+      detail: mcp.problem
+        ? `${mcpFile}: ${mcp.problem}`
+        : `\`${MCP_SERVER_KEY}\` also configured in ${mcpFile} (adds a per-project consent dialog)`,
+    });
 
   // ---- keep-awake ---------------------------------------------------------
   // Two things people need to know and cannot see: whether the Mac is being held awake right

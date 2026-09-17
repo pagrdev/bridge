@@ -203,6 +203,13 @@ export function persistedSummary(sessionId: string, p: PersistedSession): Sessio
 }
 
 /** Attachments are referenced by local path; Claude reads them with its own tools. */
+/** What a delivery frame says when there is no instruction text to show (the later states). */
+const DELIVERY_TEXT = {
+  queued: 'Queued for the Claude Code session in your terminal.',
+  picked_up: 'Handed to the Claude Code session in your terminal.',
+  delivered: 'Claude Code picked it up; it runs at the next turn boundary.',
+} as const;
+
 const withImages = (instruction: string, images: string[]): string =>
   images.length
     ? `${images.map((p) => `See screenshot at ${p}`).join('\n')}\n\n${instruction}`
@@ -213,6 +220,8 @@ const CAPABILITIES = {
   canResumeSession: true,
   /** Live steering of an in-flight turn is not faked (ADR 0001); instructions are queued. */
   canSteerActiveTurn: false,
+  /** Turns true only with a channel bound: a follow-up lands at the next turn boundary. */
+  canQueueIntoActiveTurn: false,
   canReceiveLiveExternalMessages: false,
   canRelayApprovals: true,
   canStop: true,
@@ -235,8 +244,10 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
   private readonly listeners = new Set<(e: AdapterEvent) => void>();
   private readonly map: SessionMap;
-  /** Non-null only under `PAGR_CLAUDE_CHANNEL=1` (ADR 0001 `approved-channel`, dev flag only). */
+  /** Null only under `PAGR_CLAUDE_CHANNEL=0` (ADR 0001 `approved-channel`). */
   private readonly channel: ChannelMode | null;
+  /** Disposes the channel pick-up subscription on `shutdown`. */
+  private unsubscribePickup: (() => void) | null = null;
   /** Null when `PAGR_MIRROR=0` or the embedder turned it off. */
   readonly mirror: ClaudeMirror | null;
   private hookCache: { value: boolean; atMs: number } | null = null;
@@ -253,6 +264,18 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     this.channel = opts.channel
       ? new ChannelMode(...(opts.channelBridge ? [opts.channelBridge] : []))
       : null;
+    // `queued` → `picked_up`: the moment the channel server takes the follow-up off the queue is
+    // the moment it stops being merely queued, and it is the only moment the bridge can observe
+    // between sending and the transcript showing it.
+    this.unsubscribePickup =
+      this.channel?.onPickup((p) => {
+        if (!p.sessionId || !p.projectId) return;
+        this.deliveryFrame(
+          { sessionId: p.sessionId, projectId: p.projectId },
+          'picked_up',
+          p.followupId,
+        );
+      }) ?? null;
     this.mirror =
       opts.mirror === false
         ? null
@@ -461,20 +484,25 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   async sendInstruction(
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
-    // Channel mode: if a Pagr channel server is polling for this session's project, the text is
-    // injected into the *running* Claude Code session (`notifications/claude/channel`). That is
-    // real live steering — the one case where ADR 0001 permits `delivered: 'steered'`.
+    // Channel mode: a Pagr channel server is polling for this session, so the text goes into the
+    // running Claude Code session (`notifications/claude/channel`). It renders in that terminal at
+    // once and the model acts on it at the next turn boundary — so the honest answer is `queued`,
+    // and the phone is shown that follow-up move through queued → picked_up → delivered rather
+    // than being told its message interrupted anything.
     const target = this.channel?.resolve(input.sessionId, this.locationOf(input.sessionId));
     if (this.channel && target) {
-      this.channel.deliver(target, withImages(input.instruction, input.localImagePaths));
-      this.emit({
-        kind: 'session_event',
-        sessionId: input.sessionId,
-        projectId: target.projectId,
-        type: 'followup_delivered',
-        summary: clip(input.instruction, 500),
-      });
-      return { delivered: 'steered' };
+      const followupId = this.channel.deliver(
+        target,
+        withImages(input.instruction, input.localImagePaths),
+        { sessionId: input.sessionId },
+      );
+      this.deliveryFrame(
+        { sessionId: input.sessionId, projectId: target.projectId },
+        'queued',
+        followupId,
+        clip(input.instruction, 500),
+      );
+      return { delivered: 'queued' };
     }
     const live = this.requireLive(input.sessionId);
     if (live.activeTurn && live.proc?.alive) {
@@ -545,6 +573,8 @@ export class ClaudeAdapter implements CodingAgentAdapter {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.unsubscribePickup?.();
+    this.unsubscribePickup = null;
     this.mirror?.stop();
     for (const p of [...this.pendingQuestions.values()]) {
       clearTimeout(p.timer);
@@ -758,6 +788,29 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       }
     });
     proc.start();
+  }
+
+  /**
+   * One `system` frame saying where a channel follow-up has got to.
+   *
+   * The state lives in `meta.delivery`, which the protocol already carries, so nothing about the
+   * frame shape is new. The phone uses it to move a message from "sending" to "in that terminal"
+   * without the bridge ever having to claim the turn was interrupted.
+   */
+  private deliveryFrame(
+    at: { sessionId: string; projectId: string },
+    state: 'queued' | 'picked_up' | 'delivered',
+    followupId?: string,
+    text?: string,
+  ): void {
+    this.emit({
+      kind: 'frame',
+      sessionId: at.sessionId,
+      projectId: at.projectId,
+      body: { kind: 'system', subtype: `followup_${state}`, text: text ?? DELIVERY_TEXT[state] },
+      meta: { source: 'stdio', delivery: { state, ...(followupId ? { followupId } : {}) } },
+      ...(followupId ? { providerRecordId: `${followupId}:${state}` } : {}),
+    });
   }
 
   /** Registered project a session belongs to, as far as this adapter knows. */

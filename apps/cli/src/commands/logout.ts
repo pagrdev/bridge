@@ -7,6 +7,7 @@ import { CliError, EXIT } from '../errors.js';
 import { daemonStatus, socketPath } from '../ipc.js';
 import { bold, dim, ok, printJson, warn } from '../output.js';
 import { tryResolveWebUrl } from '../urls.js';
+import { removeChannelRegistration } from './claudeChannel.js';
 
 export interface LogoutResult {
   deviceId: string | null;
@@ -16,6 +17,8 @@ export interface LogoutResult {
   revokeUrl: string | null;
   /** Hook entries taken back out of `~/.claude/settings.json`. */
   claudeHookRemoved: string[];
+  /** Whether the user-scope Claude Code channel registration was removed with it. */
+  claudeChannelRemoved: boolean;
 }
 
 /**
@@ -39,6 +42,9 @@ export async function runLogout(
   const hook = removeHookForUser(ctx, (l) => {
     if (report && !ctx.json) ctx.out(l);
   });
+  // The channel server points at a daemon this Mac no longer has a pairing for; leaving it
+  // registered would have every `pagr claude` spawn a process that can only fail.
+  const channelRemoved = removeChannelRegistration(ctx);
   const removed: string[] = [];
   const files = [ctx.paths.configFile, ctx.paths.sessionsFile, ctx.paths.replayFile];
   if (opts.purge) files.push(ctx.paths.projectsFile, ctx.paths.policyFile);
@@ -60,6 +66,7 @@ export async function runLogout(
     // A courtesy link, not the job: a Mac that was never pointed at a deployment still logs out.
     revokeUrl: revokeBase && config.deviceId ? `${revokeBase}/app/devices` : null,
     claudeHookRemoved: hook.removed,
+    claudeChannelRemoved: channelRemoved,
   };
   if (!report) return result;
   if (ctx.json) {

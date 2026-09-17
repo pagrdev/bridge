@@ -126,6 +126,14 @@ export const AgentCapabilities = z.object({
   canStop: z.boolean(),
   canAttachImages: z.boolean(),
   canListSessions: z.boolean(),
+  /**
+   * The bridge can put a follow-up into a turn that is already running, and the agent will act on
+   * it when that turn ends — the Claude channel's real behaviour.
+   *
+   * Deliberately NOT `canSteerActiveTurn`, which promises an interruption. Optional (additive):
+   * an adapter or a bridge that predates it simply does not say, and the phone reads that as no.
+   */
+  canQueueIntoActiveTurn: z.boolean().optional(),
 });
 export type AgentCapabilities = z.infer<typeof AgentCapabilities>;
 

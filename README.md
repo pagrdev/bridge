@@ -29,6 +29,7 @@ pagr project add      # …or register it under a name you choose
 pagr project scan     # …or find every repo under ~/code, ~/src, ~/Developer… and pick
 pagr projects         # what is reachable, and what is running in each
 pagr status
+pagr claude           # start Claude Code with the Pagr channel (see below)
 ```
 
 `pagr project scan [roots...]` walks a few conventional folders (never your whole home
@@ -36,6 +37,31 @@ directory), stops at each `.git`, skips `node_modules`/caches/hidden folders, an
 found. Add `--dry-run` to preview, `--all` to take everything, `--json` for a machine-readable
 plan. Names come from the folder plus the GitHub repo name, so you can text either; collisions
 are qualified (`two/app`) rather than silently duplicated. Running it twice is a no-op.
+
+## Control a terminal session from your phone
+
+Pagr watches the `claude` sessions you start yourself and relays their permission prompts. To go
+further and send one a follow-up from your phone, start it through the launcher:
+
+```bash
+pagr claude channel-install   # once: registers the Pagr channel with Claude Code (all projects)
+pagr claude                   # then: use this instead of `claude`
+```
+
+`pagr claude` runs the real `claude` with a Pagr *channel* loaded, passing your arguments through
+unchanged. Claude Code asks you to confirm development channels on **every** launch — it cannot be
+pre-accepted, so the launcher prints one line warning you and you press Enter. Plain `claude` is
+left exactly as it was, and its sessions stay approvals-only.
+
+A follow-up you text into a channel-bound session appears in that terminal immediately and Claude
+acts on it at the next turn boundary. It is not an interruption, and Pagr never says it was:
+`pagr doctor` reports delivery as *queued, surfaced at the next turn boundary*, and the phone
+watches each message move `queued → picked_up → delivered`.
+
+`pagr claude --no-channel` (or `PAGR_NO_CHANNEL=1`) starts plain `claude`; so does any headless
+run (`-p`, `--print`, `--output-format`), where Claude Code would silently drop channel events.
+`pagr claude channel-status` says what is registered and what is bound; `pagr claude channel-remove`
+undoes the registration, as do `pagr logout` and `pagr daemon uninstall`.
 
 ## Many sessions at once
 
@@ -68,11 +94,8 @@ integrations/             optional add-ons, not part of the default install
 packaging/                Homebrew formula template + release runbook
 ```
 
-Optional: [`integrations/claude-channel`](integrations/claude-channel/README.md) is a Claude Code
-*channel* server that lets Pagr steer an in-flight Claude turn instead of queueing a follow-up.
-Channels are an Anthropic **research preview** and custom ones require
-`--dangerously-load-development-channels`, so it is off unless you set `PAGR_CLAUDE_CHANNEL=1`.
-Nothing in the default install depends on it.
+`integrations/claude-channel` is deprecated: the channel server it used to hold now ships inside
+`@pagr/cli` (see **Control a terminal session from your phone** above).
 
 ## Develop
 

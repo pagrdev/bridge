@@ -552,15 +552,13 @@ hands those same rules back to Claude Code itself when `optionId` comes back `al
 `agent.event`. `approval.request` is also how the hook relays an `AskUserQuestion`: it sends
 `toolName: 'AskUserQuestion'` plus that tool's `questions`, the daemon registers a question rather
 than an approval, and the result comes back as `{ decision: 'allow', updatedInput }` for the hook
-to print as its `PermissionRequest` decision. Under
-`PAGR_CLAUDE_CHANNEL=1` two more are registered: `channel.poll` and `channel.outbound`.
+to print as its `PermissionRequest` decision. `channel.poll` and `channel.outbound` are registered
+by default (`PAGR_CLAUDE_CHANNEL=0` takes them away; `=1` is a no-op kept for older launchd plists).
 See `packages/core/src/ipc.ts` and `daemon.ts`.
 
 - `sessions.reconcile` → `[{ sessionId, provider, projectId, status, outcome, reason }]`, where
   `outcome` is `resumable` | `terminated` | `failed`. The daemon runs this itself on startup, so a
   session that was working when the daemon died never survives as a zombie.
-- `channel.status` → `{ enabled, attachedProjects, canSteerLive }`. `enabled` only means the flag is
-  set; `canSteerLive` is the one that says a follow-up would really interrupt a turn.
 - `sessions.journal` → `{ [sessionId]: { lastSeq, bytes, sent, acked, updatedAt } }`, which is what
   `pagr sessions` puts in its SEQ and JOURNAL columns.
 - `sessions.history` → the `session.list_history` answer, and `sessions.backfill` → the
@@ -568,6 +566,15 @@ See `packages/core/src/ipc.ts` and `daemon.ts`.
   feature can be exercised from the Mac alone (`pagr sessions backfill <id>`).
 - `sessions.purge` → `{ removed, bytesFreed, totalBytes }`. Deletes whole journals under
   `~/.pagr/journal` and nothing else; `~/.claude` is never touched.
+- `channel.status` → `{ enabled, attachedProjects, canSteerLive, boundSessions? }`. `enabled` only
+  means the methods are registered. `boundSessions` is the number that matters: how many Claude
+  sessions a channel is bound to by **Claude session id**, which is what decides whether any one
+  terminal can be handed a follow-up.
+- `channel.poll` takes `{ cwd, cursor?, claudePid? }`. `claudePid` is the channel server's
+  `process.ppid`, i.e. the `claude` that spawned it; the daemon reads
+  `~/.claude/sessions/<pid>.json` to learn that process's Claude session id and binds
+  `syntheticSessionId('claude', <id>)` to the project. Without it the binding falls back to the
+  directory index, which cannot tell two `claude` processes in one project apart.
 
 ## Concurrency rules (bridge-side, no protocol change)
 
@@ -585,5 +592,24 @@ protocol field for "the user explicitly asked for two writers in one tree", so t
 expressed locally on the device (see `packages/core/src/concurrency.ts`).
 
 `AgentCapabilities.canSteerActiveTurn` is reported per probe and reflects what the device can do
-*at that moment*: Claude Code reports `true` only while a channel is actually attached and polling,
-never merely because `PAGR_CLAUDE_CHANNEL=1` is set.
+*at that moment*. For Claude Code it is **always false**: nothing Pagr has interrupts a running
+turn. A bound channel sets `canQueueIntoActiveTurn` instead — the follow-up renders in the terminal
+at once and the model acts on it at the next turn boundary — and only while a channel is actually
+polling. `canQueueIntoActiveTurn` is optional and additive: a bridge that predates it simply does
+not send the field, which reads as `false`.
+
+## Follow-up delivery states
+
+`agent.send_instruction` into a channel-bound session is acknowledged `{ delivered: 'queued' }` and
+then reported through `FrameMeta.delivery`, on `system` frames that share one `followupId`:
+
+| state | emitted when | by |
+| --- | --- | --- |
+| `queued` | the instruction is accepted and put on the channel queue | the Claude adapter |
+| `picked_up` | the channel server's long poll takes it off that queue | the Claude adapter, from the bridge's pick-up signal |
+| `delivered` | the injected turn appears in the transcript as `<channel source="pagr" … followup="…">` | the transcript mirror |
+
+`delivered` also emits `session.event` `followup_delivered`. The follow-up id rides out to Claude
+Code as a `<channel>` attribute (`meta.followup`), which is the only thing that lets the tailer tie
+a transcript record back to the message a phone sent. A follow-up that never reaches `delivered`
+stops at `picked_up`: the bridge does not guess.

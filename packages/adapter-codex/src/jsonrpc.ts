@@ -30,26 +30,11 @@ export function classifyLine(line: string): Classified {
   return { kind: 'invalid', raw, reason: 'neither request, notification nor response' };
 }
 
-/** Incremental JSONL splitter: feed chunks, get whole lines back. */
-export class LineBuffer {
-  private buf = '';
-  push(chunk: string): string[] {
-    this.buf += chunk;
-    const out: string[] = [];
-    let i = this.buf.indexOf('\n');
-    while (i >= 0) {
-      out.push(this.buf.slice(0, i));
-      this.buf = this.buf.slice(i + 1);
-      i = this.buf.indexOf('\n');
-    }
-    return out;
-  }
-  flush(): string | null {
-    const rest = this.buf;
-    this.buf = '';
-    return rest.trim() === '' ? null : rest;
-  }
-}
+/**
+ * Re-exported so every `jsonrpc.js` caller keeps its import. The implementation lives in
+ * `@pagr/bridge-core` because the Claude channel server needs the same splitter.
+ */
+export { LineBuffer } from '@pagr/bridge-core';
 
 export function encode(msg: RpcMessage): string {
   return `${JSON.stringify(msg)}\n`;

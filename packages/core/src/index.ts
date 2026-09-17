@@ -33,6 +33,7 @@ export {
   stopLaunchAgent,
   writeNodeLauncher,
 } from './launchAgent.js';
+export * from './lineBuffer.js';
 export * from './logging.js';
 export * from './mirrorBridge.js';
 export * from './pairing.js';

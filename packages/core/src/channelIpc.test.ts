@@ -96,17 +96,27 @@ describe('registerChannelMethods', () => {
   let bridge: ChannelBridge;
   let messages: Array<{ sessionId: string; projectId: string; text: string }>;
   let minted: string[];
+  /** Stands in for `~/.claude/sessions/<pid>.json`: which Claude session a live pid is running. */
+  let pidFiles: Map<number, string>;
+  let bound: Array<{ sessionId: string; claudeSessionId: string; projectId: string }>;
 
   beforeEach(() => {
     ipc = new IpcServer({ socketPath: '/unused.sock' });
     bridge = new ChannelBridge();
     messages = [];
     minted = [];
+    pidFiles = new Map();
+    bound = [];
     registerChannelMethods(ipc, {
       bridge,
       pollTimeoutMs: 5,
       resolveProject: (cwd) => (cwd.startsWith(project.path) ? project : null),
       claudeSessionsIn: () => ['ses_a', 'ses_b'],
+      claudeSessionForPid: (pid) => {
+        const claudeSessionId = pidFiles.get(pid);
+        return claudeSessionId ? { claudeSessionId, sessionId: `ses_of_${claudeSessionId}` } : null;
+      },
+      onBound: (b) => void bound.push(b),
       ensureSession: ({ sessionId }) => {
         const id = sessionId ?? 'ses_minted';
         minted.push(id);
@@ -134,6 +144,72 @@ describe('registerChannelMethods', () => {
     expect(bridge.bindingFor('ses_a')).toEqual({ cwd: project.path, projectId: project.projectId });
     expect(bridge.bindingFor('ses_b')).toEqual({ cwd: project.path, projectId: project.projectId });
     expect(bridge.isAttached(project.path)).toBe(true);
+  });
+
+  /**
+   * The binding that matters. `claudePid` is the `claude` that spawned the channel server, so the
+   * daemon can name the exact Claude session and the phone can take a turn in THAT terminal —
+   * not in whatever else happens to be running in the same directory.
+   */
+  it('binds by Claude session id when the poll reports its claudePid', async () => {
+    pidFiles.set(4242, 'cs-abc');
+    await call('channel.poll', { cwd: project.path, cursor: 0, claudePid: 4242 });
+    expect(bridge.bindingFor('ses_of_cs-abc')).toEqual({
+      cwd: project.path,
+      projectId: project.projectId,
+      claudeSessionId: 'cs-abc',
+    });
+    expect(bound).toEqual([
+      { sessionId: 'ses_of_cs-abc', claudeSessionId: 'cs-abc', projectId: project.projectId },
+    ]);
+    expect(bridge.boundSessions()).toContain('ses_of_cs-abc');
+  });
+
+  it('falls back to the directory index when there is no pid file for that pid', async () => {
+    await call('channel.poll', { cwd: project.path, cursor: 0, claudePid: 9999 });
+    expect(bound).toEqual([]);
+    // The legacy path still binds every known Claude session in the project, which is right for
+    // one `claude` per directory and is all an older Claude Code can support.
+    expect(bridge.bindingFor('ses_a')?.cwd).toBe(project.path);
+    expect(bridge.bindingFor('ses_a')?.claudeSessionId).toBeUndefined();
+  });
+
+  it('stops reporting a bound session once its project stops polling', async () => {
+    let clock = 1_000_000;
+    const ttl = new ChannelBridge(() => clock, 1000);
+    ttl.bindSession('ses_x', { cwd: '/p', projectId: 'prj_1', claudeSessionId: 'cs-x' });
+    await ttl.poll('/p', 0, 0);
+    expect(ttl.boundSessions()).toEqual(['ses_x']);
+    clock += 2000;
+    expect(ttl.boundSessions()).toEqual([]);
+  });
+
+  it('reports a follow-up leaving the queue, so `queued` can become `picked_up`', async () => {
+    const b = new ChannelBridge();
+    const seen: unknown[] = [];
+    const off = b.onPickup((p) => seen.push(p));
+    b.enqueue('/p', 'do it', { followupId: 'fu_1', sessionId: 'ses_1', projectId: 'prj_1' });
+    expect(seen).toEqual([]); // queued is not picked up
+    await b.poll('/p', 0, 0);
+    expect(seen).toEqual([
+      { cwd: '/p', seq: 1, followupId: 'fu_1', sessionId: 'ses_1', projectId: 'prj_1' },
+    ]);
+    // A second poll past the cursor hands out nothing, so nothing is reported twice.
+    await b.poll('/p', 1, 0);
+    expect(seen).toHaveLength(1);
+    off();
+    b.enqueue('/p', 'again', { followupId: 'fu_2' });
+    await b.poll('/p', 1, 0);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('never leaks local routing to the channel server', async () => {
+    const b = new ChannelBridge();
+    b.enqueue('/p', 'text', { followupId: 'fu_1', sessionId: 'ses_1', projectId: 'prj_1' });
+    const res = await b.poll('/p', 0, 0);
+    // `followupId` rides out (it becomes a `<channel followup="…">` attribute); the session and
+    // project ids are this Mac's business and stay here.
+    expect(res.messages).toEqual([{ seq: 1, text: 'text', followupId: 'fu_1' }]);
   });
 
   it('emits an agent message on outbound and binds the session', async () => {
@@ -173,13 +249,20 @@ describe('daemon flag gate', () => {
     return createDaemon({ home, adapters: new Map(), secretStore: new MemorySecretStore(), env });
   };
 
-  it('registers the channel methods only under PAGR_CLAUDE_CHANNEL=1', async () => {
-    const off = await make({});
-    expect(off.ipc.methodNames()).not.toContain('channel.poll');
-    const on = await make({ PAGR_CLAUDE_CHANNEL: '1' });
+  it('registers the channel methods by default, and PAGR_CLAUDE_CHANNEL=0 takes them away', async () => {
+    const on = await make({});
     expect(on.ipc.methodNames()).toEqual(
       expect.arrayContaining(['channel.poll', 'channel.outbound']),
     );
+    // `=1` was the old opt-in and is now a no-op, which matters: a daemon installed with it in
+    // its launchd environment must behave exactly like one without.
+    const explicit = await make({ PAGR_CLAUDE_CHANNEL: '1' });
+    expect(explicit.ipc.methodNames()).toEqual(
+      expect.arrayContaining(['channel.poll', 'channel.outbound']),
+    );
+    const off = await make({ PAGR_CLAUDE_CHANNEL: '0' });
+    expect(off.ipc.methodNames()).not.toContain('channel.poll');
+    expect(off.channelStatus().enabled).toBe(false);
   });
 
   /**

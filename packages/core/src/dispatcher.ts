@@ -50,6 +50,7 @@ import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.j
 import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFloor.js';
 import { type EventPayloadInput, makeEvent } from './events.js';
 import { chunkFrame, type FrameBody } from './frames.js';
+import { type ChannelBridge, getChannelBridge } from './ipc.js';
 import type { JournalEntry, JournalMeta, JournalStore, OutboxCursors } from './journal.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
@@ -236,6 +237,12 @@ export interface DispatcherOptions {
    * bridge that cannot read a transcript must say so rather than answer "no history".
    */
   backfill?: BackfillChannel;
+  /**
+   * Claude Code channel bindings. Defaults to the process-wide bridge the daemon registers
+   * `channel.*` on; injected in tests. Read for exactly one decision: whether an adopted session
+   * can be given a turn (see `assertOurSession`).
+   */
+  channelBridge?: ChannelBridge;
 }
 
 /** Everything `session.list_history` and `session.backfill` need that the dispatcher does not own. */
@@ -618,7 +625,9 @@ export class Dispatcher {
       case 'agent.start_session':
         return this.startSession(body.payload);
       case 'agent.send_instruction':
-        this.assertOurSession(body.payload.sessionId, 'send an instruction to');
+        this.assertOurSession(body.payload.sessionId, 'send an instruction to', {
+          channelBound: true,
+        });
         return this.sendInstruction(body.payload);
       case 'agent.stop_session': {
         this.assertOurSession(body.payload.sessionId, 'stop');
@@ -900,6 +909,13 @@ export class Dispatcher {
     return { rec, adapter: this.adapterFor(rec.provider) };
   }
 
+  /** A live Pagr channel bound to this exact session, i.e. a `pagr claude` terminal. */
+  private channelBoundTo(sessionId: string): boolean {
+    const bridge = this.o.channelBridge ?? getChannelBridge();
+    const bound = bridge.bindingFor(sessionId);
+    return Boolean(bound && bridge.isAttached(bound.cwd));
+  }
+
   /**
    * Taking the turn in a session the bridge did not start.
    *
@@ -907,16 +923,25 @@ export class Dispatcher {
    * adapter that has never heard of this one. Refusing here turns that into one sentence the
    * person can act on, and keeps the limit true on this side rather than only in the cloud.
    *
-   * Only the *turn* is refused. Answering a prompt this session raised is the entire point of
-   * adopting it and goes through `respondToApproval`, which does not come through here.
+   * Two exceptions, both narrow. Answering a prompt this session raised is the entire point of
+   * adopting it and goes through `respondToApproval`, which does not come through here. And a
+   * session with a Pagr channel bound to it (`pagr claude`) CAN be given a follow-up: the channel
+   * is a documented way in, and the text arrives as an ordinary user turn at the next turn
+   * boundary. Stopping such a session is still refused — the `claude` process belongs to the
+   * terminal it is running in, and Pagr has no handle on it to kill and no business killing it.
    */
-  private assertOurSession(sessionId: string, what: string): void {
+  private assertOurSession(
+    sessionId: string,
+    what: string,
+    opts: { channelBound?: boolean } = {},
+  ): void {
     const rec = this.o.sessions.get(sessionId);
-    if (rec && isAdopted(rec))
-      throw new DispatchError(
-        'capability_unsupported',
-        `this is one of your own ${rec.provider} sessions — Pagr did not start it, so it cannot ${what} it. Pagr can relay the prompts it raises; everything else belongs to the terminal it is running in.`,
-      );
+    if (!rec || !isAdopted(rec)) return;
+    if (opts.channelBound && this.channelBoundTo(sessionId)) return;
+    throw new DispatchError(
+      'capability_unsupported',
+      `this is one of your own ${rec.provider} sessions — Pagr did not start it, so it cannot ${what} it. Pagr can relay the prompts it raises; everything else belongs to the terminal it is running in.`,
+    );
   }
 
   /**

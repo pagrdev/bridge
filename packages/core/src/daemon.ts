@@ -35,6 +35,7 @@ import {
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, InvalidDeviceKeyError, loadOrCreateIdentity } from './identity.js';
 import {
+  CHANNEL_POLL_TIMEOUT_MS,
   type ChannelBridge,
   IpcMethodError,
   IpcServer,
@@ -125,6 +126,14 @@ export interface CreateDaemonOptions {
    * `capability_unsupported`.
    */
   backfill?: DaemonBackfillOptions;
+  /**
+   * Claude Code's session id for a running pid, read from `~/.claude/sessions/<pid>.json`.
+   *
+   * Supplied by the CLI (the reader lives in `@pagr/bridge-adapter-claude`, which core must not
+   * import). Without it the channel binds by directory only, which is right for one `claude` per
+   * project and cannot tell two apart.
+   */
+  claudeSessionForPid?: (pid: number) => string | null;
 }
 
 /** What the daemon is handed about reading history; the rest of the channel it wires itself. */
@@ -268,12 +277,18 @@ const ProjectAddParams = z.object({
 
 /** Reported by `pagr status` / `pagr doctor` so users can see the live-steering truth. */
 export interface ChannelStatus {
-  /** `PAGR_CLAUDE_CHANNEL=1`: the daemon registered the channel IPC methods. */
+  /** The daemon registered the channel IPC methods (the default; `PAGR_CLAUDE_CHANNEL=0` opts out). */
   enabled: boolean;
   /** Project roots with a channel server actually polling right now. */
   attachedProjects: string[];
   /** True only when at least one project can be steered live this second. */
   canSteerLive: boolean;
+  /**
+   * How many Claude sessions are bound by session id, not merely by directory. Optional so a
+   * newer `pagr` CLI still parses the status of an older daemon. This is the number that decides
+   * whether any single terminal can be given a turn from a phone.
+   */
+  boundSessions?: number;
 }
 
 /** Stable `ses_…` id for a provider session the bridge did not spawn (hook path). */
@@ -1036,19 +1051,37 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   }
 
   // --- Claude Code Channel (ADR 0001 `approved-channel`, research preview) -------------------
-  // Additive and flag-gated: without PAGR_CLAUDE_CHANNEL=1 these methods are never registered
-  // and the daemon behaves exactly as before. See integrations/claude-channel/README.md.
+  // Registered by default since MOB-037: nothing here does anything until a channel server
+  // actually connects, and one only exists because the user ran `pagr claude`. `PAGR_CLAUDE_CHANNEL=0`
+  // takes the methods away entirely for anyone who wants the old behaviour back.
   const channelEnv = o.env ?? process.env;
-  const channelEnabled = channelEnv.PAGR_CLAUDE_CHANNEL === '1';
+  const channelEnabled = channelEnv.PAGR_CLAUDE_CHANNEL !== '0';
   let channelBridge: ChannelBridge | null = null;
   const channelStatus = (): ChannelStatus => {
     const attachedProjects = channelBridge?.attachedProjects() ?? [];
-    return { enabled: channelEnabled, attachedProjects, canSteerLive: attachedProjects.length > 0 };
+    return {
+      enabled: channelEnabled,
+      attachedProjects,
+      canSteerLive: attachedProjects.length > 0,
+      boundSessions: channelBridge?.boundSessions().length ?? 0,
+    };
   };
   // Always answerable, so `pagr doctor` can say "the channel is off" instead of "unknown".
   ipc.registerMethod('channel.status', () => channelStatus());
   if (channelEnabled) {
     channelBridge = registerChannelMethods(ipc, {
+      claudeSessionForPid: (pid) => {
+        const claudeSessionId = o.claudeSessionForPid?.(pid) ?? null;
+        return claudeSessionId
+          ? { claudeSessionId, sessionId: syntheticSessionId('claude', claudeSessionId) }
+          : null;
+      },
+      onBound: ({ sessionId, claudeSessionId, projectId }) =>
+        logger.debug('channel bound to a Claude session', {
+          sessionId,
+          claudeSessionId,
+          projectId,
+        }),
       resolveProject: (cwd) => {
         const rec = registry.findByPath(cwd);
         return rec ? { projectId: rec.projectId, path: rec.path } : null;
@@ -1106,8 +1139,31 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         );
       },
     });
-    logger.warn('Claude Code channel IPC enabled (research preview; dev flag only)');
+    logger.info('Claude Code channel IPC registered (attaches only when `pagr claude` is used)');
   }
+
+  /**
+   * Tell the cloud when live steering appears or disappears.
+   *
+   * Attaching is observable (a poll arrives); detaching is a silence — two missed long polls —
+   * so it has to be watched for. Without this the phone would keep an "I can take the turn"
+   * affordance for a terminal that was closed twenty minutes ago.
+   */
+  let lastCanSteer = false;
+  let channelWatch: NodeJS.Timeout | null = null;
+  const watchChannel = (): void => {
+    const canSteer = (channelBridge?.boundSessions().length ?? 0) > 0;
+    if (canSteer === lastCanSteer) return;
+    lastCanSteer = canSteer;
+    const adapter = o.adapters.get('claude');
+    if (!adapter) return;
+    void adapter
+      .probe()
+      .then((st) => emit(makeEvent(dispatcherDeviceId(), 'agent.connection', st, { now })))
+      .catch(() => {
+        // A probe that fails says nothing new; the next flip will try again.
+      });
+  };
 
   let cleanupTimer: NodeJS.Timeout | null = null;
 
@@ -1165,6 +1221,10 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         pruneJournal();
       }, 3600_000);
       cleanupTimer.unref();
+      if (channelEnabled) {
+        channelWatch = setInterval(watchChannel, CHANNEL_POLL_TIMEOUT_MS);
+        channelWatch.unref();
+      }
       if (transport) transport.start();
       else logger.warn('not paired: run `pagr connect`; IPC available, gateway idle');
       logger.info('daemon started', {
@@ -1175,6 +1235,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     },
     async stop() {
       if (cleanupTimer) clearInterval(cleanupTimer);
+      if (channelWatch) clearInterval(channelWatch);
+      channelWatch = null;
       // Before the dispatcher, so the assertion goes even if an adapter shutdown hangs or throws.
       keepAwake.dispose();
       await dispatcher.shutdown();

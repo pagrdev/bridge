@@ -239,6 +239,27 @@ export class IpcServer {
 export interface ChannelMessage {
   seq: number;
   text: string;
+  /**
+   * Correlates the three delivery states of one follow-up. It rides out to Claude Code as a
+   * `<channel … followup="…">` attribute, which is how the transcript tailer later recognises
+   * the injected turn and can say `delivered` instead of guessing.
+   */
+  followupId?: string;
+}
+
+/** What the queue holds. `sessionId`/`projectId` are local routing and never reach the channel. */
+interface QueuedMessage extends ChannelMessage {
+  sessionId?: string;
+  projectId?: string;
+}
+
+/** A follow-up leaving the queue on a `channel.poll`, i.e. `queued` → `picked_up`. */
+export interface ChannelPickup {
+  cwd: string;
+  seq: number;
+  followupId?: string;
+  sessionId?: string;
+  projectId?: string;
 }
 
 export interface ChannelPollResult {
@@ -250,11 +271,17 @@ export interface ChannelPollResult {
 export interface ChannelSessionBinding {
   cwd: string;
   projectId: string;
+  /**
+   * The Claude Code session id this binding came from (`~/.claude/sessions/<pid>.json`). Present
+   * for a binding made from a `channel.poll` that reported its `claudePid`; absent for the legacy
+   * cwd-only fallback, which cannot tell two `claude` processes in one project apart.
+   */
+  claudeSessionId?: string;
 }
 
 interface ChannelQueue {
   seq: number;
-  messages: ChannelMessage[];
+  messages: QueuedMessage[];
   waiters: Set<() => void>;
   attachedAt: string;
   /** Epoch ms of the last `channel.poll`. 0 for a queue created by an enqueue with no channel. */
@@ -281,6 +308,7 @@ export const CHANNEL_ATTACH_TTL_MS = CHANNEL_POLL_TIMEOUT_MS * 2;
 export class ChannelBridge {
   private readonly queues = new Map<string, ChannelQueue>();
   private readonly bindings = new Map<string, ChannelSessionBinding>();
+  private readonly pickupListeners = new Set<(p: ChannelPickup) => void>();
 
   constructor(
     private readonly now: () => number = () => Date.now(),
@@ -327,16 +355,49 @@ export class ChannelBridge {
     return this.bindings.get(sessionId);
   }
 
+  /**
+   * Sessions a live channel is actually bound to right now.
+   *
+   * A binding whose project has stopped polling is not reported: the `claude` it named has quit
+   * (or the channel was never loaded), and counting it would make `pagr doctor` claim a phone can
+   * take a turn in a terminal that is gone.
+   */
+  boundSessions(): string[] {
+    return [...this.bindings.entries()]
+      .filter(([, b]) => this.isAttached(b.cwd))
+      .map(([sessionId]) => sessionId);
+  }
+
+  /** Notified when a follow-up leaves the queue on a poll. Returns a disposer. */
+  onPickup(listener: (p: ChannelPickup) => void): () => void {
+    this.pickupListeners.add(listener);
+    return () => void this.pickupListeners.delete(listener);
+  }
+
   /** Queue a text for injection and wake any long-poll waiting on this project. */
-  enqueue(cwd: string, text: string): ChannelMessage {
+  enqueue(
+    cwd: string,
+    text: string,
+    routing: { followupId?: string; sessionId?: string; projectId?: string } = {},
+  ): ChannelMessage {
     const q = this.queue(cwd);
     q.seq += 1;
-    const msg: ChannelMessage = { seq: q.seq, text };
+    const msg: QueuedMessage = {
+      seq: q.seq,
+      text,
+      ...(routing.followupId ? { followupId: routing.followupId } : {}),
+      ...(routing.sessionId ? { sessionId: routing.sessionId } : {}),
+      ...(routing.projectId ? { projectId: routing.projectId } : {}),
+    };
     q.messages.push(msg);
     if (q.messages.length > CHANNEL_QUEUE_MAX)
       q.messages.splice(0, q.messages.length - CHANNEL_QUEUE_MAX);
     for (const wake of [...q.waiters]) wake();
-    return msg;
+    return {
+      seq: msg.seq,
+      text: msg.text,
+      ...(msg.followupId ? { followupId: msg.followupId } : {}),
+    };
   }
 
   /** Everything newer than `cursor`, waiting up to `timeoutMs` for the first arrival. */
@@ -346,9 +407,20 @@ export class ChannelBridge {
     this.attach(cwd);
     const q = this.queue(cwd);
     const take = (): ChannelPollResult | null => {
-      const messages = q.messages.filter((m) => m.seq > cursor);
-      if (messages.length === 0) return null;
-      return { cursor: messages[messages.length - 1]?.seq ?? cursor, messages };
+      const picked = q.messages.filter((m) => m.seq > cursor);
+      if (picked.length === 0) return null;
+      // Handing a follow-up to the channel server is the moment it stops being queued. Reported
+      // before the response goes out, so the phone's `picked_up` never arrives after the turn it
+      // describes has already run.
+      for (const m of picked) this.announcePickup(cwd, m);
+      return {
+        cursor: picked[picked.length - 1]?.seq ?? cursor,
+        messages: picked.map((m) => ({
+          seq: m.seq,
+          text: m.text,
+          ...(m.followupId ? { followupId: m.followupId } : {}),
+        })),
+      };
     };
     const immediate = take();
     if (immediate) return immediate;
@@ -370,6 +442,24 @@ export class ChannelBridge {
     for (const q of this.queues.values()) for (const wake of [...q.waiters]) wake();
     this.queues.clear();
     this.bindings.clear();
+    this.pickupListeners.clear();
+  }
+
+  private announcePickup(cwd: string, m: QueuedMessage): void {
+    const p: ChannelPickup = {
+      cwd,
+      seq: m.seq,
+      ...(m.followupId ? { followupId: m.followupId } : {}),
+      ...(m.sessionId ? { sessionId: m.sessionId } : {}),
+      ...(m.projectId ? { projectId: m.projectId } : {}),
+    };
+    for (const l of [...this.pickupListeners]) {
+      try {
+        l(p);
+      } catch {
+        // A listener that throws must not cost the channel its message.
+      }
+    }
   }
 }
 
@@ -387,6 +477,12 @@ export function getChannelBridge(): ChannelBridge {
 const ChannelPollParams = z.object({
   cwd: z.string().min(1),
   cursor: z.number().int().nonnegative().optional(),
+  /**
+   * The pid of the `claude` that spawned the channel server (`process.ppid`). It is what turns a
+   * per-directory attachment into a per-SESSION binding: `~/.claude/sessions/<pid>.json` names the
+   * Claude session id, and that is the identity the mirror and the phone already use.
+   */
+  claudePid: z.number().int().positive().optional(),
 });
 
 const ChannelOutboundParams = z.object({
@@ -399,6 +495,15 @@ export interface ChannelIpcDeps {
   bridge?: ChannelBridge;
   /** Map a channel's cwd onto a registered project, or null when it is not registered. */
   resolveProject(cwd: string): { projectId: string; path: string } | null;
+  /**
+   * Claude Code session id for the process that spawned the channel server, from
+   * `~/.claude/sessions/<pid>.json`. Null when there is no such file (an older Claude, a pid that
+   * has gone) — the channel then falls back to the cwd index, which is right for one `claude` per
+   * project and cannot distinguish two.
+   */
+  claudeSessionForPid?: (pid: number) => { claudeSessionId: string; sessionId: string } | null;
+  /** Called when a binding is made or renewed, so the daemon can restate what control is now possible. */
+  onBound?: (input: { sessionId: string; claudeSessionId: string; projectId: string }) => void;
   /** Existing local `ses_…` ids for this project, bound so live steering can find the queue. */
   claudeSessionsIn(projectId: string): string[];
   /** Mint (or reuse) the local session id representing this interactive Claude Code session. */
@@ -426,8 +531,21 @@ export function registerChannelMethods(ipc: IpcServer, deps: ChannelIpcDeps): Ch
     const p = ChannelPollParams.parse(params);
     const rec = project(p.cwd);
     bridge.attach(rec.path);
-    // Re-bind on every poll: a session minted after the channel started (permission hook,
-    // cloud-started turn) becomes steerable within one poll interval.
+    // The precise binding first: the pid of the `claude` that spawned this server names exactly
+    // one Claude session, so the phone can steer THAT terminal and no other.
+    const bound = p.claudePid ? (deps.claudeSessionForPid?.(p.claudePid) ?? null) : null;
+    if (bound) {
+      bridge.bindSession(bound.sessionId, {
+        cwd: rec.path,
+        projectId: rec.projectId,
+        claudeSessionId: bound.claudeSessionId,
+      });
+      deps.onBound?.({ ...bound, projectId: rec.projectId });
+    }
+    // Legacy fallback, kept because it is what a Claude with no pid file (and every session the
+    // permission hook minted before this poll) still needs: re-bind every known Claude session in
+    // the project. It cannot tell two `claude` processes in one directory apart, which is the
+    // whole reason the pid path above exists.
     for (const sessionId of deps.claudeSessionsIn(rec.projectId))
       bridge.bindSession(sessionId, { cwd: rec.path, projectId: rec.projectId });
     const res = await bridge.poll(rec.path, p.cursor ?? 0, timeoutMs);

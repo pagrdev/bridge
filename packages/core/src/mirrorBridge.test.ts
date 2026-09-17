@@ -5,6 +5,7 @@ import { DeviceEvent as DeviceEventSchema } from '@pagr/protocol';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
 import { Dispatcher } from './dispatcher.js';
+import { ChannelBridge } from './ipc.js';
 import { JournalStore, OutboxCursors } from './journal.js';
 import {
   getMirrorBridge,
@@ -166,6 +167,38 @@ describe('Dispatcher and the sessions the bridge did not start', () => {
     // A later update that says nothing about adoption must not silently un-adopt it.
     await emitSession({ session: { status: 'idle', updatedAt: '2026-09-17T12:05:00.000Z' } });
     expect(sessions.get(sessionId)?.adopted).toBe(true);
+    expect(() => assertOurs('stop')).toThrow(/cannot stop it/);
+  });
+
+  /**
+   * The one exception, and the reason it is narrow. A channel is a documented way INTO a running
+   * Claude Code session, so a follow-up really can be delivered to one. The `claude` process
+   * still belongs to the terminal it is running in, so stopping it stays refused: Pagr has no
+   * handle on it to kill, and no business killing it if it had.
+   */
+  it('accepts an instruction for a channel-bound session, and still refuses to stop it', async () => {
+    const bridge = new ChannelBridge();
+    const dispatcher = new Dispatcher({
+      deviceId: ids.dev(),
+      adapters: new Map<Provider, CodingAgentAdapter>(),
+      registry,
+      sessions,
+      emit: () => {},
+      tmpDir: join(t.home, 'tmp'),
+      bridgeVersion: '0.1.0',
+      channelBridge: bridge,
+    });
+    await emitSession({ adopted: true, localCwd: repo });
+    const assertOurs = (what: string, channelBound?: boolean) =>
+      // biome-ignore lint/suspicious/noExplicitAny: reaching the private guard
+      (dispatcher as any).assertOurSession(sessionId, what, { channelBound });
+
+    // Bound but not polling: a channel that died must not leave the session steerable.
+    bridge.bindSession(sessionId, { cwd: repo, projectId, claudeSessionId: 'cs-1' });
+    expect(() => assertOurs('send an instruction to', true)).toThrow(/Pagr did not start it/);
+
+    bridge.attach(repo);
+    expect(() => assertOurs('send an instruction to', true)).not.toThrow();
     expect(() => assertOurs('stop')).toThrow(/cannot stop it/);
   });
 
