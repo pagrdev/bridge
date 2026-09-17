@@ -111,6 +111,29 @@ export function classifyAuthFailure(error: string | undefined): AuthFailure {
   };
 }
 
+/**
+ * Where the transport gets the frames a reconnect owes the gateway, and where it reports what the
+ * gateway has confirmed.
+ *
+ * Deliberately a port rather than a direct dependency on the journal: the transport's job is
+ * ordering and delivery, and the questions "what is unacked", "how is it sealed" and "what does
+ * the phone need to reassemble it" all belong to the dispatcher, which has the keys.
+ */
+export interface FrameResume {
+  /** Journaled frames the gateway has not acked, oldest first. */
+  pending(): ResumableFrames | Promise<ResumableFrames>;
+  /** One frame has been handed to the socket. */
+  noteSent(sessionId: string, seq: number): void;
+  /** A gateway `ack {cursors}` frame: everything up to this seq is persisted on their side. */
+  ack(cursors: Record<string, number>): void;
+}
+
+export type ResumableFrames = ReadonlyArray<{
+  sessionId: string;
+  seq: number;
+  event: DeviceEvent;
+}>;
+
 export interface GatewayClientOptions {
   url: string;
   identity: DeviceIdentity & { deviceId: string };
@@ -163,6 +186,15 @@ export interface GatewayClientOptions {
   recipientKeys?: Record<string, string>;
   /** Environment used for the transport-security checks (defaults to `process.env`). */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Run once per connection, after `auth.result` and before anything else is sent. The daemon
+   * puts `device.hello` here: the gateway has to know what this Mac is before it is handed a
+   * transcript. A failure is logged and the connection carries on — a hello that could not be
+   * built is not a reason to withhold the frames.
+   */
+  onReady?: () => Promise<void> | void;
+  /** Journal-backed resume for `session.frame`. Absent on a bridge with no journal. */
+  resume?: FrameResume;
 }
 
 /**
@@ -504,6 +536,10 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
       if (!this.mayEmit(event)) return false;
       return this.sendFrame({ kind: 'event', event });
     }
+    // A frame's buffer is the journal, which is durable, ordered and survives a restart — the
+    // ring is neither, and holding a copy in both would put every offline frame on the wire
+    // twice on the next connect. The ring keeps everything else: statuses, acks, heartbeats.
+    if (event.type === 'session.frame' && this.opts.resume) return false;
     if (this.buffer.length >= this.bufferLimit) {
       this.buffer.shift();
       this.buffer.push(event);
@@ -623,9 +659,9 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
         this.retryFloorMs = 0;
         this.lastFailure = null;
         this.touch();
-        this.flush();
         this.startHeartbeat();
         this.emit('connected');
+        void this.openSession(this.ws);
         return;
       }
       case 'ping':
@@ -648,8 +684,10 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
         this.features = frame.features;
         return;
       case 'ack':
-        // Frame cursors. The journal that resumes from them is MOB-032; until it exists there is
-        // nothing to move, and an unhandled frame kind would be indistinguishable from a bug.
+        // The gateway has persisted every frame up to these seqs. This is the ONLY thing that
+        // retires a frame from the resume set, which is why it is clamped to what was actually
+        // sent (see `OutboxCursors.ack`) rather than taken on trust.
+        this.opts.resume?.ack(frame.cursors);
         this.logger.debug('gateway acked frames', { sessions: Object.keys(frame.cursors).length });
         return;
     }
@@ -767,6 +805,42 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
       negotiatedVersion: this.negotiated,
     });
     return false;
+  }
+
+  /**
+   * What a fresh connection sends, in the order it has to be sent in: the hello, then every frame
+   * the gateway never acked, then whatever was buffered while the socket was down.
+   *
+   * Frames come before the ring because they are the transcript and the ring is everything else —
+   * statuses, acks, heartbeats — and a phone that receives a `session.updated` for a turn whose
+   * frames have not arrived yet shows an empty thread that fills in backwards.
+   */
+  private async openSession(ws: WebSocket | null): Promise<void> {
+    const alive = () =>
+      this.ws === ws && this.state_ === 'connected' && ws?.readyState === this.WS.OPEN;
+    try {
+      await this.opts.onReady?.();
+    } catch (err) {
+      this.logger.warn('the connect hook failed; continuing', { error: String(err) });
+    }
+    if (!alive()) return;
+    if (this.opts.resume && this.negotiated >= 2) {
+      try {
+        const pending = await this.opts.resume.pending();
+        if (pending.length > 0)
+          this.logger.info('re-sending journaled frames the gateway has not acked', {
+            frames: pending.length,
+          });
+        for (const frame of pending) {
+          if (!alive()) return;
+          if (this.sendEvent(frame.event)) this.opts.resume.noteSent(frame.sessionId, frame.seq);
+        }
+      } catch (err) {
+        this.logger.warn('could not resume frames from the journal', { error: String(err) });
+      }
+    }
+    if (!alive()) return;
+    this.flush();
   }
 
   private flush(): void {

@@ -27,6 +27,7 @@ network call sites: `transport.ts` (gateway), `pairing.ts` (pairing API), `attac
 | `command.ack` | command id, status, error code, a short message, a command-specific result | secrets |
 | `session.updated` / `session.event` | session id, status, a ≤2000-char summary produced by the adapter | full transcripts, diffs, file bodies |
 | `approval.requested` | a ≤1500-char **preview** of the action (the command line or file list) and its sha256 | full file contents |
+| `session.frame` | session/project/provider ids, a sequence number, the frame's **kind** (`assistant`, `tool_call`, `diff`, `terminal`…), a timestamp, its size, whether it was clipped, and the **sealed** body | anything readable. The body is encrypted on this Mac for the phones you have paired, and the cloud relays ciphertext it holds no key for. A frame over 512 KiB is clipped for the wire (command output keeps its first 8 KiB and last 56 KiB) and the full text stays in `~/.pagr/journal/` |
 | `attachment.consumed` | attachment id and ok/error | image bytes |
 
 ## What stays local
@@ -43,6 +44,9 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 | `policy.json` | the public approval policy synced from your dashboard settings. |
 | `device-policy.json` | your local approval floor. Written only by you; no command can change it, and it is never sent anywhere. See `docs/SECURITY.md`. |
 | `logs/daemon.log` | local JSON log. Home directory is rewritten to `~`. Never uploaded. |
+| `journal/<sessionId>.log` | **plaintext copies of your own sessions, on your own disk** (0600, in a 0700 directory): one NDJSON line per transcript frame — the assistant's words, your messages, tool calls and their output, diffs, terminal blocks. It is the archive the phone's transcript is served from, and the reason a dropped connection costs a re-send rather than a hole. Pruned whole sessions at a time: nothing older than 30 days, and never more than 2 GiB in total. Never uploaded as it stands — what leaves this Mac is the sealed, capped copy described above. `pagr uninstall` deletes it with the rest of `~/.pagr/`. |
+| `journal/<sessionId>.idx` | byte offsets into that log so a resume is a seek, not a scan (0600). Rebuilt from the log whenever it does not match it; holds no content of its own. |
+| `journal/outbox.json` | per session, how far the frames have been sent and how far the cloud confirmed them (`{sent, acked}`). Ids and numbers only. |
 | `tmp/att_*.{png,jpg,heic,webp}` | downloaded screenshots (0600), held for the agent turn that referenced them and deleted when that turn ends, whether it finished, failed or was stopped; a 1 h sweep is the backstop, and everything goes on daemon shutdown. |
 | `run/daemon.sock` | Unix socket (0600) for the CLI and Claude hooks. Not reachable over the network. |
 | Keychain `dev.pagr.bridge / device.private_key` | Ed25519 private key. Never transmitted. |

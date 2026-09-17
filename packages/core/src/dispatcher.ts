@@ -1,15 +1,17 @@
 import { release } from 'node:os';
-import type {
-  AgentConnectionStatus,
-  CommandBody,
-  CommandPayload,
-  DeviceEvent,
-  EventPayload,
-  ProjectSummary,
-  Provider,
-  RepoScanResult,
-  SessionStatus,
-  SessionSummary,
+import {
+  type AgentConnectionStatus,
+  type CommandBody,
+  type CommandPayload,
+  canonicalize,
+  type DeviceEvent,
+  type EventPayload,
+  type ProjectSummary,
+  type Provider,
+  type RepoScanResult,
+  type SealAad,
+  type SessionStatus,
+  type SessionSummary,
 } from '@pagr/protocol';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
 import {
@@ -25,11 +27,14 @@ import { deleteAttachment, type FetchLike, fetchAttachment } from './attachments
 import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.js';
 import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFloor.js';
 import { type EventPayloadInput, makeEvent } from './events.js';
+import { chunkFrame, type FrameBody } from './frames.js';
+import type { JournalEntry, JournalMeta, JournalStore, OutboxCursors } from './journal.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
 import { PublicPolicy, readPolicy, writePolicy } from './policy.js';
 import { ProjectError, type ProjectRegistry } from './projects.js';
 import { RepoHandleCache, scanRepos } from './repoScan.js';
+import { importRecipientKeys, type RecipientKeySet, sealFrame } from './seal.js';
 import { isAdopted, isReportable, type SessionStore } from './sessions.js';
 
 /**
@@ -157,6 +162,60 @@ export interface DispatcherOptions {
    * awake while somebody still has a prompt to answer; nothing in the dispatcher depends on it.
    */
   onApprovalsChange?: () => void;
+  /**
+   * Transcript frames. Absent on a bridge with no journal wired up (the CLI's one-shot
+   * dispatchers, and tests that do not care), in which case `emitFrame` returns null rather than
+   * throwing — a bridge that cannot journal must not pretend to have sent anything.
+   */
+  frames?: FrameChannel;
+}
+
+/** Everything `emitFrame` needs that the dispatcher does not own. */
+export interface FrameChannel {
+  journal: JournalStore;
+  cursors: OutboxCursors;
+  /** The phones to seal for (`kid` → base64url X25519). Empty means journal-only. */
+  recipientKeys: () => Record<string, string>;
+  /** Protocol version in force on the current link. Frames are v2-only. */
+  protocolVersion: () => number;
+  /** Whether the account has iMessage linked; gates the plaintext `imessage` field. */
+  imessageLinked?: () => boolean;
+  /** Most frames one reconnect re-sends per session. Default `MAX_RESUME_FRAMES`. */
+  maxResumeFrames?: number;
+}
+
+/**
+ * Frames one reconnect re-sends per session before leaving the rest for the next one.
+ *
+ * A Mac that was offline for a fortnight has more backlog than a phone wants in one burst, and
+ * the gateway's ack moves the cursor as each batch lands, so the next connection picks up exactly
+ * where this one stopped. Anything older than the journal keeps is a `session.backfill`.
+ */
+export const MAX_RESUME_FRAMES = 500;
+
+/** What `emitFrame` did. `emitted: false` is a normal outcome, not a failure. */
+export interface EmitFrameResult {
+  seq: number;
+  emitted: boolean;
+  /** Why the frame stayed on this Mac. */
+  heldBack?: 'duplicate' | 'protocol_v1' | 'no_recipients';
+}
+
+/** Facts about a frame the caller owns; `seq` and the seal are the dispatcher's. */
+export interface EmitFrameInput {
+  projectId: string;
+  provider: Provider;
+  meta: JournalMeta;
+  providerRecordId?: string;
+  at?: string;
+  imessage?: string;
+}
+
+/** One journaled frame the gateway has not acked, ready to go back on the wire. */
+export interface ResumableFrame {
+  sessionId: string;
+  seq: number;
+  event: DeviceEvent;
 }
 
 /**
@@ -232,6 +291,160 @@ export class Dispatcher {
 
   ack(commandId: string, payload: Omit<AckPayload, 'commandId'>): DeviceEvent {
     return this.send('command.ack', { commandId, ...payload }, commandId);
+  }
+
+  // ---------- transcript frames (v2) ----------
+
+  /**
+   * Journal a frame, then seal and send it.
+   *
+   * The order is the whole point. `append` allocates the sequence number and puts the full body
+   * on disk; only then is a capped, chunked copy sealed for the user's phones. A daemon killed
+   * between the two loses nothing — the frame is on disk with `sent` still behind it, and the
+   * next connection re-sends it from the journal.
+   *
+   * Three ordinary states end in `emitted: false` and are not failures: the provider handed us a
+   * record we already have, the gateway speaks v1 and has never heard of `session.frame`, or no
+   * phone key is pinned so nothing in the world could open the envelope. All three still journal,
+   * because the journal is what a later backfill serves.
+   */
+  emitFrame(sessionId: string, body: FrameBody, input: EmitFrameInput): EmitFrameResult | null {
+    const channel = this.o.frames;
+    if (!channel) return null;
+    const { seq, at, duplicate } = channel.journal.append(sessionId, body, {
+      projectId: input.projectId,
+      provider: input.provider,
+      meta: input.meta,
+      ...(input.providerRecordId ? { providerRecordId: input.providerRecordId } : {}),
+      ...(input.at ? { at: input.at } : {}),
+    });
+    if (duplicate) return { seq, emitted: false, heldBack: 'duplicate' };
+
+    const hold = this.frameHold();
+    if (hold) {
+      this.logger.debug('frame journaled but not sent', { sessionId, seq, reason: hold });
+      return { seq, emitted: false, heldBack: hold };
+    }
+    const entry: JournalEntry = {
+      sessionId,
+      seq,
+      at,
+      kind: body.kind,
+      projectId: input.projectId,
+      provider: input.provider,
+      ...(input.providerRecordId ? { providerRecordId: input.providerRecordId } : {}),
+      meta: input.meta,
+      body,
+    };
+    for (const event of this.frameEvents(entry, input.imessage)) this.o.emit(event);
+    channel.cursors.noteSent(sessionId, seq);
+    return { seq, emitted: true };
+  }
+
+  /**
+   * Journaled frames the gateway has not confirmed, oldest first — what a reconnect re-sends
+   * before the in-memory ring, so the transcript arrives in order.
+   */
+  pendingFrames(): ResumableFrame[] {
+    const channel = this.o.frames;
+    if (!channel || this.frameHold()) return [];
+    const limit = channel.maxResumeFrames ?? MAX_RESUME_FRAMES;
+    const out: ResumableFrame[] = [];
+    for (const { sessionId, fromSeq, toSeq } of channel.cursors.pending()) {
+      const entries = channel.journal.read(sessionId, fromSeq, toSeq);
+      const batch = entries.slice(0, limit);
+      if (entries.length > batch.length)
+        this.logger.info('resuming part of a session backlog; the rest follows next connection', {
+          sessionId,
+          resending: batch.length,
+          remaining: entries.length - batch.length,
+        });
+      for (const entry of batch)
+        for (const event of this.frameEvents(entry)) out.push({ sessionId, seq: entry.seq, event });
+    }
+    return out;
+  }
+
+  /** Record that a resumed frame has been handed to the socket. */
+  noteFrameSent(sessionId: string, seq: number): void {
+    this.o.frames?.cursors.noteSent(sessionId, seq);
+  }
+
+  /** Why frames may not go on the wire right now, or null when they may. */
+  private frameHold(): 'protocol_v1' | 'no_recipients' | null {
+    const channel = this.o.frames;
+    if (!channel) return null;
+    if (channel.protocolVersion() < 2) return 'protocol_v1';
+    return this.recipients().length === 0 ? 'no_recipients' : null;
+  }
+
+  /** One `session.frame` event per sealed chunk. All of them carry the same `seq`. */
+  private frameEvents(entry: JournalEntry, imessage?: string): DeviceEvent[] {
+    const channel = this.o.frames;
+    if (!channel) return [];
+    const recipients = this.recipients();
+    if (recipients.length === 0) return [];
+    const plan = chunkFrame(entry.body);
+    const events: DeviceEvent[] = [];
+    for (const part of plan.parts) {
+      const aad: SealAad = {
+        sessionId: entry.sessionId,
+        seq: entry.seq,
+        kind: entry.kind,
+        ...(part.chunk ? { chunk: part.chunk } : {}),
+      };
+      events.push(
+        makeEvent(
+          this.o.deviceId,
+          'session.frame',
+          {
+            sessionId: entry.sessionId,
+            projectId: entry.projectId,
+            provider: entry.provider,
+            seq: entry.seq,
+            kind: entry.kind,
+            at: entry.at,
+            ...(entry.providerRecordId ? { providerRecordId: entry.providerRecordId } : {}),
+            sealed: sealFrame(part.body, aad, recipients),
+            meta: {
+              ...entry.meta,
+              bytes: plan.bytes,
+              truncated: plan.truncated,
+              ...(part.chunk ? { chunk: part.chunk } : {}),
+            },
+          },
+          { now: this.now },
+        ),
+      );
+    }
+    // Only the first part carries the iMessage line: it is one message, not one per chunk.
+    if (imessage && channel.imessageLinked?.() && events[0])
+      (events[0].payload as Record<string, unknown>).imessage = imessage.slice(0, 1500);
+    return events;
+  }
+
+  /**
+   * Imported once per distinct key set rather than per frame: `importRecipientKeys` does a
+   * fingerprint check and an X25519 parse per phone, and a busy session is hundreds of frames a
+   * minute against a set that changes when somebody pairs a phone.
+   */
+  private recipientCacheKey = '\u0000';
+  private recipientCache: RecipientKeySet = [];
+  private recipients(): RecipientKeySet {
+    const raw = this.o.frames?.recipientKeys() ?? {};
+    const key = canonicalize(raw);
+    if (key === this.recipientCacheKey) return this.recipientCache;
+    this.recipientCacheKey = key;
+    try {
+      this.recipientCache = importRecipientKeys(raw);
+    } catch (err) {
+      // A set that does not import is a set nothing can be sealed for. Frames stay journaled.
+      this.logger.error('pinned recipient keys are unusable; frames stay on this Mac', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.recipientCache = [];
+    }
+    return this.recipientCache;
   }
 
   // ---------- commands in ----------
@@ -963,6 +1176,18 @@ export class Dispatcher {
           summary: e.summary.slice(0, 2000),
           ...(e.providerEventId ? { providerEventId: e.providerEventId } : {}),
           at: this.now().toISOString(),
+        });
+        return;
+      case 'frame':
+        // The adapter said what happened; the journal says when and in what order, and the seal
+        // says who may read it. B4 wires the Claude adapter to this; nothing emits it yet.
+        this.emitFrame(e.sessionId, e.body, {
+          projectId: e.projectId,
+          provider,
+          meta: e.meta,
+          ...(e.providerRecordId ? { providerRecordId: e.providerRecordId } : {}),
+          ...(e.at ? { at: e.at } : {}),
+          ...(e.imessage ? { imessage: e.imessage } : {}),
         });
         return;
       case 'approval_requested': {

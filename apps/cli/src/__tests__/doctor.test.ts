@@ -495,6 +495,48 @@ describe('doctor · phone keys', () => {
   });
 });
 
+describe('doctor · journal', () => {
+  const SES = `ses_${'c'.repeat(32)}`;
+  const line = (seq: number) =>
+    `${JSON.stringify({
+      seq,
+      at: '2026-09-17T00:00:00.000Z',
+      kind: 'assistant',
+      projectId: `proj_${'d'.repeat(32)}`,
+      provider: 'claude',
+      meta: { source: 'stdio' },
+      body: { kind: 'assistant', text: 'x'.repeat(100) },
+    })}\n`;
+  const writeJournal = (cursors?: Record<string, { sent: number; acked: number }>) => {
+    const dir = getPaths(h.home).journalDir;
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, `${SES}.log`), `${line(1)}${line(2)}`, { mode: 0o600 });
+    if (cursors) writeFileSync(join(dir, 'outbox.json'), JSON.stringify(cursors), { mode: 0o600 });
+  };
+
+  it('skips on a Mac that has never recorded a session', async () => {
+    const r = await report(['--offline']);
+    expect(check(r, 'journal')?.status).toBe('skip');
+    expect(check(r, 'journal')?.detail).toContain('no session transcripts');
+  });
+
+  it('reports how much is on disk and how old it is', async () => {
+    writeJournal({ [SES]: { sent: 2, acked: 2 } });
+    const r = await report(['--offline']);
+    expect(check(r, 'journal')?.status).toBe('ok');
+    expect(check(r, 'journal')?.detail).toContain('1 session(s)');
+    expect(check(r, 'journal')?.detail).toContain('every frame confirmed');
+  });
+
+  it('warns when the cloud is behind, and says the frames are not lost', async () => {
+    writeJournal({ [SES]: { sent: 9, acked: 4 } });
+    const r = await report(['--offline']);
+    expect(check(r, 'journal')?.status).toBe('warn');
+    expect(check(r, 'journal')?.detail).toContain('5 frame(s) not confirmed');
+    expect(check(r, 'journal')?.fix).toContain('re-send');
+  });
+});
+
 describe('doctor · keep-awake', () => {
   it('names what the Mac is being held awake for, and that the lid still sleeps it', async () => {
     server = await fakeDaemon(h.home, {

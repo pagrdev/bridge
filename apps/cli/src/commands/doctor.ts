@@ -12,6 +12,7 @@ import {
   hasIdentity,
   inspectConfig,
   inspectJson,
+  journalStats,
   KEEP_AWAKE_ENV,
   LAUNCHCTL,
   launchAgentPlistPath,
@@ -247,6 +248,34 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
         : 'no phone key is pinned — nothing could read a transcript, so none is sent',
     ...(paired && recipientKids.length === 0
       ? { fix: 'open Pagr on your iPhone and sign in; its key is pinned here on the next connect' }
+      : {}),
+  });
+
+  // ---- session journal ----------------------------------------------------
+  // Transcripts live on this Mac, in the clear, because this Mac is where they happened. The
+  // check answers the two questions somebody actually has about that: how much disk is it using,
+  // and is any of it stuck here because the cloud never confirmed it.
+  const journal = journalStats(ctx.paths.journalDir, ctx.paths.outboxFile);
+  const behind = journal.lagging.reduce((n, s) => n + s.behind, 0);
+  add({
+    name: 'journal',
+    status: journal.sessions === 0 ? 'skip' : behind > 0 ? 'warn' : 'ok',
+    detail:
+      journal.sessions === 0
+        ? 'no session transcripts on disk yet'
+        : [
+            `${journal.sessions} session(s), ${formatBytes(journal.bytes)}`,
+            journal.oldestAt ? `oldest ${journal.oldestAt.slice(0, 10)}` : null,
+            behind > 0
+              ? `${behind} frame(s) not confirmed by the cloud across ${journal.lagging.length} session(s)`
+              : 'every frame confirmed by the cloud',
+          ]
+            .filter(Boolean)
+            .join('; '),
+    ...(behind > 0
+      ? {
+          fix: 'they re-send on the next gateway connection; check the `gateway link` row above if that never happens',
+        }
       : {}),
   });
 
@@ -609,6 +638,19 @@ function launchAgentLoadedSafely(ctx: CliContext): boolean {
   } catch {
     return false;
   }
+}
+
+/** Sizes people read at a glance; the exact byte count is never the point here. */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 }
 
 function safeMode(path: string): string | null {

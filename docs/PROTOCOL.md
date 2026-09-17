@@ -21,6 +21,7 @@ auth.response {deviceId, nonce, signature, bridgeVersion, protocolVersion}
                             auth.result {ok, error?, serverKeys?, serverKeysSignature?, minBridgeVersion?}
 event {event: DeviceEvent}  command {envelope: CommandEnvelope}
 pong                        ping
+                            ack {cursors} (v2)
 ```
 
 - `signature` is base64url Ed25519 over the UTF-8 string `${deviceId}.${nonce}` using the device key.
@@ -137,6 +138,7 @@ Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payl
 | `session.event` | progress, messages, completion… | `{ sessionId, projectId, provider, kind, summary ≤ 2000, providerEventId?, at }` |
 | `approval.requested` | agent asked permission | `{ approvalId, sessionId, projectId, provider, providerRequestId, actionType, preview ≤ 1500, previewHash, hints, expiresAt }` |
 | `approval.resolved_locally` | timeout, terminal answer, or shutdown | `{ approvalId, resolution: allowed\|denied\|timed_out\|canceled }` |
+| `session.frame` | one transcript frame, v2 only | `{ sessionId, projectId, provider, seq, kind, at, providerRecordId?, sealed, meta }` — see *Transcript frames and cursors* |
 | `attachment.consumed` | after a download attempt | `{ attachmentId, ok, error? }` |
 
 `errorCode` values: `bad_signature`, `expired`, `replayed`, `wrong_device`, `unknown_project`,
@@ -164,6 +166,58 @@ A session left out is not forgotten — it is still resumable by id and still an
 `agent.get_status`. Statuses in the hello are the real ones: a session this Mac knows finished is
 reported `completed` / `failed` / `stopped`, never downgraded to `idle`, because the cloud upserts
 these summaries and a downgrade shows a dead session on the user's phone as resumable.
+
+## Transcript frames and cursors (protocol v2)
+
+A `session.frame` event carries one piece of a transcript: `{ sessionId, projectId, provider, seq,
+kind, at, providerRecordId?, sealed, meta }`. Everything outside `sealed` is routing metadata the
+cloud indexes on; the body is encrypted for the phones this Mac has pinned and the cloud holds no
+key for it.
+
+- **`seq` is the bridge's.** It is allocated by the per-session journal (`~/.pagr/journal/`) and
+  nowhere else, monotonic from 1, one per frame. That is what makes "the phone has everything up
+  to 412" mean something exact.
+- **Journal first, send second.** The full body is on disk before anything is sealed. A daemon
+  killed in between loses nothing: the frame is journaled with its cursor still behind it.
+- **Chunking.** A body over 160 KiB is split into parts that all carry the same `seq` and `kind`
+  and differ only by `meta.chunk = {group, index, total}`, which is also inside the AAD both
+  crypto layers authenticate. The phone reassembles a group by `index` and parses once.
+- **Caps.** A frame is a live view, not the archive: over 512 KiB the body is clipped and
+  `meta.truncated` is true, with command output keeping its first 8 KiB and last 56 KiB. The whole
+  body stays in the journal for `session.backfill`.
+
+### `ack {cursors}` and resume
+
+```
+gateway → bridge     ack { cursors: { "<sessionId>": <seq>, … } }
+```
+
+The gateway sends it after persisting a batch of frames; `cursors[sessionId]` is the highest `seq`
+it has stored for that session. The bridge keeps `{sent, acked}` per session in
+`~/.pagr/journal/outbox.json` and applies the ack as `acked = max(acked, min(seq, sent))` — never
+backwards, and never past what this bridge actually sent, so a cursor the bridge cannot account for
+can't mark unsent frames as delivered.
+
+On every connection, in this order:
+
+1. `device.hello` — the gateway learns what this Mac is before it is handed any transcript;
+2. every session with `sent > acked`, re-read from the journal and re-sealed, in `seq` order, up
+   to 500 frames per session (the rest follows on the next connection, or a `session.backfill`);
+3. the in-memory buffer of everything else — statuses, acks, heartbeats.
+
+Frames are never held in that in-memory buffer: the journal is their buffer, so a frame produced
+while the socket is down goes out exactly once, from disk, when it comes back. The gateway
+de-duplicates on `(sessionId, seq, kind)`, so a re-send after an ack that never arrived is
+harmless.
+
+Frames are v2-only. Against a gateway that negotiated v1 they are journaled and nothing is sent,
+`sent` stays where it was, and the backlog goes out unchanged the first time a v2 gateway answers.
+With no phone key pinned the same thing happens for a different reason: nothing in the world could
+open the envelope, so none is made (`pagr doctor` says so under *phone keys*, and *journal* reports
+how much is waiting).
+
+Implementation: `packages/core/src/{frames,journal}.ts`, `Dispatcher.emitFrame`,
+`GatewayClient.resume`.
 
 ## Approval hints
 
