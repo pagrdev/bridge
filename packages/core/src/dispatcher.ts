@@ -125,6 +125,11 @@ export interface DispatcherOptions {
    * `auth.result` and changes live on `keys.updated`.
    */
   recipientKeyIds?: () => string[];
+  /**
+   * Called whenever the set of pending approvals changes. The daemon uses it to hold the Mac
+   * awake while somebody still has a prompt to answer; nothing in the dispatcher depends on it.
+   */
+  onApprovalsChange?: () => void;
 }
 
 /**
@@ -161,6 +166,7 @@ export class Dispatcher {
       now: this.now,
       onResolveError: (approvalId, err) =>
         this.logger.warn('approval resolution failed', { approvalId, error: String(err) }),
+      ...(o.onApprovalsChange ? { onChange: o.onApprovalsChange } : {}),
     });
     for (const adapter of o.adapters.values()) {
       this.unsubscribes.push(

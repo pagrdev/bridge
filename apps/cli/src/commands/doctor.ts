@@ -8,9 +8,11 @@ import {
   DEVICE_FLOOR_ENV,
   DeviceFloor,
   describeClockSkew,
+  describeKeepAwake,
   hasIdentity,
   inspectConfig,
   inspectJson,
+  KEEP_AWAKE_ENV,
   LAUNCHCTL,
   launchAgentPlistPath,
   launchAgentStaleReason,
@@ -456,6 +458,28 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
             : 'follow-ups are queued, not steered (channel mode off — this is the default)',
     ...(status && channel?.enabled && !channel.canSteerLive
       ? { fix: `start Claude Code with \`${LAUNCH_COMMAND}\` inside a registered project` }
+      : {}),
+  });
+
+  // ---- keep-awake ---------------------------------------------------------
+  // Two things people need to know and cannot see: whether the Mac is being held awake right
+  // now, and that closing the lid still sleeps it. Pagr asserts against IDLE sleep only, so
+  // saying "your Mac will stay awake" without that qualifier would be a lie people discover at
+  // the worst possible moment.
+  const keepAwake = status?.keepAwake ?? null;
+  // Only a darwin daemon ever reports keep-awake as enabled, so "enabled" is the honest test for
+  // whether the lid caveat applies — not this CLI's own platform.
+  const lidNote = ' — closing the lid still sleeps the Mac; only idle sleep is prevented';
+  add({
+    name: 'keep-awake',
+    status: !status ? 'skip' : keepAwake === null ? 'skip' : keepAwake.disabled ? 'skip' : 'ok',
+    detail: !status
+      ? 'daemon not running'
+      : keepAwake === null
+        ? 'the daemon did not report keep-awake (older bridge?)'
+        : `${describeKeepAwake(keepAwake)}${keepAwake.disabled ? '' : lidNote}`,
+    ...(keepAwake?.disabled && keepAwake.disabledReason === 'opt_out'
+      ? { fix: `unset ${KEEP_AWAKE_ENV} on the daemon to let Pagr hold the Mac awake again` }
       : {}),
   });
 

@@ -75,6 +75,12 @@ export class SessionStore {
   constructor(
     private readonly file?: string,
     private readonly now: () => Date = () => new Date(),
+    /**
+     * Called after every change to the store. One choke point, because "a session became live /
+     * stopped being live" is derived state several callers care about (keep-awake holds the Mac
+     * on it) and every mutation here already funnels through `persist`.
+     */
+    private readonly onChange?: () => void,
   ) {
     if (file) {
       const raw = readJson<Record<string, SessionRecord>>(file, {});
@@ -192,5 +198,6 @@ export class SessionStore {
   }
   private persist(): void {
     if (this.file) writeJson(this.file, Object.fromEntries(this.map));
+    this.onChange?.();
   }
 }

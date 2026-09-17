@@ -495,6 +495,58 @@ describe('doctor · phone keys', () => {
   });
 });
 
+describe('doctor · keep-awake', () => {
+  it('names what the Mac is being held awake for, and that the lid still sleeps it', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () =>
+        daemonStatus({
+          keepAwake: { active: true, disabled: false, reasons: { sessions: 2, approvals: 1 } },
+        }),
+    });
+    const r = await report(['--offline']);
+    const c = check(r, 'keep-awake');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('active (2 sessions, 1 approval)');
+    expect(c?.detail).toContain('closing the lid still sleeps the Mac');
+  });
+
+  it('says idle when nothing is holding it', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () => daemonStatus({ keepAwake: { active: false, disabled: false, reasons: {} } }),
+    });
+    const r = await report(['--offline']);
+    expect(check(r, 'keep-awake')?.status).toBe('ok');
+    expect(check(r, 'keep-awake')?.detail).toContain('idle');
+  });
+
+  it('names the opt-out by its exact variable, and does not call it a failure', async () => {
+    server = await fakeDaemon(h.home, {
+      status: () =>
+        daemonStatus({
+          keepAwake: { active: false, disabled: true, disabledReason: 'opt_out', reasons: {} },
+        }),
+    });
+    const r = await report(['--offline']);
+    const c = check(r, 'keep-awake');
+    expect(c?.status).toBe('skip');
+    expect(c?.detail).toBe('disabled (PAGR_KEEP_AWAKE=0)');
+    expect(c?.fix).toContain('PAGR_KEEP_AWAKE');
+  });
+
+  it('skips rather than guessing when an older daemon reports no keep-awake at all', async () => {
+    server = await fakeDaemon(h.home, { status: () => daemonStatus() });
+    const r = await report(['--offline']);
+    expect(check(r, 'keep-awake')?.status).toBe('skip');
+    expect(check(r, 'keep-awake')?.detail).toContain('older bridge');
+  });
+
+  it('skips the check entirely when the daemon is down', async () => {
+    const r = await report(['--offline']);
+    expect(check(r, 'keep-awake')?.status).toBe('skip');
+    expect(check(r, 'keep-awake')?.detail).toContain('daemon not running');
+  });
+});
+
 describe('doctor · Claude Code live steering', () => {
   it('says follow-ups are queued when channel mode is off', async () => {
     server = await fakeDaemon(h.home, {

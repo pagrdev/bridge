@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -21,6 +22,7 @@ import {
 import { DaemonAlreadyRunningError } from './daemonLock.js';
 import { InvalidDeviceKeyError, verifyRaw } from './identity.js';
 import { IpcClient } from './ipc.js';
+import type { KeepAwakeSpawn } from './keepAwake.js';
 import { MemorySecretStore, SecretStoreError } from './keychain.js';
 import { DAEMON_EXIT } from './launchAgent.js';
 import { PagrHomeError } from './paths.js';
@@ -990,5 +992,158 @@ describe('a refused device does not keep hammering the gateway (BR-5)', () => {
     } finally {
       await paired.stop();
     }
+  });
+});
+
+describe('daemon · keep-awake', () => {
+  const t = useTempHome('pagr-awake-');
+  const deviceId = ids.dev();
+  let calls: Array<[string, string[]]>;
+  let children: Array<{ kill: (s?: NodeJS.Signals | number) => boolean; killed: boolean }>;
+  let daemon: Daemon | null;
+  let codex: FakeAdapter;
+
+  /** Records argv and hands back a controllable child: no real `caffeinate` is ever run. */
+  const spawn: KeepAwakeSpawn = (command, args) => {
+    calls.push([command, args]);
+    const emitter = new EventEmitter();
+    const child = Object.assign(emitter, {
+      killed: false,
+      kill(_signal?: NodeJS.Signals | number) {
+        child.killed = true;
+        return true;
+      },
+    });
+    children.push(child);
+    return child;
+  };
+
+  const build = async (): Promise<{ d: Daemon; projectId: string }> => {
+    const home = join(t.home, 'pagr');
+    mkdirSync(home, { recursive: true });
+    const repo = join(t.home, 'repo');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    codex = new FakeAdapter('codex');
+    const d = await createDaemon({
+      home,
+      adapters: new Map<Provider, CodingAgentAdapter>([['codex', codex]]),
+      secretStore: new MemorySecretStore(),
+      // Not the suite's environment: this is one of the few tests that wants keep-awake ON.
+      env: {},
+      spawn,
+      keepAwakeHysteresisMs: 60_000,
+    });
+    daemon = d;
+    return { d, projectId: d.registry.add(repo).projectId };
+  };
+
+  const start = (d: Daemon, projectId: string, sessionId: string, readOnly = false) =>
+    d.dispatcher.handle(
+      makeBody(
+        'agent.start_session',
+        { provider: 'codex', projectId, instruction: 'go', sessionId, attachments: [], readOnly },
+        { deviceId },
+      ),
+    );
+
+  beforeEach(() => {
+    calls = [];
+    children = [];
+    daemon = null;
+  });
+  afterEach(async () => {
+    await daemon?.stop();
+    daemon = null;
+    vi.useRealTimers();
+  });
+
+  it('holds the Mac awake while a session is live, and lets go once it completes', async () => {
+    const { d, projectId } = await build();
+    expect(d.keepAwake.status().active).toBe(false);
+
+    const sessionId = ids.ses();
+    await start(d, projectId, sessionId);
+    expect(calls).toEqual([['/usr/bin/caffeinate', ['-i', '-w', String(process.pid)]]]);
+    expect(d.keepAwake.status().reasons).toEqual({ sessions: 1 });
+
+    d.sessions.setStatus(sessionId, 'completed');
+    expect(d.keepAwake.status().reasons).toEqual({});
+    // Still asserted: the hysteresis window is what stops back-to-back turns churning the child.
+    expect(children[0]?.killed).toBe(false);
+  });
+
+  it('counts every live session, so one ending does not release the others', async () => {
+    const { d, projectId } = await build();
+    const a = ids.ses();
+    const b = ids.ses();
+    await start(d, projectId, a);
+    // Read-only, because two writers in one tree is what `SessionGuard` exists to refuse.
+    await start(d, projectId, b, true);
+    expect(d.keepAwake.status().reasons).toEqual({ sessions: 2 });
+
+    d.sessions.setStatus(a, 'completed');
+    expect(d.keepAwake.status().reasons).toEqual({ sessions: 1 });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('holds while an approval is pending and releases when it is answered', async () => {
+    const { d, projectId } = await build();
+    const sessionId = ids.ses();
+    await start(d, projectId, sessionId);
+    d.sessions.setStatus(sessionId, 'completed');
+    expect(d.keepAwake.status().reasons).toEqual({});
+
+    const record = d.dispatcher.requestApproval({
+      sessionId,
+      projectId,
+      provider: 'codex',
+      providerRequestId: 'req-1',
+      actionType: 'command_execution',
+      preview: 'rm -rf build',
+      onDecision: () => {},
+    });
+    expect(d.keepAwake.status().reasons).toEqual({ approvals: 1 });
+
+    await d.dispatcher.approvals.resolveLocally(record.approvalId, 'canceled');
+    expect(d.keepAwake.status().reasons).toEqual({});
+  });
+
+  it('reports keep-awake through the IPC status, as an optional field', async () => {
+    const { d, projectId } = await build();
+    await d.start();
+    await start(d, projectId, ids.ses());
+    const status = await new IpcClient(d.paths.socketPath).call<{
+      keepAwake?: { active: boolean; disabled: boolean; reasons: Record<string, number> };
+    }>('status');
+    expect(status.keepAwake).toEqual({ active: true, disabled: false, reasons: { sessions: 1 } });
+  });
+
+  it('kills the assertion at shutdown rather than waiting out the hysteresis', async () => {
+    const { d, projectId } = await build();
+    await start(d, projectId, ids.ses());
+    expect(children[0]?.killed).toBe(false);
+
+    await d.stop();
+    daemon = null;
+    expect(children[0]?.killed).toBe(true);
+  });
+
+  it('PAGR_KEEP_AWAKE=0 means a live session spawns nothing at all', async () => {
+    const home = join(t.home, 'optout');
+    mkdirSync(home, { recursive: true });
+    const repo = join(t.home, 'optout-repo');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    const d = await createDaemon({
+      home,
+      adapters: new Map<Provider, CodingAgentAdapter>([['codex', new FakeAdapter('codex')]]),
+      secretStore: new MemorySecretStore(),
+      env: { PAGR_KEEP_AWAKE: '0' },
+      spawn,
+    });
+    daemon = d;
+    await start(d, d.registry.add(repo).projectId, ids.ses());
+
+    expect(calls).toHaveLength(0);
+    expect(d.status().keepAwake).toMatchObject({ active: false, disabled: true });
   });
 });
