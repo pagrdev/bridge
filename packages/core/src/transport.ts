@@ -8,11 +8,13 @@ import {
   SERVER_KEY_SET_CONTEXT,
 } from '@pagr/protocol';
 import WebSocket from 'ws';
+import { z } from 'zod';
 import { compareVersions, makeEvent } from './events.js';
 import type { DeviceIdentity } from './identity.js';
 import { verifyRaw } from './identity.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
+import { importRecipientKeys, SealError } from './seal.js';
 
 export type TransportState =
   | 'idle'
@@ -95,6 +97,11 @@ export interface GatewayClientOptions {
   onCommand: (envelope: unknown) => void;
   /** Called only when an ACCEPTED key set differs from the pinned one. Persisting is the caller's job. */
   onServerKeys?: (keys: Record<string, string>) => void;
+  /**
+   * Called only when an ACCEPTED recipient key set differs from the pinned one (the phones this
+   * Mac seals frames for). Persisting into `config.json` is the caller's job.
+   */
+  onRecipientKeys?: (keys: Record<string, string>) => void;
   activeSessions?: () => number;
   /** Heartbeat + liveness probe period. Default 20 s. */
   heartbeatMs?: number;
@@ -128,6 +135,11 @@ export interface GatewayClientOptions {
    * is only accepted with a `serverKeysSignature` from a key that is already pinned.
    */
   serverKeys?: Record<string, string>;
+  /**
+   * Recipient keys (`kid` → base64url raw X25519 public key) pinned in `config.json`. Same
+   * acceptance rule as `serverKeys`, except that the signature comes from a pinned SERVER key.
+   */
+  recipientKeys?: Record<string, string>;
   /** Environment used for the transport-security checks (defaults to `process.env`). */
   env?: NodeJS.ProcessEnv;
 }
@@ -151,14 +163,38 @@ export function assertSecureGatewayUrl(url: string, env: NodeJS.ProcessEnv = pro
   );
 }
 
-export interface ServerKeySignature {
+/** `{keyId, signature}` — a detached Ed25519 signature by a key the bridge already trusts. */
+export interface KeySetSignature {
   keyId: string;
   signature: string;
 }
+/** The original name, kept so nothing downstream has to be renamed. */
+export type ServerKeySignature = KeySetSignature;
 
-export type ServerKeyDecision =
+export type KeySetDecision =
   | { accept: true; reason: 'first-pin' | 'unchanged' | 'narrowed' | 'signed' }
   | { accept: false; reason: 'unsigned-change' | 'unknown-signer' | 'bad-signature' };
+export type ServerKeyDecision = KeySetDecision;
+
+/**
+ * Resolves a `keyId` to a trusted signer and checks the signature. Split out so the two key sets
+ * can trust different things: a server key set is vouched for by the server keys already pinned,
+ * while a RECIPIENT key set (the user's phones) is vouched for by a pinned SERVER key — the
+ * phones never sign anything.
+ */
+export type KeySetVerify = (
+  signature: KeySetSignature,
+  payload: string,
+) => 'ok' | 'unknown-signer' | 'bad-signature';
+
+/** The usual verifier: the signature must come from one of `signers`, keyed by `keyId`. */
+export const signedByOneOf =
+  (signers: Record<string, string>): KeySetVerify =>
+  (signature, payload) => {
+    const signer = signers[signature.keyId];
+    if (!signer) return 'unknown-signer';
+    return verifyRaw(signer, payload, signature.signature) ? 'ok' : 'bad-signature';
+  };
 
 /** True when `incoming` grants no trust `pinned` did not already grant. */
 export function isNarrowingKeySet(
@@ -172,36 +208,164 @@ export const sameKeySet = (a: Record<string, string>, b: Record<string, string>)
   canonicalize(a) === canonicalize(b);
 
 /**
- * Decide whether an `auth.result` may replace the pinned server key set (SEC-7).
+ * Decide whether an incoming key set may replace the pinned one (SEC-7). One rule, two uses:
+ * the gateway's command-signing keys, and the recipient keys frames are sealed for.
  *
  * The old rule — "accept any set that overlaps the pinned one by a single key" — let anybody who
  * obtained one server key hand the bridge an extra key of their own, which the bridge then
- * persisted and trusted forever. `auth.result` is not itself signed, so it cannot authenticate a
- * widening of trust on its own.
+ * persisted and trusted forever. Neither `auth.result` nor `keys.updated` is itself signed, so
+ * neither can authenticate a widening of trust on its own.
  *
  * What is safe unsigned is anything that grants no NEW trust: the same set again, or a smaller
- * one (the retiring half of a rotation). Adding a key id, or changing what a pinned id maps to,
- * must carry `serverKeysSignature` — a signature by a key the bridge already trusts over
- * `SERVER_KEY_SET_CONTEXT + canonicalize(incoming)`. That keeps rotation working (publish the new
- * key signed by the outgoing one, then drop the outgoing one unsigned) while making additive
+ * one (the retiring half of a rotation, or a phone the user just revoked). Adding a key id, or
+ * changing what a pinned id maps to, must carry a signature by a key the bridge already trusts
+ * over `context + canonicalize(signedOver ?? incoming)`. That keeps rotation working (publish the
+ * new key signed by the outgoing one, then drop the outgoing one unsigned) while making additive
  * poisoning impossible for anyone who does not hold a trusted private key.
+ *
+ * `signedOver` exists because the two sets are signed over different documents: a server key set
+ * is signed as the `keyId → key` map itself, while a recipient key set is signed as the whole
+ * `{v, userId, keys, features, issuedAt}` set the cloud issued, exactly as it was received.
  */
-export function evaluateServerKeys(
+export function evaluateKeySet(
   pinned: Record<string, string>,
   incoming: Record<string, string>,
-  signature?: ServerKeySignature | undefined,
-): ServerKeyDecision {
+  signature: KeySetSignature | undefined,
+  verify: KeySetVerify,
+  context: string,
+  signedOver?: unknown,
+): KeySetDecision {
   if (Object.keys(pinned).length === 0) return { accept: true, reason: 'first-pin' };
   if (sameKeySet(pinned, incoming)) return { accept: true, reason: 'unchanged' };
   if (isNarrowingKeySet(pinned, incoming)) return { accept: true, reason: 'narrowed' };
   if (!signature) return { accept: false, reason: 'unsigned-change' };
-  const signer = pinned[signature.keyId];
-  if (!signer) return { accept: false, reason: 'unknown-signer' };
-  const payload = `${SERVER_KEY_SET_CONTEXT}${canonicalize(incoming)}`;
-  return verifyRaw(signer, payload, signature.signature)
-    ? { accept: true, reason: 'signed' }
-    : { accept: false, reason: 'bad-signature' };
+  const payload = `${context}${canonicalize(signedOver === undefined ? incoming : signedOver)}`;
+  const verdict = verify(signature, payload);
+  return verdict === 'ok' ? { accept: true, reason: 'signed' } : { accept: false, reason: verdict };
 }
+
+/** `evaluateKeySet` for the gateway's command-signing keys: the pinned keys vouch for changes. */
+export function evaluateServerKeys(
+  pinned: Record<string, string>,
+  incoming: Record<string, string>,
+  signature?: KeySetSignature | undefined,
+): KeySetDecision {
+  return evaluateKeySet(pinned, incoming, signature, signedByOneOf(pinned), SERVER_KEY_SET_CONTEXT);
+}
+
+// ---------- recipient keys (the phones a frame is sealed for) ----------
+
+/**
+ * Domain separator for `recipientKeysSignature`, so no other Pagr signature can be replayed as
+ * one. Moves to `@pagr/protocol` when MOB-030 merges.
+ */
+export const RECIPIENT_KEY_SET_CONTEXT = 'pagr.recipient-keys.v1:';
+
+/**
+ * The recipient key set as the cloud issues it. Moves to `@pagr/protocol` when MOB-030 merges.
+ *
+ * Parsed permissively on purpose: the SIGNATURE is checked over the object exactly as it arrived,
+ * never over this parse, because zod strips unknown keys and a newer gateway that adds a field
+ * would otherwise fail to verify against its own signature.
+ */
+export const RecipientKeyEntry = z.object({
+  kid: z.string().min(1).max(64),
+  x25519: z.string().min(1).max(128),
+  name: z.string().max(120).optional(),
+  registeredAt: z.string().optional(),
+});
+export const RecipientKeySetDoc = z.object({
+  v: z.literal(1),
+  userId: z.string().min(1),
+  keys: z.array(RecipientKeyEntry).max(32),
+  features: z.object({ imessage: z.boolean() }).optional(),
+  issuedAt: z.string().optional(),
+});
+export type RecipientKeySetDoc = z.infer<typeof RecipientKeySetDoc>;
+
+export const KeySetSignatureSchema = z.object({
+  keyId: z.string().min(1).max(32),
+  signature: z.string().min(1).max(200),
+});
+
+export type RecipientKeyDecision =
+  | {
+      accept: true;
+      reason: 'first-pin' | 'unchanged' | 'narrowed' | 'signed';
+      keys: Record<string, string>;
+      features: { imessage: boolean } | null;
+      userId: string;
+    }
+  | {
+      accept: false;
+      reason: 'unsigned-change' | 'unknown-signer' | 'bad-signature' | 'invalid-set' | 'bad-keys';
+      detail?: string;
+    };
+
+/**
+ * Decide whether a recipient key set off the wire may replace the pinned one.
+ *
+ * Three things have to hold before a phone is sealed for: the set parses, every key is a real
+ * X25519 key that fingerprints to the `kid` it is filed under (`importRecipientKeys`), and the
+ * change is either trust-narrowing or signed by a pinned SERVER key. Adding a phone is a
+ * widening — it is exactly the move a compromised gateway would make — so it always needs the
+ * signature, and the fingerprints are shown on both ends so the user can check them.
+ */
+export function evaluateRecipientKeys(
+  pinned: Record<string, string>,
+  incoming: unknown,
+  signature: KeySetSignature | undefined,
+  serverKeys: Record<string, string>,
+): RecipientKeyDecision {
+  const parsed = RecipientKeySetDoc.safeParse(incoming);
+  if (!parsed.success)
+    return {
+      accept: false,
+      reason: 'invalid-set',
+      detail: parsed.error.issues[0]?.message ?? 'not a recipient key set',
+    };
+  const keys: Record<string, string> = {};
+  for (const k of parsed.data.keys) keys[k.kid] = k.x25519;
+  try {
+    importRecipientKeys(keys);
+  } catch (err) {
+    return {
+      accept: false,
+      reason: 'bad-keys',
+      detail: err instanceof SealError ? err.message : String(err),
+    };
+  }
+  const decision = evaluateKeySet(
+    pinned,
+    keys,
+    signature,
+    signedByOneOf(serverKeys),
+    RECIPIENT_KEY_SET_CONTEXT,
+    incoming,
+  );
+  if (!decision.accept) return decision;
+  return {
+    accept: true,
+    reason: decision.reason,
+    keys,
+    features: parsed.data.features ?? null,
+    userId: parsed.data.userId,
+  };
+}
+
+/** The v2 fields on `auth.result`. A v1 gateway sends none of them. Moves to `@pagr/protocol`. */
+const AuthResultV2Extras = z.object({
+  recipientKeys: z.unknown().optional(),
+  recipientKeysSignature: KeySetSignatureSchema.optional(),
+  features: z.object({ imessage: z.boolean() }).optional(),
+});
+
+/** The gateway's live key-set push. Moves to `@pagr/protocol` when MOB-030 merges. */
+const KeysUpdatedFrame = z.object({
+  kind: z.literal('keys.updated'),
+  recipientKeys: z.unknown(),
+  recipientKeysSignature: KeySetSignatureSchema.optional(),
+});
 
 export interface GatewayClientEvents {
   connected: [];
@@ -243,6 +407,10 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
   private readonly monotonicNow: () => number;
   private readonly WS: typeof WebSocket;
   serverKeys: Record<string, string> = {};
+  /** The phones every sealed frame is encrypted for. Empty until a phone is paired. */
+  recipientKeys: Record<string, string> = {};
+  /** `auth.result.features` / the signed set's `features`, once a v2 gateway has sent them. */
+  features: { imessage: boolean } | null = null;
   /** Why the transport is in a terminal state, for `pagr status` and the logs. */
   lastFailure: AuthFailure | null = null;
 
@@ -250,6 +418,7 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
     super();
     assertSecureGatewayUrl(opts.url, opts.env);
     this.serverKeys = { ...(opts.serverKeys ?? {}) };
+    this.recipientKeys = { ...(opts.recipientKeys ?? {}) };
     this.logger = opts.logger ?? silentLogger;
     this.heartbeatMs = opts.heartbeatMs ?? 20_000;
     this.livenessTimeoutMs = opts.livenessTimeoutMs ?? this.heartbeatMs * 3;
@@ -270,6 +439,14 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
   }
   get bufferedCount(): number {
     return this.buffer.length;
+  }
+  /** Pinned recipient key ids, sorted — what `device.hello` v2 reports as `recipientKeyIds`. */
+  recipientKeyIds(): string[] {
+    return Object.keys(this.recipientKeys).sort();
+  }
+  /** True when nothing can open a sealed frame yet, so sealing is skipped and frames stay local. */
+  get sealsToNobody(): boolean {
+    return Object.keys(this.recipientKeys).length === 0;
   }
 
   /** States the client will never leave on its own; only `start()` clears them. */
@@ -362,6 +539,23 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
       this.logger.warn('gateway sent non-JSON frame');
       return;
     }
+    // `keys.updated` is a v2 frame and `GatewayFrame` is a closed v1 union, so it is handled
+    // before the union sees it. It moves into `GatewayFrame` when MOB-030 merges.
+    if ((json as { kind?: unknown } | null)?.kind === 'keys.updated') {
+      const update = KeysUpdatedFrame.safeParse(json);
+      if (!update.success) {
+        this.logger.warn('gateway sent an invalid keys.updated frame', {
+          issue: update.error.issues[0]?.message,
+        });
+        return;
+      }
+      this.applyRecipientKeys(
+        update.data.recipientKeys,
+        update.data.recipientKeysSignature,
+        'keys.updated',
+      );
+      return;
+    }
     const parsed = GatewayFrame.safeParse(json);
     if (!parsed.success) {
       this.logger.warn('gateway sent invalid frame', { issue: parsed.error.issues[0]?.message });
@@ -400,6 +594,18 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
           return;
         }
         if (frame.serverKeys) this.applyServerKeys(frame.serverKeys, frame.serverKeysSignature);
+        // The v2 fields are read from the raw frame: `GatewayFrame` is the v1 union and zod has
+        // already stripped anything it does not know about. A v1 gateway sends none of them.
+        const v2 = AuthResultV2Extras.safeParse(json);
+        if (v2.success) {
+          if (v2.data.features) this.features = v2.data.features;
+          if (v2.data.recipientKeys !== undefined)
+            this.applyRecipientKeys(
+              v2.data.recipientKeys,
+              v2.data.recipientKeysSignature,
+              'auth.result',
+            );
+        }
         this.state_ = 'connected';
         this.attempt = 0;
         this.retryFloorMs = 0;
@@ -473,6 +679,44 @@ export class GatewayClient extends EventEmitter<GatewayClientEvents> {
     });
     this.serverKeys = { ...incoming };
     this.opts.onServerKeys?.({ ...incoming });
+  }
+
+  /**
+   * Pin an incoming recipient key set, or refuse it loudly.
+   *
+   * A refusal is never fatal to the connection: the bridge keeps the phones it already trusts and
+   * carries on. That is the safe failure — frames stay readable by the phones the user pinned,
+   * and a gateway that tried to add one of its own gets nothing.
+   */
+  private applyRecipientKeys(
+    incoming: unknown,
+    signature: KeySetSignature | undefined,
+    source: 'auth.result' | 'keys.updated',
+  ): void {
+    const decision = evaluateRecipientKeys(
+      this.recipientKeys,
+      incoming,
+      signature,
+      this.serverKeys,
+    );
+    if (!decision.accept) {
+      this.logger.error('refusing a recipient key set', {
+        source,
+        reason: decision.reason,
+        ...(decision.detail ? { detail: decision.detail } : {}),
+        pinned: Object.keys(this.recipientKeys),
+      });
+      return;
+    }
+    if (decision.features) this.features = decision.features;
+    if (sameKeySet(this.recipientKeys, decision.keys)) return;
+    this.logger.info('recipient key set updated', {
+      source,
+      reason: decision.reason,
+      keys: Object.keys(decision.keys).sort(),
+    });
+    this.recipientKeys = { ...decision.keys };
+    this.opts.onRecipientKeys?.({ ...decision.keys });
   }
 
   private flush(): void {

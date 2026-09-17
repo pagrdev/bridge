@@ -18,13 +18,19 @@ import {
 } from './identity.js';
 import { MemorySecretStore } from './keychain.js';
 import { type Logger, silentLogger } from './logging.js';
+import { generateRecipientKeyPair, importRecipientKeys, openFrame, sealFrame } from './seal.js';
 import { ids } from './testFixtures.js';
 import {
   CLOSE_REPLACED,
   classifyAuthFailure,
+  evaluateKeySet,
+  evaluateRecipientKeys,
   evaluateServerKeys,
   GatewayClient,
+  type KeySetSignature,
   MAX_FRAME_BYTES,
+  RECIPIENT_KEY_SET_CONTEXT,
+  signedByOneOf,
 } from './transport.js';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -50,6 +56,13 @@ interface FakeGateway {
   serverKeys: Record<string, string> | null;
   /** Detached signature over the key set, as a real rotation would carry. */
   keySignature: { keyId: string; signature: string } | null;
+  /** v2 `auth.result.recipientKeys`: the signed set of phones. Null sends none (a v1 gateway). */
+  recipientKeys: unknown | null;
+  recipientKeysSignature: { keyId: string; signature: string } | null;
+  /** v2 `auth.result.features`. */
+  features: { imessage: boolean } | null;
+  /** Send a frame the v1 `GatewayFrame` union does not know about (e.g. `keys.updated`). */
+  sendRaw(f: unknown): void;
   /** Gateway hub behaviour: a newer connection evicts the older one with 4000. */
   replaceOlder: boolean;
   /** Accept the socket and then say nothing at all (a black-hole proxy). */
@@ -71,6 +84,12 @@ async function startFakeGateway(publicKeyRaw: string, deviceId: string): Promise
     authError: 'bad_signature',
     serverKeys: { k1: 'AAAA' },
     keySignature: null,
+    recipientKeys: null,
+    recipientKeysSignature: null,
+    features: null,
+    sendRaw: (f) => {
+      for (const s of gw.sockets) if (s.readyState === WebSocket.OPEN) s.send(JSON.stringify(f));
+    },
     replaceOlder: false,
     silent: false,
     authAttempts: 0,
@@ -108,6 +127,11 @@ async function startFakeGateway(publicKeyRaw: string, deviceId: string): Promise
             ? {
                 ...(gw.serverKeys ? { serverKeys: gw.serverKeys } : {}),
                 ...(gw.keySignature ? { serverKeysSignature: gw.keySignature } : {}),
+                ...(gw.recipientKeys ? { recipientKeys: gw.recipientKeys } : {}),
+                ...(gw.recipientKeysSignature
+                  ? { recipientKeysSignature: gw.recipientKeysSignature }
+                  : {}),
+                ...(gw.features ? { features: gw.features } : {}),
               }
             : { error: gw.authError }),
           ...(gw.minBridgeVersion ? { minBridgeVersion: gw.minBridgeVersion } : {}),
@@ -544,5 +568,407 @@ describe('server key rotation (SEC-7)', () => {
         signature: signKeySet(a.pem, added),
       }),
     ).toEqual({ accept: true, reason: 'signed' });
+  });
+});
+
+describe('recipient key set (MOB-031)', () => {
+  const signer = () => {
+    const kp = generateKeyPairPem();
+    return { pem: kp.privateKeyPem, raw: rawPublicKeyFromPem(kp.publicKeyPem) };
+  };
+  const phones = [
+    generateRecipientKeyPair(),
+    generateRecipientKeyPair(),
+    generateRecipientKeyPair(),
+  ];
+  const userId = ids.usr();
+  /** The set exactly as the cloud issues and signs it. */
+  const setOf = (
+    keys: Array<{ kid: string; publicKeyB64u: string }>,
+    over: Record<string, unknown> = {},
+  ) => ({
+    v: 1,
+    userId,
+    keys: keys.map((k, i) => ({
+      kid: k.kid,
+      x25519: k.publicKeyB64u,
+      name: `iPhone ${i + 1}`,
+      registeredAt: '2026-09-17T00:00:00.000Z',
+    })),
+    features: { imessage: true },
+    issuedAt: '2026-09-17T00:00:00.000Z',
+    ...over,
+  });
+  const sign = (pem: string, set: unknown): KeySetSignature => ({
+    keyId: 'k1',
+    signature: signWithPem(pem, `${RECIPIENT_KEY_SET_CONTEXT}${canonicalize(set)}`),
+  });
+  const flat = (keys: Array<{ kid: string; publicKeyB64u: string }>) =>
+    Object.fromEntries(keys.map((k) => [k.kid, k.publicKeyB64u]));
+
+  it('pins the first set unsigned, re-accepts it unchanged, and narrows unsigned', () => {
+    const cloud = signer();
+    const one = setOf([phones[0] as (typeof phones)[0]]);
+    const first = evaluateRecipientKeys({}, one, undefined, { k1: cloud.raw });
+    expect(first).toMatchObject({ accept: true, reason: 'first-pin' });
+    if (!first.accept) throw new Error('unreachable');
+    expect(first.keys).toEqual(flat([phones[0] as (typeof phones)[0]]));
+    expect(first.features).toEqual({ imessage: true });
+    expect(first.userId).toBe(userId);
+
+    const pinned = flat([phones[0] as (typeof phones)[0], phones[1] as (typeof phones)[1]]);
+    expect(
+      evaluateRecipientKeys(
+        pinned,
+        setOf([phones[0] as (typeof phones)[0], phones[1] as (typeof phones)[1]]),
+        undefined,
+        {
+          k1: cloud.raw,
+        },
+      ),
+    ).toMatchObject({ accept: true, reason: 'unchanged' });
+    // The user revoked a phone in the dashboard: dropping a key grants nothing new.
+    expect(
+      evaluateRecipientKeys(pinned, setOf([phones[0] as (typeof phones)[0]]), undefined, {
+        k1: cloud.raw,
+      }),
+    ).toMatchObject({ accept: true, reason: 'narrowed' });
+  });
+
+  it('refuses an added phone that no pinned server key vouched for', () => {
+    const cloud = signer();
+    const attacker = signer();
+    const pinned = flat([phones[0] as (typeof phones)[0]]);
+    const widened = setOf([phones[0] as (typeof phones)[0], phones[1] as (typeof phones)[1]]);
+    // A compromised gateway adding a key of its own is the whole threat: it would be able to
+    // read every frame from that moment on, so this MUST be the signed path.
+    expect(evaluateRecipientKeys(pinned, widened, undefined, { k1: cloud.raw })).toEqual({
+      accept: false,
+      reason: 'unsigned-change',
+    });
+    expect(
+      evaluateRecipientKeys(pinned, widened, sign(attacker.pem, widened), { k1: cloud.raw }),
+    ).toEqual({ accept: false, reason: 'bad-signature' });
+    expect(
+      evaluateRecipientKeys(pinned, widened, { keyId: 'k9', signature: 'x' }, { k1: cloud.raw }),
+    ).toEqual({ accept: false, reason: 'unknown-signer' });
+    // A signature over a DIFFERENT set does not carry over to this one.
+    const other = setOf([phones[0] as (typeof phones)[0], phones[2] as (typeof phones)[2]]);
+    expect(
+      evaluateRecipientKeys(pinned, widened, sign(cloud.pem, other), { k1: cloud.raw }),
+    ).toEqual({ accept: false, reason: 'bad-signature' });
+  });
+
+  it('accepts an addition and a re-point when a pinned server key signs them', () => {
+    const cloud = signer();
+    const pinned = flat([phones[0] as (typeof phones)[0]]);
+    const widened = setOf([phones[0] as (typeof phones)[0], phones[1] as (typeof phones)[1]]);
+    expect(
+      evaluateRecipientKeys(pinned, widened, sign(cloud.pem, widened), { k1: cloud.raw }),
+    ).toMatchObject({ accept: true, reason: 'signed' });
+    // Re-pointing an existing kid is a widening too — but a kid IS its key's fingerprint, so the
+    // re-point has to keep the pair consistent or `importRecipientKeys` refuses it first.
+    const repointed = {
+      ...setOf([phones[1] as (typeof phones)[1]]),
+      keys: [
+        {
+          kid: (phones[1] as (typeof phones)[1]).kid,
+          x25519: (phones[1] as (typeof phones)[1]).publicKeyB64u,
+          name: 'iPhone 1',
+          registeredAt: '2026-09-17T00:00:00.000Z',
+        },
+      ],
+    };
+    expect(
+      evaluateRecipientKeys(pinned, repointed, sign(cloud.pem, repointed), { k1: cloud.raw }),
+    ).toMatchObject({ accept: true, reason: 'signed' });
+  });
+
+  it('refuses a set that is malformed, or whose key does not fingerprint to its kid', () => {
+    const cloud = signer();
+    expect(
+      evaluateRecipientKeys({}, { v: 2, userId, keys: [] }, undefined, { k1: cloud.raw }),
+    ).toMatchObject({
+      accept: false,
+      reason: 'invalid-set',
+    });
+    expect(evaluateRecipientKeys({}, 'nope', undefined, { k1: cloud.raw })).toMatchObject({
+      accept: false,
+      reason: 'invalid-set',
+    });
+    // Someone else's key filed under a kid the user has verified out of band.
+    const swapped = {
+      ...setOf([phones[0] as (typeof phones)[0]]),
+      keys: [
+        {
+          kid: (phones[0] as (typeof phones)[0]).kid,
+          x25519: (phones[1] as (typeof phones)[1]).publicKeyB64u,
+        },
+      ],
+    };
+    expect(
+      evaluateRecipientKeys({}, swapped, sign(cloud.pem, swapped), { k1: cloud.raw }),
+    ).toMatchObject({ accept: false, reason: 'bad-keys' });
+  });
+
+  it('verifies over the set exactly as received, not over a re-serialised parse', () => {
+    const cloud = signer();
+    // A newer gateway adds a field this bridge has never heard of. The signature still covers it,
+    // so stripping unknown keys before verifying would break every rotation on the next release.
+    const forwardCompatible = setOf(
+      [phones[0] as (typeof phones)[0], phones[1] as (typeof phones)[1]],
+      {
+        revocationHint: 'kid-2 retired',
+      },
+    );
+    expect(
+      evaluateRecipientKeys(
+        flat([phones[0] as (typeof phones)[0]]),
+        forwardCompatible,
+        sign(cloud.pem, forwardCompatible),
+        {
+          k1: cloud.raw,
+        },
+      ),
+    ).toMatchObject({ accept: true, reason: 'signed' });
+  });
+
+  it('is the same rule as the server key set, over a different document', () => {
+    const a = signer();
+    const b = signer();
+    const verify = signedByOneOf({ k1: a.raw });
+    expect(evaluateKeySet({}, { k1: a.raw }, undefined, verify, 'ctx:')).toEqual({
+      accept: true,
+      reason: 'first-pin',
+    });
+    expect(
+      evaluateKeySet({ k1: a.raw }, { k1: a.raw, k2: b.raw }, undefined, verify, 'ctx:'),
+    ).toEqual({
+      accept: false,
+      reason: 'unsigned-change',
+    });
+    const widened = { k1: a.raw, k2: b.raw };
+    expect(
+      evaluateKeySet(
+        { k1: a.raw },
+        widened,
+        { keyId: 'k1', signature: signWithPem(a.pem, `ctx:${canonicalize(widened)}`) },
+        verify,
+        'ctx:',
+      ),
+    ).toEqual({ accept: true, reason: 'signed' });
+    // `evaluateServerKeys` is that call with the pinned keys as the signers.
+    expect(evaluateServerKeys({ k1: a.raw }, widened)).toEqual({
+      accept: false,
+      reason: 'unsigned-change',
+    });
+  });
+});
+
+describe('recipient keys over the wire', () => {
+  const deviceId = ids.dev();
+  let gw: FakeGateway;
+  let client: GatewayClient;
+  let identity: Awaited<ReturnType<typeof loadOrCreateIdentity>> & { deviceId: string };
+  let persisted: Array<Record<string, string>>;
+  const cloud = (() => {
+    const kp = generateKeyPairPem();
+    return { pem: kp.privateKeyPem, raw: rawPublicKeyFromPem(kp.publicKeyPem) };
+  })();
+  const phoneA = generateRecipientKeyPair();
+  const phoneB = generateRecipientKeyPair();
+  const setOf = (keys: Array<{ kid: string; publicKeyB64u: string }>) => ({
+    v: 1,
+    userId: ids.usr(),
+    keys: keys.map((k) => ({ kid: k.kid, x25519: k.publicKeyB64u })),
+    features: { imessage: true },
+    issuedAt: '2026-09-17T00:00:00.000Z',
+  });
+  const sign = (set: unknown): KeySetSignature => ({
+    keyId: 'k1',
+    signature: signWithPem(cloud.pem, `${RECIPIENT_KEY_SET_CONTEXT}${canonicalize(set)}`),
+  });
+
+  beforeEach(async () => {
+    identity = (await loadOrCreateIdentity(new MemorySecretStore(), {
+      deviceId,
+    })) as typeof identity;
+    gw = await startFakeGateway(identity.publicKeyRaw, deviceId);
+    gw.serverKeys = { k1: cloud.raw };
+    persisted = [];
+  });
+  afterEach(async () => {
+    await client?.stop();
+    await gw.close();
+  });
+
+  const make = (over: Partial<ConstructorParameters<typeof GatewayClient>[0]> = {}) =>
+    new GatewayClient({
+      url: gw.url,
+      identity,
+      bridgeVersion: '0.1.0',
+      onCommand: () => {},
+      onRecipientKeys: (k) => persisted.push(k),
+      heartbeatMs: 1000,
+      backoff: { baseMs: 20, maxMs: 100 },
+      env: { PAGR_ENV: 'local' },
+      ...over,
+    });
+
+  it('starts with nothing pinned and seals to nobody', async () => {
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.recipientKeys).toEqual({});
+    expect(client.recipientKeyIds()).toEqual([]);
+    expect(client.sealsToNobody).toBe(true);
+    expect(persisted).toEqual([]);
+  });
+
+  it('pins the set from auth.result and reports it for hello v2', async () => {
+    gw.recipientKeys = setOf([phoneA, phoneB]);
+    gw.features = { imessage: true };
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.recipientKeys).toEqual({
+      [phoneA.kid]: phoneA.publicKeyB64u,
+      [phoneB.kid]: phoneB.publicKeyB64u,
+    });
+    expect(client.recipientKeyIds()).toEqual([phoneA.kid, phoneB.kid].sort());
+    expect(client.sealsToNobody).toBe(false);
+    expect(client.features).toEqual({ imessage: true });
+    expect(persisted).toEqual([client.recipientKeys]);
+  });
+
+  it('ignores a v1 gateway that sends no recipient fields at all', async () => {
+    gw.recipientKeys = null;
+    client = make({ recipientKeys: { [phoneA.kid]: phoneA.publicKeyB64u } });
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.recipientKeys).toEqual({ [phoneA.kid]: phoneA.publicKeyB64u });
+    expect(persisted).toEqual([]);
+  });
+
+  it('accepts a signed addition pushed as keys.updated, and persists it once', async () => {
+    gw.recipientKeys = setOf([phoneA]);
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.recipientKeyIds()).toEqual([phoneA.kid]);
+    persisted.length = 0;
+
+    const widened = setOf([phoneA, phoneB]);
+    gw.sendRaw({
+      kind: 'keys.updated',
+      recipientKeys: widened,
+      recipientKeysSignature: sign(widened),
+    });
+    await until(() => client.recipientKeyIds().length === 2);
+    expect(client.recipientKeyIds()).toEqual([phoneA.kid, phoneB.kid].sort());
+    expect(persisted).toHaveLength(1);
+    // Re-sending the same set changes nothing and writes nothing.
+    gw.sendRaw({
+      kind: 'keys.updated',
+      recipientKeys: widened,
+      recipientKeysSignature: sign(widened),
+    });
+    await wait(50);
+    expect(persisted).toHaveLength(1);
+  });
+
+  it('refuses an unsigned addition pushed as keys.updated and keeps the connection', async () => {
+    const complaints: string[] = [];
+    const logger: Logger = {
+      ...silentLogger,
+      error: (m) => {
+        complaints.push(m);
+      },
+      child: () => logger,
+    };
+    gw.recipientKeys = setOf([phoneA]);
+    client = make({ logger });
+    client.start();
+    await until(() => client.state === 'connected');
+    gw.sendRaw({ kind: 'keys.updated', recipientKeys: setOf([phoneA, phoneB]) });
+    await until(() => complaints.some((c) => /recipient key set/i.test(c)));
+    expect(client.recipientKeyIds()).toEqual([phoneA.kid]);
+    expect(persisted).toHaveLength(1); // only the first pin
+    expect(client.state).toBe('connected');
+  });
+
+  it('accepts an unsigned revocation pushed as keys.updated', async () => {
+    gw.recipientKeys = setOf([phoneA, phoneB]);
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    gw.sendRaw({ kind: 'keys.updated', recipientKeys: setOf([phoneA]) });
+    await until(() => client.recipientKeyIds().length === 1);
+    expect(client.recipientKeyIds()).toEqual([phoneA.kid]);
+  });
+
+  it('ignores a malformed keys.updated without dropping the socket', async () => {
+    gw.recipientKeys = setOf([phoneA]);
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    gw.sendRaw({ kind: 'keys.updated' });
+    gw.sendRaw({ kind: 'keys.updated', recipientKeys: { v: 9 } });
+    await wait(50);
+    expect(client.recipientKeyIds()).toEqual([phoneA.kid]);
+    expect(client.state).toBe('connected');
+  });
+
+  it('never puts a frame body on the wire in the clear', async () => {
+    gw.recipientKeys = setOf([phoneA]);
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+
+    const secret = 'ssh deploy@prod "psql -c \\"drop table users\\""';
+    const aad = { sessionId: ids.ses(), seq: 3, kind: 'terminal' };
+    const sealed = sealFrame(
+      new TextEncoder().encode(JSON.stringify({ command: secret, exitCode: 0 })),
+      aad,
+      importRecipientKeys(client.recipientKeys),
+    );
+    // `session.frame` lands in `@pagr/protocol` with MOB-030; the transport only cares that a
+    // frame is JSON, so the v2 shape rides through as-is until then.
+    const frame = {
+      version: 1,
+      eventId: 'evt_sealed',
+      deviceId,
+      at: new Date().toISOString(),
+      type: 'session.frame',
+      payload: {
+        sessionId: aad.sessionId,
+        projectId: ids.proj(),
+        provider: 'claude',
+        seq: aad.seq,
+        kind: aad.kind,
+        at: new Date().toISOString(),
+        sealed,
+        meta: { bytes: 64, truncated: false, source: 'stdio' },
+      },
+    } as unknown as DeviceEvent;
+    expect(client.sendEvent(frame)).toBe(true);
+    await until(() =>
+      gw.frames.some((f) => f.kind === 'event' && f.event.type === ('session.frame' as never)),
+    );
+
+    // Every byte this Mac has sent since it connected, frame by frame.
+    expect(gw.frames.length).toBeGreaterThan(1);
+    for (const f of gw.frames) {
+      const wire = JSON.stringify(f);
+      expect(wire).not.toContain(secret);
+      expect(wire).not.toContain('drop table');
+      expect(wire).not.toContain('deploy@prod');
+    }
+    // …and the ciphertext really is on the wire, so the assertion above is not vacuous.
+    expect(gw.frames.map((f) => JSON.stringify(f)).join('\n')).toContain(sealed.ct);
+    // …and the phone, holding the private key, reads it back.
+    expect(JSON.parse(new TextDecoder().decode(openFrame(sealed, aad, phoneA.privateKey)))).toEqual(
+      { command: secret, exitCode: 0 },
+    );
   });
 });

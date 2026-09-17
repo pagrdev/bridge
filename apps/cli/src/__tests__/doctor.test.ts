@@ -455,6 +455,46 @@ describe('doctor · genuine faults still fail on an unpaired machine', () => {
   });
 });
 
+describe('doctor · phone keys', () => {
+  const KID = 'aaaa:bbbb:cccc:dddd';
+  const pair = (over: Record<string, unknown> = {}) =>
+    writeFileSync(
+      getPaths(h.home).configFile,
+      JSON.stringify({ deviceId: DEV, gatewayUrl: 'wss://gw.example', ...over }),
+      { mode: 0o600 },
+    );
+
+  it('skips on a machine that is not paired yet', async () => {
+    const r = await report(['--offline']);
+    expect(check(r, 'phone keys')?.status).toBe('skip');
+  });
+
+  it('warns, and says what it means, when no phone key is pinned', async () => {
+    // Everything works and the phone still shows an empty thread: this is the only place that
+    // says why, so it has to be a visible warning rather than a silent `ok`.
+    pair();
+    const r = await report(['--offline']);
+    expect(check(r, 'phone keys')?.status).toBe('warn');
+    expect(check(r, 'phone keys')?.detail).toContain('no phone key is pinned');
+    expect(check(r, 'phone keys')?.fix).toContain('iPhone');
+    // A warning, never a failure: a Mac with no phone paired yet is in a correct state.
+    expect(r.checks.filter((c) => c.status === 'fail').map((c) => c.name)).not.toContain(
+      'phone keys',
+    );
+  });
+
+  it('lists the pinned fingerprints so they can be compared with the phone', async () => {
+    pair({
+      recipientKeys: { [KID]: 'AAAA' },
+      recipientKeysUpdatedAt: '2026-09-17T00:00:00.000Z',
+    });
+    const r = await report(['--offline']);
+    expect(check(r, 'phone keys')?.status).toBe('ok');
+    expect(check(r, 'phone keys')?.detail).toContain(KID);
+    expect(check(r, 'phone keys')?.detail).toContain('2026-09-17');
+  });
+});
+
 describe('doctor · Claude Code live steering', () => {
   it('says follow-ups are queued when channel mode is off', async () => {
     server = await fakeDaemon(h.home, {

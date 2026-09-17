@@ -36,5 +36,6 @@ export * from './projects.js';
 export * from './reconcile.js';
 export * from './replay.js';
 export * from './scan.js';
+export * from './seal.js';
 export * from './sessions.js';
 export * from './transport.js';
