@@ -24,6 +24,7 @@ import { IpcClient } from './ipc.js';
 import { MemorySecretStore, SecretStoreError } from './keychain.js';
 import { DAEMON_EXIT } from './launchAgent.js';
 import { PagrHomeError } from './paths.js';
+import { generateRecipientKeyPair } from './seal.js';
 import { DEFAULT_SESSION_RETENTION_MS, UNREGISTERED_PROJECT } from './sessions.js';
 import { FakeServerSigner, ids, makeBody } from './testFixtures.js';
 import { useTempHome } from './testUtil.js';
@@ -108,6 +109,32 @@ describe('daemon', () => {
     received
       .filter((f) => f.kind === 'event' && f.event.type === 'command.ack')
       .map((f) => (f.kind === 'event' ? f.event : null));
+
+  it('pins the phones it seals for into config.json and reports them for hello v2', async () => {
+    await until(() => daemon.transport?.state === 'connected');
+    expect(daemon.recipientKeys).toEqual({});
+    expect(daemon.recipientKeyIds()).toEqual([]);
+
+    const phone = generateRecipientKeyPair();
+    const set = {
+      v: 1,
+      userId: ids.usr(),
+      keys: [{ kid: phone.kid, x25519: phone.publicKeyB64u, name: 'iPhone' }],
+      features: { imessage: false },
+      issuedAt: '2026-09-17T00:00:00.000Z',
+    };
+    for (const s of sockets) s.send(JSON.stringify({ kind: 'keys.updated', recipientKeys: set }));
+    await until(() => daemon.recipientKeyIds().length === 1);
+
+    expect(daemon.recipientKeys).toEqual({ [phone.kid]: phone.publicKeyB64u });
+    // It survives a restart: the phone is pinned on disk, not only in this process.
+    const cfg = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')) as {
+      recipientKeys: Record<string, string>;
+      recipientKeysUpdatedAt: string;
+    };
+    expect(cfg.recipientKeys).toEqual({ [phone.kid]: phone.publicKeyB64u });
+    expect(Date.parse(cfg.recipientKeysUpdatedAt)).not.toBeNaN();
+  });
 
   it('connects, sends device.hello, learns server keys, and runs a signed command end to end', async () => {
     await until(() => daemon.transport?.state === 'connected');

@@ -10,6 +10,15 @@ export const BridgeConfig = z.object({
   deviceName: z.string().optional(),
   /** keyId → base64url raw Ed25519 public key, pinned from pairing / auth.result. */
   serverKeys: z.record(z.string()).default({}),
+  /**
+   * kid → base64url raw X25519 public key: the phones every sealed frame is encrypted for.
+   * Pinned from `auth.result.recipientKeys` / the gateway's `keys.updated`, under the same
+   * acceptance rule as `serverKeys` (SEC-7). Empty means no phone is paired, which means
+   * nothing is sealed and nothing is sent.
+   */
+  recipientKeys: z.record(z.string()).default({}),
+  /** When the pinned recipient set last changed, for `pagr status` and `pagr doctor`. */
+  recipientKeysUpdatedAt: z.string().optional(),
   pairedAt: z.string().optional(),
 });
 export type BridgeConfig = z.infer<typeof BridgeConfig>;

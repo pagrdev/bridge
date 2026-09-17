@@ -109,6 +109,10 @@ export interface Daemon {
   readonly ipc: IpcServer;
   /** Null until paired (no deviceId / gatewayUrl). */
   readonly transport: GatewayClient | null;
+  /** The phones sealed frames are encrypted for: `kid` → base64url raw X25519 public key. */
+  readonly recipientKeys: Record<string, string>;
+  /** Pinned recipient key ids, sorted — `device.hello` v2 reports these as `recipientKeyIds`. */
+  recipientKeyIds(): string[];
   start(): Promise<void>;
   stop(): Promise<void>;
   status(): DaemonStatus;
@@ -203,6 +207,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   const replay = new ReplayCache({ file: paths.replayFile, now: () => now().getTime() });
   const commands = new CommandTracker();
   let serverKeys: Record<string, string> = { ...config.serverKeys };
+  let recipientKeys: Record<string, string> = { ...config.recipientKeys };
   const startedAt = now().toISOString();
   const exitProcess = o.exit ?? ((code: number) => process.exit(code));
 
@@ -333,6 +338,15 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       onServerKeys: (keys) => {
         serverKeys = keys;
         updateConfig(paths.configFile, { serverKeys: keys });
+      },
+      recipientKeys,
+      onRecipientKeys: (keys) => {
+        recipientKeys = keys;
+        updateConfig(paths.configFile, {
+          recipientKeys: keys,
+          recipientKeysUpdatedAt: now().toISOString(),
+        });
+        logger.info('recipient keys pinned', { keys: Object.keys(keys).sort() });
       },
       ...(o.env ? { env: o.env } : {}),
       activeSessions: () => dispatcher.activeSessionCount(),
@@ -720,6 +734,10 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     get transport() {
       return transport;
     },
+    get recipientKeys() {
+      return { ...recipientKeys };
+    },
+    recipientKeyIds: () => Object.keys(recipientKeys).sort(),
     async start() {
       // Single instance per PAGR_HOME: take the pid lock, then bind the socket. Either step
       // finding a live daemon means we must not proceed (two daemons would share one device

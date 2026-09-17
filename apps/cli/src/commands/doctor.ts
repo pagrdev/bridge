@@ -226,6 +226,27 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
     ...(paired ? {} : { fix: 'run `pagr connect`' }),
   });
 
+  // ---- recipient keys -----------------------------------------------------
+  // Frames are sealed on this Mac for the user's own phones and for nobody else — the cloud
+  // relays ciphertext it cannot read. With no phone key pinned there is nothing that could open
+  // a frame, so the bridge seals nothing and sends nothing: a correct state, but an invisible
+  // one, and "I paired my Mac and my phone shows no transcript" is exactly what it looks like.
+  const recipientKids = Object.keys(config.recipientKeys).sort();
+  add({
+    name: 'phone keys',
+    status: !paired ? 'skip' : recipientKids.length > 0 ? 'ok' : 'warn',
+    detail: !paired
+      ? 'not paired yet — run `pagr connect`'
+      : recipientKids.length > 0
+        ? `${recipientKids.length} phone key(s) pinned: ${recipientKids.join(', ')}${
+            config.recipientKeysUpdatedAt ? ` (updated ${config.recipientKeysUpdatedAt})` : ''
+          }`
+        : 'no phone key is pinned — nothing could read a transcript, so none is sent',
+    ...(paired && recipientKids.length === 0
+      ? { fix: 'open Pagr on your iPhone and sign in; its key is pinned here on the next connect' }
+      : {}),
+  });
+
   // ---- API + clock --------------------------------------------------------
   // Only ever probed against a URL somebody chose (--api-url / PAGR_API_URL / a paired
   // config.json). With none of those there is nothing to be reachable, so both checks skip: an
