@@ -101,6 +101,12 @@ export class FakeAdapter implements CodingAgentAdapter {
   }): Promise<void> {
     this.record('respondToApproval', input);
   }
+  async answerQuestion(input: {
+    providerRequestId: string;
+    answers: Array<{ questionIndex: number; optionIndexes: number[]; freeText?: string }>;
+  }): Promise<void> {
+    this.record('answerQuestion', input);
+  }
   subscribe(emit: (e: AdapterEvent) => void): () => void {
     this.listeners.add(emit);
     return () => this.listeners.delete(emit);

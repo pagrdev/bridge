@@ -17,6 +17,16 @@
 //                     "allow always" has rules to persist. Every control_response line is appended
 //                     to FAKE_CLAUDE_CONTROL_FILE when that env var is set, so a test can read
 //                     back exactly what the adapter wrote (incl. `updatedPermissions`).
+//         "ask"    → AskUserQuestion: a can_use_tool control_request carrying
+//                     `requires_user_interaction:true` and `questions[]`, then the EXACT outcomes
+//                     spike MOB-044 measured against Claude Code 2.1.220 —
+//                       allow with `updatedInput.answers` keyed by the full question text
+//                         → "Your questions have been answered: …"   (run 4)
+//                       allow with `updatedInput.response`
+//                         → "The user responded: …"                   (run 5)
+//                       allow with anything else (the original input, or answers keyed by header)
+//                         → "The user did not answer the questions."  (runs 2 and 3: today's bug)
+//                     "ask multi" makes the question multi-select with three options.
 //         "elsewhere" → asks permission and then answers it ITSELF, as a terminal user would:
 //                     the tool_result arrives with no control_response, which is what
 //                     `answeredElsewhere` looks like on the wire
@@ -173,7 +183,7 @@ const SUGGESTIONS = [
   { type: 'addRules', rules: [{ toolName: 'Write', ruleContent: '//tmp/**' }], behavior: 'allow' },
 ];
 
-function askPermission(toolName, input, toolUseId, suggestions = []) {
+function askPermission(toolName, input, toolUseId, suggestions = [], extra = {}) {
   const request_id = `req_${n++}`;
   return new Promise((resolve) => {
     pendingControl.set(request_id, resolve);
@@ -187,9 +197,71 @@ function askPermission(toolName, input, toolUseId, suggestions = []) {
         input,
         tool_use_id: toolUseId,
         permission_suggestions: suggestions,
+        ...extra,
       },
     });
   });
+}
+
+const SINGLE_QUESTIONS = [
+  {
+    question: 'Do you prefer option A or option B?',
+    header: 'Preference',
+    multiSelect: false,
+    options: [
+      { label: 'Option A', description: 'Choose option A' },
+      { label: 'Option B', description: 'Choose option B' },
+    ],
+  },
+];
+
+const MULTI_QUESTIONS = [
+  {
+    question: 'Which checks should run before I push?',
+    header: 'Checks',
+    multiSelect: true,
+    options: [
+      { label: 'lint', description: 'biome' },
+      { label: 'typecheck', description: 'tsc' },
+      { label: 'test', description: 'vitest', preview: '1238 tests' },
+    ],
+  },
+];
+
+/**
+ * What the real CLI does with a `control_response` for AskUserQuestion. Verbatim from spike
+ * MOB-044: an allow EXECUTES the tool on the spot with whatever `updatedInput` carries, so a
+ * plain allow is not a deferred prompt — it is an instant "did not answer" and the end of the
+ * turn. `answers` is only recognised when keyed by the full `question` string.
+ */
+function answerOf(questions, res) {
+  if (res?.behavior !== 'allow')
+    return {
+      error: true,
+      content: `Permission denied: ${res?.message ?? ''}`,
+      toolUseResult: { questions, answers: {} },
+    };
+  const ui = res.updatedInput ?? {};
+  const answers = ui.answers && typeof ui.answers === 'object' ? ui.answers : {};
+  if (typeof ui.response === 'string' && ui.response.length > 0)
+    return {
+      content: `The user responded: ${ui.response}`,
+      toolUseResult: { questions, answers, response: ui.response },
+    };
+  const recognised = Object.entries(answers).filter(([k]) =>
+    questions.some((q) => q.question === k),
+  );
+  if (recognised.length === 0)
+    return {
+      // Runs 2 and 3: the answers are echoed back untouched and still count for nothing.
+      content: 'The user did not answer the questions.',
+      toolUseResult: { questions, answers },
+    };
+  const rendered = recognised.map(([k, v]) => `"${k}"="${v}"`).join(', ');
+  return {
+    content: `Your questions have been answered: ${rendered}. You can now continue with these answers in mind.`,
+    toolUseResult: { questions, answers },
+  };
 }
 
 async function handleUser(text) {
@@ -272,6 +344,23 @@ async function handleUser(text) {
     toolResult(editId, `The file ${process.cwd()}/t.txt has been updated successfully.`, undefined);
     assistant([{ type: 'text', text: 'Edited. DONE' }]);
     result(true, 'Edited. DONE');
+    return;
+  }
+  if (/\bask\b/i.test(text)) {
+    const questions = /multi/i.test(text) ? MULTI_QUESTIONS : SINGLE_QUESTIONS;
+    const toolUseId = `toolu_${n++}`;
+    assistant([{ type: 'tool_use', id: toolUseId, name: 'AskUserQuestion', input: { questions } }]);
+    const res = await askPermission('AskUserQuestion', { questions }, toolUseId, [], {
+      // The field the real 2.1.220 puts on this request and on no other (spike finding 1).
+      requires_user_interaction: true,
+    });
+    const answer = answerOf(questions, res);
+    toolResult(toolUseId, answer.content, answer.toolUseResult, answer.error === true);
+    const text2 = answer.error
+      ? 'I could not ask you. DONE'
+      : `Noted: ${answer.content.slice(0, 120)} DONE`;
+    assistant([{ type: 'text', text: text2 }]);
+    result(true, text2);
     return;
   }
   if (/elsewhere/i.test(text)) {

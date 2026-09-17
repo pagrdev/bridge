@@ -178,6 +178,93 @@ describe('daemon', () => {
     ).toBe(true);
   });
 
+  it('IPC: an AskUserQuestion from the hook becomes a question, answered with updatedInput', async () => {
+    await until(() => daemon.transport?.state === 'connected');
+    const c = new IpcClient(daemon.paths.socketPath);
+    const repo = join(t.home, 'ask-repo');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    const proj = await c.call<{ projectId: string }>('projects.add', { path: repo });
+    const questions = [
+      {
+        question: 'Do you prefer option A or option B?',
+        header: 'Preference',
+        multiSelect: false,
+        options: [{ label: 'Option A' }, { label: 'Option B' }],
+      },
+    ];
+    const sessionId = ids.ses();
+    const pending = c.call<{
+      approvalId: string;
+      decision: string | null;
+      resolution: string;
+      updatedInput?: Record<string, unknown>;
+    }>(
+      'approval.request',
+      {
+        sessionId,
+        projectId: proj.projectId,
+        provider: 'claude',
+        providerRequestId: 'hook-ask-1',
+        actionType: 'tool_use',
+        preview: 'AskUserQuestion',
+        toolName: 'AskUserQuestion',
+        questions,
+      },
+      5000,
+    );
+    // It became a question, not an approval card. (`question.asked` is v2-only and this fake
+    // gateway negotiated v1, so the wire is the wrong place to look; the registry is not.)
+    await until(() => daemon.dispatcher.questions.list().length === 1);
+    expect(received.some((f) => f.kind === 'event' && f.event.type === 'approval.requested')).toBe(
+      false,
+    );
+    expect(daemon.dispatcher.approvals.list()).toEqual([]);
+    const record = daemon.dispatcher.questions.list()[0];
+    if (!record) throw new Error('unreachable');
+    expect(record).toMatchObject({
+      sessionId,
+      providerRequestId: 'hook-ask-1',
+      answerable: true,
+      multiSelect: [false],
+      optionCount: [2],
+      secret: [false],
+    });
+    daemon.sessions.upsert({
+      sessionId,
+      provider: 'claude',
+      projectId: proj.projectId,
+      providerSessionId: 'x',
+      status: 'waiting_for_user',
+      startedAt: new Date().toISOString(),
+    });
+    sendCommand(
+      signer.sign(
+        makeBody(
+          'agent.answer_question',
+          {
+            questionId: record.questionId,
+            sessionId,
+            providerRequestId: 'hook-ask-1',
+            answers: [{ questionIndex: 0, optionIndexes: [1] }],
+          },
+          { deviceId },
+        ),
+      ),
+    );
+    // The hook is handed the answer to print back to Claude, keyed by the question text.
+    expect(await pending).toMatchObject({
+      decision: 'allow',
+      resolution: 'answered',
+      updatedInput: {
+        questions,
+        answers: { 'Do you prefer option A or option B?': 'Option B' },
+      },
+    });
+    await until(() => acks().length === 1);
+    expect(acks()[0]?.payload).toMatchObject({ status: 'completed' });
+    expect(daemon.dispatcher.questions.list()).toEqual([]);
+  });
+
   it('IPC: projects.add/list/remove, sessions.list, agent.event, approval.request round trip with cloud decision', async () => {
     await until(() => daemon.transport?.state === 'connected');
     const c = new IpcClient(daemon.paths.socketPath);

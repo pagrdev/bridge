@@ -92,6 +92,7 @@ Implementation: `packages/core/src/transport.ts`.
 | `agent.stop_session` | `{ sessionId }` | `{ sessionId }` |
 | `agent.get_status` | `{ sessionId? }` | `{ sessions: SessionSummary[] }` |
 | `agent.respond_to_approval` | `{ approvalId, sessionId, providerRequestId, previewHash, decision: allow\|deny, optionId? }` | `{ approvalId, decision }` |
+| `agent.answer_question` (v2) | `{ questionId, sessionId, providerRequestId, answers: [{ questionIndex, optionIndexes[], freeText? }] }` | `{ questionId }` |
 | `settings.sync_public_policy` | `{ approvalTimeoutSeconds }` | the stored policy |
 | `repo.scan` | `{}` | `RepoScanResult`: `{ repos: [{ handle: rh_<32hex>, displayName, repoHint?, registeredAs? }], truncated }` |
 | `project.register_handle` | `{ handle, displayName? }` | `ProjectSummary` |
@@ -146,11 +147,14 @@ Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payl
 | `approval.requested` | agent asked permission | `{ approvalId, sessionId, projectId, provider, providerRequestId, actionType, preview ≤ 1500, previewHash, hints, expiresAt, options?, frameSeq? }` |
 | `approval.resolved_locally` | timeout, terminal answer, or shutdown | `{ approvalId, resolution: allowed\|denied\|timed_out\|canceled, source?, answeredElsewhere }` |
 | `approval.applied` | after the agent was told (v2 only) | `{ approvalId, sessionId, optionId, applied, appliedAs?, error? }` |
+| `question.asked` | agent asked the user something (v2 only) | `{ questionId, sessionId, projectId, provider, providerRequestId, seq, meta: { answerable, reason?, multiSelect[], optionCount[], secret[] }, expiresAt, imessage? }` |
+| `question.answered` | the question is no longer pending (v2 only) | `{ questionId, answeredElsewhere, reason? }` |
 | `session.frame` | one transcript frame, v2 only | `{ sessionId, projectId, provider, seq, kind, at, providerRecordId?, sealed, meta }` — see *Transcript frames and cursors* |
 | `attachment.consumed` | after a download attempt | `{ attachmentId, ok, error? }` |
 
 `errorCode` values: `bad_signature`, `expired`, `replayed`, `wrong_device`, `unknown_project`,
-`unknown_session`, `unknown_approval`, `capability_unsupported`, `provider_error`, `invalid_payload`.
+`unknown_session`, `unknown_approval`, `unknown_question`, `rate_limited`, `not_negotiated`,
+`capability_unsupported`, `provider_error`, `invalid_payload`.
 `status: rejected` means the guard refused the command before dispatch; `failed` means dispatch ran and
 the adapter or a precondition failed. A second copy of a command already accepted — the gateway's 30 s
 resend, or a retry under the same `idempotencyKey` — is answered with the terminal ack of the single
@@ -197,6 +201,69 @@ chosen (a refused persistent grant is relayed as a plain `deny`). It is also emi
 (`terminal`, `provider`, `timeout`, `shutdown`), and `answeredElsewhere: true` marks the case
 where somebody answered in the terminal — or another client of the same agent did — while the
 phone still had the card open. The phone dismisses it rather than reporting an error.
+
+### Questions (protocol v2)
+
+A question is not an approval, and the difference is not cosmetic. An approval asks whether one
+action may run, and "allow" is a complete answer. A question asks the person to **choose**, and
+the choice is fed back to the model as the user's own words — so an approval-shaped "allow" is not
+a degraded answer to a question, it is a wrong one delivered instantly (see
+`docs/spikes/2026-09-17-askuserquestion-answer-path.md`).
+
+`question.asked` carries only the shape: how many questions, how many options each has, which take
+more than one (`multiSelect`), which must never be echoed back or stored in the clear (`secret`),
+and whether the phone can answer at all. The words — question text, headers, option labels and any
+`preview` the model attached — travel sealed in the `question` frame at `seq`:
+
+```json
+{ "kind": "question",
+  "questions": [{ "question": "…", "header": "…", "multiSelect": false,
+                  "options": [{ "label": "…", "description": "…", "preview": "…" }] }] }
+```
+
+`meta.answerable: false` means only the Mac can answer it, and `meta.reason` says why —
+`mirror_only` for a Codex thread another client owns, `terminal_dialog` for a prompt Pagr can see
+but cannot type into, `not_supported` for an adapter with no answer path. Answering one of those
+acks `failed` / `capability_unsupported` rather than pretending.
+
+`agent.answer_question` sends **indexes, never text**. The options came from the agent, the Mac
+still holds them, and resolving positions here is what stops a compromised cloud putting words in
+the user's mouth. Every index is checked against the retained question — out of range, repeated,
+two options on a single-select question, or `freeText` over 2000 characters are all
+`invalid_payload`, and the question stays pending. An id that is not pending any more (expired,
+already answered, answered on the Mac) is `unknown_question`, which is deliberately not
+`unknown_session`: the session is usually alive and only the prompt has lapsed.
+
+`question.answered` is emitted once, whatever ended it. `answeredElsewhere: true` means somebody
+answered on the Mac while the phone still had the sheet open, so the phone dismisses rather than
+errors; `reason` (`timed_out`, `canceled`, `shutdown`, `answered_elsewhere`) says what happened
+when it was not the phone's own answer.
+
+**How the answer reaches each agent**
+
+- **Claude Code** — `AskUserQuestion` arrives on the same `can_use_tool` control request as any
+  other tool, with `requires_user_interaction: true`. The answer is an *allow* whose
+  `updatedInput` carries it, written on that request id (there is no later opportunity):
+
+  ```json
+  {"behavior":"allow",
+   "updatedInput":{"questions":<the request's own array, verbatim>,
+                   "answers":{"<the full question text>":"<the chosen option's label>"}}}
+  ```
+
+  Keyed by `header` instead of the question text it fails **silently** — the CLI echoes the answers
+  back and still reports "The user did not answer the questions." A multi-select answer joins the
+  chosen labels with `", "` (Agent SDK docs; the spike could not exercise it). Free text goes in
+  `response` instead, and Claude reports it as "The user responded: …". A timeout writes
+  `{"behavior":"deny", …}`, because the child process blocks on this request indefinitely.
+
+- **Codex** — `item/tool/requestUserInput` is answered with the JSON-RPC response for that request,
+  `{ answers: { "<question id>": { answers: ["<label>", …] } } }`, by option index. A thread the
+  bridge only mirrors is `answerable: false` / `mirror_only`: the person sitting in front of it is
+  the one who answers.
+
+`docs/TROUBLESHOOTING.md` § "A question never reached my phone" covers what to check when one does
+not arrive.
 
 ### `device.hello` is bounded
 
@@ -422,7 +489,10 @@ risk tiering; the bridge only ever reports.
 until decision/timeout, returns `{ approvalId, decision, resolution, optionId? }`; the Claude
 PermissionRequest hook passes `permissionSuggestions` so the prompt can offer "allow always", and
 hands those same rules back to Claude Code itself when `optionId` comes back `allow_always`),
-`agent.event`. Under
+`agent.event`. `approval.request` is also how the hook relays an `AskUserQuestion`: it sends
+`toolName: 'AskUserQuestion'` plus that tool's `questions`, the daemon registers a question rather
+than an approval, and the result comes back as `{ decision: 'allow', updatedInput }` for the hook
+to print as its `PermissionRequest` decision. Under
 `PAGR_CLAUDE_CHANNEL=1` two more are registered: `channel.poll` and `channel.outbound`.
 See `packages/core/src/ipc.ts` and `daemon.ts`.
 

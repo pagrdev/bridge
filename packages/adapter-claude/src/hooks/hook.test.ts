@@ -316,6 +316,65 @@ describe('permission.mjs hook', () => {
     expect(JSON.parse(r3.stdout).hookSpecificOutput.decision).toEqual({ behavior: 'allow' });
   });
 
+  // --- AskUserQuestion (MOB-036) ------------------------------------------------------------
+  //
+  // The PermissionRequest hook fires for `AskUserQuestion` like any other tool, and answering it
+  // as an ordinary permission is the bug: spike MOB-044 measured a bare allow ending the turn with
+  // "The user did not answer the questions.". The hook forwards the questions and prints back
+  // whatever `updatedInput` the daemon sends, which is where the person's answer lives.
+  const askPayload = {
+    ...stdinPayload,
+    tool_name: 'AskUserQuestion',
+    tool_input: {
+      questions: [
+        {
+          question: 'Do you prefer option A or option B?',
+          header: 'Preference',
+          multiSelect: false,
+          options: [{ label: 'Option A' }, { label: 'Option B' }],
+        },
+      ],
+    },
+  };
+
+  it('forwards AskUserQuestion questions and the tool name, and nothing else forwards its input', async () => {
+    const d = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+    await runHook(askPayload, { PAGR_DAEMON_SOCK: sock });
+    await d.close();
+    expect(d.seen[0]?.params.toolName).toBe('AskUserQuestion');
+    expect(d.seen[0]?.params.questions).toEqual(askPayload.tool_input.questions);
+
+    // A Bash prompt forwards its preview and its hints, never its raw input.
+    const b = fakeDaemon(sock, () => ({ result: { decision: 'deny' } }));
+    await runHook(stdinPayload, { PAGR_DAEMON_SOCK: sock });
+    await b.close();
+    expect(b.seen[0]?.params.toolName).toBe('Bash');
+    expect(b.seen[0]?.params.questions).toBeUndefined();
+  });
+
+  it('prints the answer as an allow carrying updatedInput', async () => {
+    const updatedInput = {
+      questions: askPayload.tool_input.questions,
+      answers: { 'Do you prefer option A or option B?': 'Option B' },
+    };
+    const d = fakeDaemon(sock, () => ({ result: { decision: 'allow', updatedInput } }));
+    const r = await runHook(askPayload, { PAGR_DAEMON_SOCK: sock });
+    await d.close();
+    expect(JSON.parse(r.stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: 'PermissionRequest',
+        decision: { behavior: 'allow', updatedInput },
+      },
+    });
+  });
+
+  it('prints nothing when nobody answered, so the terminal dialog stays in control', async () => {
+    const d = fakeDaemon(sock, () => ({ result: { decision: null, resolution: 'timed_out' } }));
+    const r = await runHook(askPayload, { PAGR_DAEMON_SOCK: sock });
+    await d.close();
+    expect(r.stdout).toBe('');
+  });
+
   it('installHooks copies the script and hookSettings references it', () => {
     const { hookPath } = installHooks(dir);
     expect(hookPath).toBe(path.join(dir, 'hooks', 'permission.mjs'));

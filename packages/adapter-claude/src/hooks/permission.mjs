@@ -15,6 +15,10 @@
 //           random id, so every request still has a stable handle to answer.
 //   stdout: {"hookSpecificOutput":{"hookEventName":"PermissionRequest",
 //            "decision":{"behavior":"allow"|"deny",…}}}
+//           For `AskUserQuestion` the allow also carries `updatedInput` — `{questions, answers}`
+//           or `{questions, answers:{}, response}` — which is how the person's answer reaches the
+//           model (spike MOB-044). A bare allow there is not a deferral: the tool runs at once and
+//           reports "The user did not answer the questions.".
 //           `message` is documented as deny-only ("tells Claude why the permission was denied"),
 //           so nothing is attached to an allow.
 //   "Exit code 0 with no output means the hook has no decision to report, so the tool call
@@ -179,15 +183,25 @@ export function buildRequest(hook) {
     ? hook.permission_suggestions.filter((x) => x !== null && typeof x === 'object').slice(0, 50)
     : [];
 
+  // `AskUserQuestion` is the one tool whose `tool_input` is forwarded: the daemon has to have the
+  // questions to relay them, and the answer it sends back is `updatedInput` rather than a bare
+  // allow (spike MOB-044 — a bare allow ends the turn with "The user did not answer the
+  // questions."). Nothing else's input leaves this process.
+  const questions =
+    toolName === 'AskUserQuestion' && Array.isArray(input.questions)
+      ? input.questions.filter((q) => q !== null && typeof q === 'object').slice(0, 50)
+      : undefined;
+
   return {
     provider: 'claude',
+    toolName,
+    ...(questions ? { questions } : {}),
     // Bridge-spawned sessions carry PAGR_SESSION_ID; the user's own interactive `claude` does
     // not, so the daemon maps `cwd` → registered project and mints a local session (finding 12).
     sessionId: process.env.PAGR_SESSION_ID || null,
     claudeSessionId: str(hook.session_id) ?? null,
     providerRequestId: providerRequestId.slice(0, 200),
     actionType,
-    toolName,
     // Paths under the session's cwd become relative before the preview leaves this Mac, the same
     // way the bridge-spawned path does it in `@pagr/bridge-core`'s `relativizePaths`.
     preview: relativizePaths(preview, cwd).replace(/\s+/g, ' ').trim().slice(0, 1500),
@@ -238,6 +252,13 @@ export function askDaemon(params, { sockPath = SOCK, timeoutMs = TIMEOUT_MS } = 
             return finish({
               decision: d,
               optionId: typeof r.optionId === 'string' ? r.optionId : undefined,
+              // Only `AskUserQuestion` comes back with one; it IS the answer.
+              updatedInput:
+                r.updatedInput &&
+                typeof r.updatedInput === 'object' &&
+                !Array.isArray(r.updatedInput)
+                  ? r.updatedInput
+                  : undefined,
             });
           }
         } catch {
@@ -256,11 +277,16 @@ export function askDaemon(params, { sockPath = SOCK, timeoutMs = TIMEOUT_MS } = 
  * unless it is an "allow always", which carries `updatedPermissions` so Claude Code writes the
  * rules it suggested into its own settings. Pagr stores no permission rules of its own.
  */
-export function hookOutput(decision, message, updatedPermissions) {
-  const allow =
-    Array.isArray(updatedPermissions) && updatedPermissions.length > 0
-      ? { behavior: 'allow', updatedPermissions }
-      : { behavior: 'allow' };
+export function hookOutput(decision, message, updatedPermissions, updatedInput) {
+  const allow = {
+    behavior: 'allow',
+    ...(Array.isArray(updatedPermissions) && updatedPermissions.length > 0
+      ? { updatedPermissions }
+      : {}),
+    // The answers to an `AskUserQuestion`. Claude runs the tool with exactly this input, so the
+    // allow and the answer are one and the same line.
+    ...(updatedInput ? { updatedInput } : {}),
+  };
   return JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PermissionRequest',
@@ -285,6 +311,7 @@ async function main() {
         'allow',
         undefined,
         answer.optionId === 'allow_always' ? params.permissionSuggestions : undefined,
+        answer.updatedInput,
       ),
     );
   else if (answer?.decision === 'deny')

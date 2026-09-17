@@ -38,6 +38,7 @@ export * from './pairing.js';
 export * from './paths.js';
 export * from './policy.js';
 export * from './projects.js';
+export * from './questions.js';
 export * from './reconcile.js';
 export * from './replay.js';
 export * from './repoScan.js';

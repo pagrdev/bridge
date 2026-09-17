@@ -1,3 +1,4 @@
+import { APPROVAL_OPTION_LABELS } from '@pagr/bridge-core';
 import type { ApprovalOption } from '@pagr/protocol';
 import type { ApprovalDecision } from './protocol.js';
 
@@ -11,11 +12,16 @@ import type { ApprovalDecision } from './protocol.js';
  * offered. The phone renders exactly what it is given and never invents an option.
  */
 
-/** Generic per kind. The agent supplies no labels, so these are the bridge's own words. */
+/**
+ * The three kinds Codex's enums can express, worded by the ONE table that words them for every
+ * agent (`approvalOptions.ts` in core). The same decision must read the same on the phone
+ * whichever agent raised it — this file used to say "Don't allow" where Claude's prompts said
+ * "Reject", which made one choice look like two.
+ */
 export const OPTION_LABELS = {
-  allow_once: 'Allow once',
-  allow_session: 'Allow for this session',
-  reject_once: "Don't allow",
+  allow_once: APPROVAL_OPTION_LABELS.allow_once,
+  allow_session: APPROVAL_OPTION_LABELS.allow_session,
+  reject_once: APPROVAL_OPTION_LABELS.reject_once,
 } as const;
 
 const option = (kind: keyof typeof OPTION_LABELS): ApprovalOption => ({

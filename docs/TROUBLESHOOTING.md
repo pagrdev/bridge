@@ -186,6 +186,42 @@ hooks, and not needed for normal use.)
 
 Note that Claude Code cannot be steered mid-turn: instructions sent while a turn is active are queued and delivered when it ends (`queued_followup` → `followup_delivered` in `pagr sessions`).
 
+## A question never reached my phone
+
+A *question* is the agent asking you to choose — Claude Code's `AskUserQuestion` ("which of these
+should I do?"), Codex's `requestUserInput`. It is not an approval, and Pagr handles it on a
+separate path: the question and its options arrive as their own sheet, and your choice is fed back
+to the model as your answer rather than as a yes/no about one action.
+
+If one never arrives:
+
+1. **Claude Code is too old to ask.** The question path needs a `claude` new enough that the model
+   backing your session is supported at all; on this Mac's pinned configuration that floor is
+   **2.1.251**. An older binary can fail the whole turn with
+   `API Error: 400 … does not support this model; version 2.1.251 or newer is required`, which
+   shows up as a failed session rather than as a missing question. `claude --version`, then
+   `npm i -g @anthropic-ai/claude-code`.
+2. **The session is one Pagr only mirrors.** A Codex thread owned by a terminal (`mirror_only` in
+   `pagr sessions`) is answered by the person sitting in front of it. The sheet still appears, marked
+   as answerable only on the Mac; answering it from the phone is refused rather than silently lost.
+3. **It was answered in your terminal first.** The sheet disappears and is reported as
+   *answered elsewhere*, not as an error. That is the correct outcome: Pagr saw the answer, it did
+   not write one.
+4. **Nobody answered in time.** The default is the approval timeout (10 minutes;
+   `settings.sync_public_policy`). Claude blocks on the question until then — nothing else in that
+   session moves — and Pagr then answers `deny` so the turn can end rather than hanging forever.
+   The phone is told `timed_out`.
+5. **Headless sessions.** In a session that cannot show a prompt (`claude -p`, a background
+   subagent) Claude Code denies when no hook returns a decision, and `AskUserQuestion` is
+   unavailable inside subagents entirely. A question that never existed cannot be relayed.
+6. **The gateway is down.** `pagr status` — questions travel over the same WebSocket as everything
+   else, and `question.asked` is a protocol v2 event: a gateway that negotiated v1 never receives
+   it. `pagr daemon logs -n 100` shows `holding back a v2-only event` when that is what happened.
+
+Nothing is ever answered on your behalf. The bridge has no path by which it chooses an option for
+you: a question is consumed by your answer, by the timeout (a deny), by the agent withdrawing it,
+or by somebody answering it on the Mac.
+
 ## Revoked device
 
 Revoking a device in the dashboard closes its socket and rejects its signatures. The daemon logs `gateway refused this device` with the reason `revoked`, stops reconnecting, and exits 78 so launchd does not restart it into the same wall. Re-pairing creates a **new** identity — revoked key material is never reused:

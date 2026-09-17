@@ -162,6 +162,28 @@ export type AdapterEvent =
       /** Per question: the answer must never be echoed back or stored in the clear. */
       secret: boolean[];
       expiresAt: string;
+      /**
+       * The provider's own id for the `question` frame the dispatcher journals. Supplying it is
+       * what makes an adapter that ALSO emits the frame itself (Codex does, from its item stream)
+       * produce one journal line rather than two.
+       */
+      providerRecordId?: string;
+      /** Frame metadata for that frame. Defaults to `{ source: 'stdio' }`. */
+      meta?: JournalMeta;
+    }
+  /**
+   * A question ended without the phone answering it: the agent withdrew the request, our own
+   * timer denied it, or somebody answered it in the terminal. What the adapter OBSERVED, never
+   * what it did — the dispatcher consumes the pending entry and tells the phone.
+   */
+  | {
+      kind: 'question_resolved_locally';
+      sessionId: string;
+      providerRequestId: string;
+      resolution: 'answered' | 'timed_out' | 'canceled';
+      answeredElsewhere?: boolean;
+      source?: 'terminal' | 'provider';
+      reason?: string;
     };
 
 export interface CodingAgentAdapter {

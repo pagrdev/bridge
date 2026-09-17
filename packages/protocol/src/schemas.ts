@@ -772,6 +772,12 @@ export const EventPayloads = {
     questionId: QuestionId,
     /** True when the Mac answered it while the phone had it open. */
     answeredElsewhere: z.boolean().default(false),
+    /**
+     * Why it ended, when it did not end in an answer from the phone: `timed_out`, `canceled`,
+     * `shutdown`, `answered_elsewhere`. Additive and optional — a client that has never heard of
+     * it still learns the only thing it must act on, which is that the sheet can go away.
+     */
+    reason: z.string().max(80).optional(),
   }),
   /**
    * The agent actually applied a decision. This is what moves the phone's card from `sending` to

@@ -1498,6 +1498,11 @@ export class CodexAdapter implements CodingAgentAdapter {
       ...(answerable ? {} : { reason: 'mirror_only' }),
       secret: q.questions.map((one) => one.isSecret === true),
       expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
+      // The dispatcher journals the `question` frame from the event, so `question.asked` can
+      // name its seq. The frame below carries the same `providerRecordId`, which is what makes
+      // the two one journal line instead of two (`JournalStore.append` dedupes on it).
+      providerRecordId: q.itemId,
+      meta: { source: 'app_server', turnId: q.turnId, final: true },
     });
     this.emitFrames(live, [
       {
