@@ -13,9 +13,12 @@ sentence an agent may act on. So the honest statement is not "the cloud cannot m
 anything"; it is that **the cloud cannot, by itself, make a high-risk action succeed**.
 
 **What it cannot do.** It cannot send a shell command, a filesystem path, or a binary to run —
-there is no command for it (`packages/protocol/src/schemas.ts`). It cannot name a directory at all: an id
-resolves only to a folder something running on this Mac put in the registry, and an id the
-registry does not know is refused without the filesystem being touched. It cannot relay its own `allow` for anything this Mac classified as high risk
+there is no command for it (`packages/protocol/src/schemas.ts`). It cannot name a directory: a project is
+an opaque id that resolves only to a folder something running on this Mac put in the registry, and
+an id the registry does not know is refused without the filesystem being touched. It can now ask
+this Mac to *list* the git repositories under your conventional code folders and register one of
+them by an opaque handle — it still never names one, and it never learns where any of them are
+(see "Projects a phone can add"). It cannot relay its own `allow` for anything this Mac classified as high risk
 (below). It cannot lift that classification: no command changes it, and there is no command that
 can. It cannot make the bridge answer a prompt for you — there is no such code path at all. It
 never sees your device private key, and the bridge never reads your provider credentials.
@@ -136,17 +139,63 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | `agent.stop_session` | interrupt a session |
 | `agent.respond_to_approval` | answer a permission prompt the agent raised, bound to the exact preview you saw — and subject to the device floor above |
 | `settings.sync_public_policy` | update the approval timeout. Nothing else: there is no cloud setting that makes the bridge answer a prompt |
+| `repo.scan` | list the git repositories under your conventional code folders as opaque handles — names, not paths. Rate limited to one every 30 s (see "Projects a phone can add") |
+| `project.register_handle` | register one of those handles as a project. The handle resolves only in this daemon's memory, and only for an hour |
+
+That table is the whole surface; it is not fixed at nine rows, and a bridge that gains a command
+gains a row here in the same change.
 
 There is deliberately **no** `shell.exec`, `fs.read`, `fs.write`, `process.spawn`, or "run this
 binary". The cloud cannot send a filesystem path: project references are opaque `proj_…` ids that
 only resolve against `~/.pagr/projects.json` on your machine (`projects.ts`). Sending a path where an
 id is expected fails schema validation before anything else runs. The reverse direction — a path
-becoming an id — happens only here: `pagr project use` / `add` / `scan`, and the daemon acting on
-what you typed. Registering is a convenience, so any folder you name is reachable without setting
+becoming an id — happens in two places, both on this Mac: `pagr project use` / `add` / `scan` and the
+daemon acting on what you typed, and `project.register_handle` resolving a handle this Mac itself
+minted from its own scan (below). Registering is a convenience, so any folder you name is reachable without setting
 it up first; it is still the *naming*, locally, that creates the id. An id the registry does not
 know is `unknown_project`, whether it was invented, guessed, or once belonged to a project you
 removed. Nothing in this list can write
 `device-policy.json` or change what the floor refuses.
+
+## Projects a phone can add (`repoScan.ts`, `scan.ts`)
+
+With this version a paired phone can ask this Mac to list the git repositories it can see, and to
+register one of them as a project. This is the one capability that widens what the cloud can
+reach, so here is exactly what it does and does not open.
+
+**What is looked at.** Only the conventional code folders directly under your home directory, in
+the list `CONVENTIONAL_ROOT_NAMES` in `packages/core/src/scan.ts` — today `code`, `src`,
+`Developer`, `Projects`, `projects`, `dev`, `repos`, `git`, `work`, `Sites` and `Desktop` — and
+only the ones that exist. Never `~` itself, never `~/Library`, never a system location, never a
+root the cloud names (the payload is `{}`; there is no field for a root). The walk stops at depth
+3, stops at 500 repositories, never follows a symlink, skips hidden and vendor directories, and
+treats a repository as a leaf. A folder without a `.git` in it is never reported and never
+descended into past that depth.
+
+**What leaves the Mac.** For each repository: the folder's name, the git remote's host and repo
+name if `.git/config` has one, and a handle. Nothing else — no path, no parent, no sibling, no
+count of what was skipped. The handle is `rh_` + a hash of the real path salted with the same
+device secret `projectIdFor` uses; that salt never leaves this Mac, so off-device a handle cannot
+be turned back into a path, and the same folder on two Macs produces two unrelated handles. The
+handles live in the daemon's memory for one hour, are never written to disk, and are dropped as
+soon as one of them is registered.
+
+**What this widens.** Before, a compromised cloud could reach *the folders a local action on this
+Mac had named*. Now it can also reach *any git repository under those folders*, because it can ask
+for the list and register one from it. That is a real widening and it is stated here rather than
+buried: a registered project is a project sessions can be started in.
+
+**What it still cannot do.** It cannot name a folder — every path in this flow came from this
+Mac's own scan. It cannot read a folder that is not a git repository under those roots. It cannot
+see anything the scan did not return: a handle it did not receive, guesses at a handle, and a
+handle from more than an hour ago are all `unknown_project`, answered without the filesystem being
+touched. It cannot make the scan look somewhere else, and registering a project still grants only
+what a project ever granted — the device floor, containment and approval rules above are unchanged.
+
+**Turning it off.** `PAGR_REMOTE_PROJECT_PICK=0` in the daemon's environment removes both commands
+(they answer `capability_unsupported`) and drops `repo_scan.v1` from `device.hello`, so the app
+stops offering it. Projects are then added only on this Mac, with `pagr project add`.
+`pagr doctor` prints which of the two you are in.
 
 ## Server key rotation (`transport.ts`)
 

@@ -92,6 +92,8 @@ Implementation: `packages/core/src/transport.ts`.
 | `agent.get_status` | `{ sessionId? }` | `{ sessions: SessionSummary[] }` |
 | `agent.respond_to_approval` | `{ approvalId, sessionId, providerRequestId, previewHash, decision: allow\|deny }` | `{ approvalId, decision }` |
 | `settings.sync_public_policy` | `{ approvalTimeoutSeconds }` | the stored policy |
+| `repo.scan` | `{}` | `RepoScanResult`: `{ repos: [{ handle: rh_<32hex>, displayName, repoHint?, registeredAs? }], truncated }` |
+| `project.register_handle` | `{ handle, displayName? }` | `ProjectSummary` |
 
 `settings.sync_public_policy` once also carried `smartApprovalsTierA`, which let the bridge answer
 "obviously safe" prompts itself. The bridge no longer decides approvals at all, so the field was
@@ -105,13 +107,28 @@ active turn; otherwise `queue`, and a `session.event` of kind `queued_followup` 
 `AttachmentRef` = `{ attachmentId, downloadUrl, sha256, sizeBytes ≤ 50 MiB, mimeType (png/jpeg/heic/webp),
 expiresAt }`. The bridge downloads, verifies, passes a local temp path to the adapter, and deletes it.
 
+`repo.scan` takes no arguments — deliberately, since a scan root would be a path from the cloud. The
+bridge walks its own conventional code folders (`scan.ts`, depth 3, 500 repositories, never `~`
+itself and never `~/Library`) and answers with handles: `rh_` + a device-salted hash of the real
+path, resolvable only in this daemon's memory and only for an hour. `registeredAs` is set when the
+repository is already a project, so the phone offers "open" rather than "add".
+
+`project.register_handle` resolves a handle from the last scan and registers that folder
+(`ProjectRegistry.ensure`), emitting `project.registered` when it is new. A handle that is unknown,
+expired, or invented is `unknown_project` — the filesystem is not touched to find out.
+
+Both commands are v2, are gated on `PAGR_REMOTE_PROJECT_PICK` (default on) and appear as
+`repo_scan.v1` in `device.hello.capabilities` exactly when they will run. With the flag off they
+ack `failed` / `capability_unsupported`. A second `repo.scan` within 30 s acks `failed` /
+`rate_limited`. `docs/SECURITY.md` § "Projects a phone can add" states what this widens.
+
 ## Device events (bridge → cloud)
 
 Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payload }`.
 
 | `type` | when | payload |
 | --- | --- | --- |
-| `device.hello` | after each successful auth | bridge/OS version, `agents: AgentConnectionStatus[]`, `projects: ProjectSummary[]`, `sessions` (bounded — see below) |
+| `device.hello` | after each successful auth | bridge/OS version, `agents: AgentConnectionStatus[]`, `projects: ProjectSummary[]`, `sessions` (bounded — see below), `capabilities?` (v2 names such as `repo_scan.v1`, present only when that command will run) |
 | `device.heartbeat` | every 20 s | `{ activeSessions }` |
 | `command.ack` | exactly once per received command (`inReplyTo = commandId`) | `{ commandId, status: accepted\|rejected\|completed\|failed\|duplicate, errorCode?, message?, result? }` |
 | `project.registered` / `project.removed` | local CLI or `project.remove` | `ProjectSummary` / `{ projectId }` |

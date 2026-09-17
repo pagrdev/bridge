@@ -15,7 +15,7 @@ import { SessionGuard } from './concurrency.js';
 import { type BridgeConfig, inspectConfig, readConfig, updateConfig } from './config.js';
 import { acquireDaemonLock, DaemonAlreadyRunningError, type DaemonLock } from './daemonLock.js';
 import type { LocalActionDetail } from './deviceFloor.js';
-import { ADOPTED_SESSION_NAME, Dispatcher } from './dispatcher.js';
+import { ADOPTED_SESSION_NAME, Dispatcher, type RemoteProjectPickStatus } from './dispatcher.js';
 import { makeEvent } from './events.js';
 import { type DeviceIdentity, InvalidDeviceKeyError, loadOrCreateIdentity } from './identity.js';
 import {
@@ -107,6 +107,8 @@ export interface DaemonStatus {
    * parses the status of an older daemon that has no keep-awake at all.
    */
   keepAwake?: KeepAwakeStatus;
+  /** Whether a phone may list and add repositories, and how many handles are cached right now. */
+  remoteProjectPick: RemoteProjectPickStatus;
   socketPath: string;
   pid: number;
   startedAt: string;
@@ -457,6 +459,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       .length,
     pendingApprovals: dispatcher.approvals.list().length,
     keepAwake: keepAwake.status(),
+    remoteProjectPick: dispatcher.remoteProjectPick(),
     socketPath: paths.socketPath,
     pid: process.pid,
     startedAt,
