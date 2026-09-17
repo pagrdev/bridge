@@ -1,12 +1,14 @@
 import type {
   AgentCapabilities,
   AgentConnectionStatus,
+  ApprovalOption,
   AttachmentRef,
   Provider,
   SessionSummary,
+  SessionSummaryV2,
 } from '@pagr/protocol';
 import type { LocalActionDetail } from '../deviceFloor.js';
-import type { FrameBody } from '../frames.js';
+import type { FrameBody, FrameQuestion } from '../frames.js';
 import type { JournalMeta } from '../journal.js';
 
 export interface LocalProject {
@@ -32,7 +34,12 @@ export interface SendInstructionInput {
 }
 
 export type AdapterEvent =
-  | { kind: 'session'; session: SessionSummary }
+  /**
+   * A session's state. `SessionSummaryV2` so an adapter can say how much of it Pagr may drive —
+   * a mirrored Codex TUI thread is `mirror_only`, `origin: 'terminal'`. Every added field is
+   * optional, so an adapter that only knows v1 keeps compiling and keeps meaning what it meant.
+   */
+  | { kind: 'session'; session: SessionSummaryV2 }
   | {
       kind: 'session_event';
       sessionId: string;
@@ -75,6 +82,14 @@ export type AdapterEvent =
        */
       local?: LocalActionDetail;
       expiresAt: string;
+      /** v2. The agent's own option list, in the agent's order. The phone renders exactly these. */
+      options?: ApprovalOption[];
+      /**
+       * Where this request reached us. `mirror` means the agent asked EVERY subscriber and the
+       * thread's owner (a terminal, an IDE) can answer it too: the bridge may relay it, but a
+       * silence from the phone is never an answer, and the owner answering first wins.
+       */
+      source?: 'owned' | 'mirror';
     }
   /**
    * One transcript frame: an assistant message, a tool call, a diff, a terminal block.
@@ -103,22 +118,54 @@ export type AdapterEvent =
       kind: 'approval_resolved_locally';
       approvalId: string;
       resolution: 'allowed' | 'denied' | 'timed_out' | 'canceled';
+      /** v2. Somebody answered it somewhere else — the phone dismisses rather than errors. */
+      answeredElsewhere?: boolean;
+    }
+  /**
+   * The agent asked the user a question (Codex `item/tool/requestUserInput`, Claude's
+   * `AskUserQuestion`). The body is a `question` frame; `answerable: false` says only the Mac can
+   * answer it, which is the honest answer for a thread we merely mirror.
+   */
+  | {
+      kind: 'question_asked';
+      sessionId: string;
+      projectId: string;
+      providerRequestId: string;
+      questions: FrameQuestion[];
+      answerable: boolean;
+      reason?: string;
+      /** Per question: the answer must never be echoed back or stored in the clear. */
+      secret: boolean[];
+      expiresAt: string;
     };
 
 export interface CodingAgentAdapter {
   readonly provider: Provider;
   probe(): Promise<AgentConnectionStatus>;
-  listSessions(): Promise<SessionSummary[]>;
-  startSession(input: StartSessionInput): Promise<SessionSummary>;
+  listSessions(): Promise<SessionSummaryV2[]>;
+  startSession(input: StartSessionInput): Promise<SessionSummaryV2>;
   sendInstruction(
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }>;
   stopSession(sessionId: string): Promise<void>;
-  getStatus(sessionId: string): Promise<SessionSummary | null>;
+  getStatus(sessionId: string): Promise<SessionSummaryV2 | null>;
   respondToApproval(input: {
     approvalId: string;
     providerRequestId: string;
     decision: 'allow' | 'deny';
+    /**
+     * v2. The exact option the user chose, from `approval.requested.options`. `decision` stays
+     * the truth for a v1 cloud that has never heard of options.
+     */
+    optionId?: string;
+  }): Promise<void>;
+  /**
+   * Answer a question the agent asked. Indexes, not text: the options came from the agent.
+   * Absent on an adapter whose agent cannot be asked questions.
+   */
+  answerQuestion?(input: {
+    providerRequestId: string;
+    answers: Array<{ questionIndex: number; optionIndexes: number[]; freeText?: string }>;
   }): Promise<void>;
   subscribe(emit: (e: AdapterEvent) => void): () => void;
   shutdown(): Promise<void>;
@@ -128,8 +175,10 @@ export interface CodingAgentAdapter {
 export type {
   AgentCapabilities,
   AgentConnectionStatus,
+  ApprovalOption,
   AttachmentRef,
   LocalActionDetail,
   Provider,
   SessionSummary,
+  SessionSummaryV2,
 };

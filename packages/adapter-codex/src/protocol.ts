@@ -72,6 +72,9 @@ export interface Thread {
   status: ThreadStatus;
   name: string | null;
   turns: Turn[];
+  /** generated/v2/Thread.ts: "Origin of the thread (CLI, VSCode, codex exec, app-server…)". */
+  source?: string | { type?: string } | null;
+  cliVersion?: string;
 }
 
 export interface ThreadStartParams {
@@ -93,10 +96,56 @@ export interface ThreadListParams {
   cursor?: string | null;
   limit?: number | null;
   cwd?: string | string[] | null;
+  /** generated/v2/ThreadSourceKind.ts. Omitted means "interactive sources". */
+  sourceKinds?: ThreadSourceKind[] | null;
+  /** "return from the state DB without scanning JSONL rollouts to repair thread metadata" */
+  useStateDbOnly?: boolean;
 }
 export interface ThreadListResponse {
   data: Thread[];
   nextCursor: string | null;
+}
+
+/** generated/v2/ThreadSourceKind.ts */
+export type ThreadSourceKind =
+  | 'cli'
+  | 'vscode'
+  | 'exec'
+  | 'appServer'
+  | 'subAgent'
+  | 'subAgentReview'
+  | 'subAgentCompact'
+  | 'subAgentThreadSpawn'
+  | 'subAgentOther'
+  | 'unknown';
+
+/** generated/v2/ThreadLoadedListParams.ts / ThreadLoadedListResponse.ts */
+export interface ThreadLoadedListParams {
+  cursor?: string | null;
+  limit?: number | null;
+}
+export interface ThreadLoadedListResponse {
+  /** Thread ids for sessions currently loaded in the server's memory. */
+  data: string[];
+  nextCursor: string | null;
+}
+
+/** generated/v2/ThreadReadParams.ts / ThreadReadResponse.ts */
+export interface ThreadReadParams {
+  threadId: string;
+  includeTurns?: boolean;
+}
+export interface ThreadReadResponse {
+  thread: Thread;
+}
+
+/** generated/v2/ThreadUnsubscribeParams.ts / ThreadUnsubscribeResponse.ts */
+export interface ThreadUnsubscribeParams {
+  threadId: string;
+}
+export type ThreadUnsubscribeStatus = 'notLoaded' | 'notSubscribed' | 'unsubscribed';
+export interface ThreadUnsubscribeResponse {
+  status: ThreadUnsubscribeStatus;
 }
 
 // ---- turn (generated/v2/Turn*.ts, UserInput.ts, ThreadItem.ts) ----
@@ -137,13 +186,89 @@ export interface TurnInterruptParams {
   turnId: string;
 }
 
+/** generated/v2/PatchChangeKind.ts */
+export type PatchChangeKind =
+  | { type: 'add' }
+  | { type: 'delete' }
+  | { type: 'update'; move_path?: string | null };
+
+/** generated/v2/FileUpdateChange.ts */
+export interface FileUpdateChange {
+  path: string;
+  kind: PatchChangeKind;
+  /** Unified diff for this one file, as the app-server rendered it. */
+  diff: string;
+}
+
+/** generated/v2/CommandExecutionStatus.ts (the values this adapter branches on). */
+export type CommandExecutionStatus = 'inProgress' | 'completed' | 'failed' | 'aborted';
+
+/** generated/v2/McpToolCallResult.ts — only the shape the mapper reads. */
+export interface McpToolCallResult {
+  content?: Array<{ type?: string; text?: string }> | null;
+  isError?: boolean | null;
+  structuredContent?: unknown;
+}
+
+/**
+ * The items this adapter maps to frames, copied field for field from `generated/v2/ThreadItem.ts`.
+ *
+ * The final member is the open end of the real union (twenty-odd variants, most of which mean
+ * nothing to a phone): an item this adapter has no mapping for is skipped, never guessed at.
+ */
 export type ThreadItem =
-  | { type: 'agentMessage'; id: string; text: string }
-  | { type: 'commandExecution'; id: string; command: string; status: string }
-  | { type: 'fileChange'; id: string; changes: Array<{ path: string; kind: string }> }
-  | { type: 'userMessage'; id: string }
-  | { type: 'reasoning'; id: string }
+  | { type: 'agentMessage'; id: string; text: string; phase?: string | null }
+  | { type: 'reasoning'; id: string; summary?: string[]; content?: string[] }
+  | { type: 'userMessage'; id: string; content?: UserInput[] }
+  | {
+      type: 'commandExecution';
+      id: string;
+      command: string;
+      cwd?: string;
+      status: CommandExecutionStatus | string;
+      aggregatedOutput?: string | null;
+      exitCode?: number | null;
+      durationMs?: number | null;
+    }
+  | {
+      type: 'fileChange';
+      id: string;
+      changes: FileUpdateChange[];
+      status?: string;
+    }
+  | {
+      type: 'mcpToolCall';
+      id: string;
+      server: string;
+      tool: string;
+      status?: string;
+      arguments?: unknown;
+      result?: McpToolCallResult | null;
+      error?: { message?: string } | string | null;
+    }
+  | {
+      type: 'dynamicToolCall';
+      id: string;
+      namespace?: string | null;
+      tool: string;
+      arguments?: unknown;
+      status?: string;
+      contentItems?: Array<{ type?: string; text?: string }> | null;
+      success?: boolean | null;
+    }
+  | {
+      type: 'webSearch';
+      id: string;
+      action?: WebSearchAction | null;
+    }
   | { type: string; id: string };
+
+/** generated/v2/WebSearchAction.ts */
+export type WebSearchAction =
+  | { type: 'search'; query?: string | null; queries?: string[] | null }
+  | { type: 'openPage'; url?: string | null }
+  | { type: 'findInPage'; url?: string | null; pattern?: string | null }
+  | { type: 'other' };
 
 // ---- notifications ----
 
@@ -238,6 +363,71 @@ export interface PermissionsRequestApprovalResponse {
   scope: 'turn' | 'session';
 }
 
+/** generated/v2/CommandExecutionOutputDeltaNotification.ts */
+export interface CommandExecutionOutputDeltaNotification {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  delta: string;
+}
+/** generated/v2/ReasoningTextDeltaNotification.ts (summaryTextDelta has `summaryIndex`). */
+export interface ReasoningTextDeltaNotification {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  delta: string;
+  contentIndex?: number;
+  summaryIndex?: number;
+}
+/** generated/v2/FileChangePatchUpdatedNotification.ts */
+export interface FileChangePatchUpdatedNotification {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  changes: FileUpdateChange[];
+}
+/** generated/v2/ServerRequestResolvedNotification.ts */
+export interface ServerRequestResolvedNotification {
+  threadId: string;
+  requestId: RpcId;
+}
+
+// ---- questions (generated/v2/ToolRequestUserInput*.ts) ----
+
+export interface ToolRequestUserInputOption {
+  label: string;
+  description: string;
+}
+export interface ToolRequestUserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options: ToolRequestUserInputOption[] | null;
+}
+export interface ToolRequestUserInputParams {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  questions: ToolRequestUserInputQuestion[];
+  isBlocking: boolean;
+  autoResolutionMs?: number | null;
+}
+/** `answers` is keyed by question id; each answer is a list of option labels (or free text). */
+export interface ToolRequestUserInputResponse {
+  answers: Record<string, { answers: string[] }>;
+}
+
+// ---- approval decisions (generated/v2/*ApprovalDecision.ts) ----
+
+/**
+ * The decisions the two approval enums actually offer. `acceptForSession` is Codex's own
+ * "allow for the rest of this session"; there is no `rejectForSession` in either enum, which is
+ * why `reject_always` is never offered for a Codex approval.
+ */
+export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
+
 export const METHODS = {
   initialize: 'initialize',
   initialized: 'initialized',
@@ -245,6 +435,9 @@ export const METHODS = {
   threadStart: 'thread/start',
   threadResume: 'thread/resume',
   threadList: 'thread/list',
+  threadLoadedList: 'thread/loaded/list',
+  threadRead: 'thread/read',
+  threadUnsubscribe: 'thread/unsubscribe',
   turnStart: 'turn/start',
   turnSteer: 'turn/steer',
   turnInterrupt: 'turn/interrupt',
@@ -254,6 +447,7 @@ export const SERVER_REQUESTS = {
   commandApproval: 'item/commandExecution/requestApproval',
   fileChangeApproval: 'item/fileChange/requestApproval',
   permissionsApproval: 'item/permissions/requestApproval',
+  requestUserInput: 'item/tool/requestUserInput',
 } as const;
 
 export const NOTIFICATIONS = {
@@ -263,6 +457,11 @@ export const NOTIFICATIONS = {
   itemStarted: 'item/started',
   itemCompleted: 'item/completed',
   agentMessageDelta: 'item/agentMessage/delta',
+  commandOutputDelta: 'item/commandExecution/outputDelta',
+  reasoningTextDelta: 'item/reasoning/textDelta',
+  reasoningSummaryTextDelta: 'item/reasoning/summaryTextDelta',
+  fileChangePatchUpdated: 'item/fileChange/patchUpdated',
+  serverRequestResolved: 'serverRequest/resolved',
   threadStatusChanged: 'thread/status/changed',
   accountUpdated: 'account/updated',
   error: 'error',

@@ -93,9 +93,16 @@ importers:
       '@pagr/protocol':
         specifier: workspace:*
         version: link:../protocol
+      ws:
+        specifier: ^8.21.3
+        version: 8.21.3
       zod:
         specifier: ^3.25.0
         version: 3.25.76
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
 
   packages/core:
     dependencies:

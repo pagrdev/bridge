@@ -269,6 +269,47 @@ read with a 2 s ceiling; past that the diff is the bridge's own and carries `app
 
 Implementation: `packages/adapter-claude/src/{stream-json,diffs}.ts` and `ClaudeAdapter.onRecord`.
 
+### Codex → frames
+
+Codex speaks items, not blocks. One frame per completed `ThreadItem`, plus coalesced frames while
+one is still streaming: deltas accumulate and leave every 750 ms or 2 KiB as a frame with
+`meta.status: 'streaming'`, `meta.final: false` and `providerRecordId = <itemId>#<n>`. The
+`item/completed` that follows carries the whole thing with `meta.final: true`, keyed on the item
+id — it REPLACES the stream on the phone rather than appending to it.
+
+| Codex item / notification | Frame | Notes |
+|---|---|---|
+| `item/agentMessage/delta` | streaming `assistant` | coalesced; `#n` on the record id |
+| `item/completed` `agentMessage` | `assistant` | `meta.final`; the turn's last one is also the `completed` session event |
+| `item/reasoning/textDelta`, `…/summaryTextDelta` | streaming `thinking` | both streams coalesce into one |
+| `item/completed` `reasoning` | `thinking` | `summary` then `content`, blank-line separated |
+| `item/commandExecution/outputDelta` | streaming `terminal` | each chunk still names the command |
+| `item/completed` `commandExecution` | `terminal` | `{command, stdout: aggregatedOutput, stderr: '', exitCode, interrupted}`; the app-server merges the two streams, so `stderr` is empty rather than guessed |
+| `item/completed` `fileChange` | one `diff` per `changes[]` | `changeKind` from the item's `PatchChangeKind`; hunks parsed from Codex's own unified diff, kept whole in `newText` if it is in a shape the parser does not know |
+| `item/completed` `mcpToolCall` / `dynamicToolCall` | `tool_call` + `tool_result` | `toolName` is `server/tool` (MCP) or `namespace.tool` |
+| `item/completed` `webSearch` | `tool_call` + `tool_result` | `toolKind: fetch` |
+| `item/completed` `userMessage` | `user` | images counted, never carried |
+| `item/tool/requestUserInput` | `question` + `question.asked` | `meta.secret[]` from each question's `isSecret` |
+| anything else (`plan`, `collabAgentToolCall`, `contextCompaction`, …) | — | no frame; an item with no mapping is skipped, never guessed at |
+
+`toolKind` for Codex: `other` for MCP and dynamic tool calls, `fetch` for `webSearch`. Command
+execution and file changes are `terminal` and `diff` frames, so they need no tool kind at all.
+
+Approval options come from the two Codex enums and nothing else — `allow_once → accept`,
+`allow_session → acceptForSession`, `reject_once → decline`; for `item/permissions/requestApproval`
+the same ids mean `scope: 'turn'`, `scope: 'session'` and an empty grant (which is how that API
+spells a denial). There is no `reject_always` in either enum, so it is never offered.
+
+A `backfill` (`thread/read {includeTurns:true}`) runs through the same mapper with
+`meta.source: 'backfill'` and keys each frame on (turnId, position) rather than the item id,
+because `thread/read` renumbers items `item-1`, `item-2`, … while live notifications use UUIDv7.
+
+Frames for a thread the bridge does not own — a terminal session mirrored through the shared
+app-server daemon — are identical; what differs is the session: `controlLevel: 'mirror_only'`,
+`origin: 'terminal'`. See TROUBLESHOOTING.md § "Codex daemon not running".
+
+Implementation: `packages/adapter-codex/src/{items,mirror,daemon,approvals}.ts`.
+
 ## Approval hints
 
 `hints` are deterministic booleans computed locally by adapters (`touchesOutsideProject`, `networkAccess`,

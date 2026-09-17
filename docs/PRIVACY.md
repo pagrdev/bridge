@@ -51,6 +51,16 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 | `run/daemon.sock` | Unix socket (0600) for the CLI and Claude hooks. Not reachable over the network. |
 | Keychain `dev.pagr.bridge / device.private_key` | Ed25519 private key. Never transmitted. |
 
+### What the daemon reads outside `~/.pagr`
+
+| Path | Why | Written? |
+| --- | --- | --- |
+| `~/.claude/settings.json`, `.claude/settings.json` | the permission hook's entry, so `pagr doctor` can tell you whether prompts from your own `claude` reach your phone | only by `pagr claude hook-install` |
+| `~/.claude/projects/<project>/<session>.jsonl` | Claude's own transcript, for the diff and terminal output of a tool call the stream did not carry | never |
+| `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) | existence only — whether you are logged in to Codex. The file is never opened. | never |
+| `$CODEX_HOME/app-server-control/app-server-control.sock` | Codex's **shared app-server control socket**. Pagr connects to it as one more client (the same socket your `codex` TUI uses) to mirror terminal threads and relay their approvals. Everything it learns there — thread ids, working directories, the transcript items of threads you are running — is what it would learn from a session you started through Pagr, and it is sealed to your phones the same way. Nothing on a mirrored thread is ever written: no turn, no steer, no answer to a prompt Pagr was not asked. | never |
+| `$CODEX_HOME` / `~/.codex` generally | not read. Pagr does not open `state_5.sqlite`, `logs_2.sqlite`, `config.toml` or `sessions/*.jsonl`; thread history comes from the app-server's own `thread/read`, which returns only what the phone would be shown. | never |
+
 `PAGR_INSECURE_FILE_STORE=1` moves the private key to `~/.pagr/secrets.json` (0600). It exists for CI
 and headless machines; the daemon logs a warning whenever it is in use.
 

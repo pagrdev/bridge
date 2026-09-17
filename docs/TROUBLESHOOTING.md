@@ -90,6 +90,46 @@ If `codex` is installed but `pagr doctor` says *not found on PATH*, it lives som
 
 The `codex app-server` process is started **only when a session needs it**, is shared by every Codex session, and is stopped again after about five minutes with nothing to do (the next instruction starts a fresh one and resumes the thread). Reporting Codex's status to the cloud — which happens on every gateway connect — starts nothing: the version is cached and the login state is read from `$CODEX_HOME/auth.json`, or from the app-server itself when one is already running for a session.
 
+## Codex daemon not running
+
+`pagr doctor` prints one line about Codex's **shared app-server daemon**:
+
+```
+codex daemon: attached (0.149.1)          # we are on your daemon; terminal threads are mirrored
+codex daemon: not running (run `codex app-server daemon start`; installer-managed builds only)
+codex daemon: embedded fallback — …       # the socket is there and did not answer
+```
+
+What it means:
+
+- **attached** — Pagr is a second client on the app-server your own `codex` uses. Threads you start
+  in a terminal are discovered (`thread/list` + `thread/loaded/list`, on connect and every 30 s),
+  mirrored into the app as `mirror_only` sessions, and their approval prompts are relayed to your
+  phone. Pagr cannot steer or stop them: the thread's own process holds its writer lock
+  ([openai/codex#44449](https://github.com/openai/codex/issues/44449)), and Codex refuses a second
+  writer. Whoever answers a prompt first wins — if you answer in the terminal, the card on your
+  phone is withdrawn rather than left hanging.
+- **not running** — nothing is listening on
+  `$CODEX_HOME/app-server-control/app-server-control.sock` (default `~/.codex/…`). Everything Pagr
+  starts itself still works: it runs its own `codex app-server` as a child. What you do not get is
+  the mirror of terminal sessions. **Pagr never starts the daemon for you.** `codex app-server
+  daemon start` only works for the installer-managed standalone package
+  (`curl -fsSL https://chatgpt.com/codex/install.sh | sh`); an npm install of `@openai/codex`
+  fails with *managed standalone Codex install not found*, and a command that always fails is not
+  one Pagr should be running behind your back. The ChatGPT desktop app and the IDE extensions run
+  their own private app-servers and never use the daemon either.
+- **embedded fallback** — the socket exists but did not complete `initialize` within 2 s (a stale
+  socket file, or a daemon that is wedged). Pagr used its own child instead. Check it with
+  `codex app-server daemon version`; if it reports `notRunning`, delete the stale socket.
+
+Threads owned by another process — the desktop app, an IDE extension, `codex exec` — cannot be
+subscribed to at all. Those are mirrored read-only by polling `thread/read` every 3 seconds while
+they are active, so they arrive a beat later and carry no approval prompts.
+
+A mirrored thread whose working directory is not a registered project stays **local**: it is listed
+by `pagr sessions`, and nothing about it is sent to the cloud, because a session has to name a
+project id to be described at all. `pagr projects add <dir>` is what changes that.
+
 ## Claude approvals not reaching your phone
 
 There are two paths, and they fail differently.

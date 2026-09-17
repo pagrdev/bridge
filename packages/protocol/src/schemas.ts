@@ -105,7 +105,17 @@ export const SessionStatus = z.enum([
 export type SessionStatus = z.infer<typeof SessionStatus>;
 
 export const ClaudeMode = z.enum(['cli-hooks', 'approved-channel', 'disabled']);
-export const CodexMode = z.enum(['app-server', 'disabled']);
+/**
+ * `app-server` is the historical answer and still what a probe reports before anything is
+ * connected; once there is a link it says WHICH one — the user's shared daemon, or the private
+ * child this bridge spawned because there was no daemon to attach to.
+ */
+export const CodexMode = z.enum([
+  'app-server',
+  'app-server-daemon',
+  'app-server-embedded',
+  'disabled',
+]);
 
 export const AgentCapabilities = z.object({
   canStartSession: z.boolean(),

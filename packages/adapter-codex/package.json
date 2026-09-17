@@ -1,7 +1,7 @@
 {
   "name": "@pagr/bridge-adapter-codex",
   "version": "0.1.0",
-  "description": "Codex adapter for the Pagr bridge — drives `codex app-server` threads and relays their approval requests as typed approvals.",
+  "description": "Codex adapter for the Pagr bridge \u2014 drives `codex app-server` threads and relays their approval requests as typed approvals.",
   "keywords": [
     "pagr",
     "bridge",
@@ -45,6 +45,10 @@
   "dependencies": {
     "@pagr/bridge-core": "workspace:*",
     "@pagr/protocol": "workspace:*",
-    "zod": "^3.25.0"
+    "zod": "^3.25.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
   }
 }
