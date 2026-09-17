@@ -1,22 +1,52 @@
 import { z } from 'zod';
 
 /**
- * Pagr device protocol v1.
+ * Pagr device protocol, versions 1 and 2.
  *
  * This file is the CANONICAL definition of everything the Pagr cloud can ask a paired bridge
  * to do, and everything a bridge reports back. It is intentionally small and closed:
  *
  *   - There is no `shell.exec`, `filesystem.read_any`, `process.spawn_any`, or any generic
  *     command. Every command is a typed capability whose payload is validated here.
- *   - The cloud never sends filesystem paths. Projects are opaque `proj_…` IDs that the bridge
- *     resolves against its LOCAL registry. Cloud-supplied paths are rejected by schema.
+ *   - The cloud never sends filesystem paths, and no path ever travels back either: projects are
+ *     opaque `proj_…` IDs the bridge resolves against its LOCAL registry, and a repository the
+ *     phone has not registered yet is an opaque `rh_…` handle. Paths are rejected by schema.
  *   - Every command carries user/device binding, issue/expiry times, a nonce, an idempotency
  *     key, and a server signature (see `CommandEnvelope`).
+ *
+ * ## v2, and why one schema describes both
+ *
+ * v2 adds the phone: sealed transcript frames, questions, approval options, control levels,
+ * backfill and repository handles. It is strictly ADDITIVE, and both versions are described by
+ * these same schemas, because a bridge and a gateway of different vintages have to understand
+ * each other's frames on the same socket. Every v2 field a v1 peer would not send is therefore
+ * optional (or defaulted), and no v1 shape has been narrowed.
+ *
+ * Which version is in force is negotiated, not assumed: the bridge OFFERS
+ * `auth.response.protocolVersion` (2 for a current bridge) and the gateway ANSWERS with
+ * `auth.result.protocolVersion` — absent means 1. Neither side may send a v2-only command or
+ * event until that answer says 2; a gateway that refuses the offer with `protocol_version` gets
+ * one more attempt offering 1.
+ *
+ * Content is sealed end to end (`SealedEnvelope`): the cloud stores and forwards the envelope
+ * without holding a key that opens it, and only routing metadata — ids, kinds, sizes, statuses,
+ * risk hints — is in the clear.
  *
  * The private platform repo vendors a copy of this file and has a test that fails if it drifts.
  */
 
+/** The baseline both peers always speak; also what the pairing API is checked against. */
 export const PROTOCOL_VERSION = 1 as const;
+
+/**
+ * The newest version this file describes — what a current bridge OFFERS in `auth.response`.
+ * What it may actually SEND is the negotiated version from `auth.result`, never this constant.
+ */
+export const LATEST_PROTOCOL_VERSION = 2 as const;
+
+/** Every protocol version these schemas parse. */
+export const ProtocolVersion = z.union([z.literal(1), z.literal(2)]);
+export type ProtocolVersion = z.infer<typeof ProtocolVersion>;
 
 // ---------- primitives ----------
 
@@ -28,7 +58,34 @@ export const SessionId = prefixed('ses');
 export const CommandId = prefixed('cmd');
 export const ApprovalId = prefixed('apr');
 export const AttachmentId = prefixed('att');
+/** v2. A question an agent asked the user; answered from the phone or on the Mac. */
+export const QuestionId = prefixed('qst');
+/**
+ * v2. A repository the bridge found on disk but that is not a registered project yet. It is a
+ * salted hash of the real path, held in memory for an hour — never the path itself, so a phone
+ * can offer "add this repo" without the cloud ever learning where anything lives.
+ */
+export const RepoHandle = prefixed('rh');
 export const IsoDate = z.string().datetime({ offset: true });
+
+/**
+ * v2. A public key's fingerprint: `sha256(raw key).hex[0:16]` in groups of four. Identical on
+ * both sides of the wire and short enough to read out loud when verifying a phone by hand.
+ */
+export const KeyFingerprint = z.string().regex(/^[0-9a-f]{4}(?::[0-9a-f]{4}){3}$/);
+
+/**
+ * Unpadded base64url. With `bytes`, the exact length that many bytes encode to, so a malformed
+ * key, nonce or tag is refused by schema rather than by a decryption failure later.
+ */
+const base64url = (bytes?: number) =>
+  z
+    .string()
+    .regex(
+      bytes === undefined
+        ? /^[A-Za-z0-9_-]+$/
+        : new RegExp(`^[A-Za-z0-9_-]{${Math.ceil((bytes * 4) / 3)}}$`),
+    );
 
 export const Provider = z.enum(['claude', 'codex']);
 export type Provider = z.infer<typeof Provider>;
@@ -117,6 +174,262 @@ export const AttachmentRef = z.object({
 });
 export type AttachmentRef = z.infer<typeof AttachmentRef>;
 
+/** What an approval is asking permission to do. Also used as a frame's `actionType`. */
+export const ApprovalActionType = z.enum([
+  'command_execution',
+  'file_change',
+  'permission',
+  'tool_use',
+  'other',
+]);
+export type ApprovalActionType = z.infer<typeof ApprovalActionType>;
+
+// ---------- v2: sealed transcript frames ----------
+
+/**
+ * Domain separator for the frame seal. It is the HKDF `info` (together with the canonical AAD),
+ * so a key derived for one sealing scheme can never open an envelope made under another.
+ */
+export const SEAL_CONTEXT = 'pagr.seal.v1';
+
+/**
+ * Domain separator for `recipientKeysSignature`, so a command signature can never be replayed as
+ * a recipient-key-set signature — the same discipline as `SERVER_KEY_SET_CONTEXT`.
+ */
+export const RECIPIENT_KEY_SET_CONTEXT = 'pagr.recipient-keys.v1:';
+
+/**
+ * What a frame IS, in the clear. The kind drives routing, badges and push on the cloud side; the
+ * words themselves are inside the seal. `imessage` is the one kind that is plaintext by nature —
+ * those messages travelled in the clear through the iMessage thread anyway.
+ */
+export const FrameKind = z.enum([
+  'user',
+  'assistant',
+  'tool_call',
+  'tool_result',
+  'diff',
+  'terminal',
+  'thinking',
+  'question',
+  'approval_preview',
+  'system',
+  'imessage',
+]);
+export type FrameKind = z.infer<typeof FrameKind>;
+
+/** A body too large for one frame is split; the phone reassembles by `group`. */
+export const FrameChunk = z.object({
+  group: z.string().min(1).max(64),
+  index: z.number().int().nonnegative(),
+  total: z.number().int().positive().max(1000),
+});
+export type FrameChunk = z.infer<typeof FrameChunk>;
+
+/**
+ * The plaintext both ends authenticate and the cloud indexes on. Deliberately only what routing
+ * needs: which session, which position in it, and what kind of thing it is.
+ */
+export const SealAad = z.object({
+  sessionId: SessionId,
+  seq: z.number().int().nonnegative(),
+  kind: FrameKind,
+  chunk: FrameChunk.optional(),
+});
+export type SealAad = z.infer<typeof SealAad>;
+
+/** One phone's copy of the content key, wrapped to its X25519 key. */
+export const SealedRecipient = z.object({
+  kid: KeyFingerprint,
+  nonce: base64url(12),
+  /** ChaCha20-Poly1305 of the 32-byte content key: 32 bytes + a 16-byte tag. */
+  wrap: base64url(48),
+});
+export type SealedRecipient = z.infer<typeof SealedRecipient>;
+
+/** The envelope format version. Bumped only if the sealing scheme itself changes. */
+export const SEAL_ENVELOPE_VERSION = 1 as const;
+
+/**
+ * A sealed frame body. Ephemeral X25519 per envelope; one wrapped content key per phone; the body
+ * itself encrypted once under that content key with `canonicalize(aad)` as the AAD.
+ *
+ * The cloud validates this shape and its size and stores it opaque. It holds no key that opens
+ * `ct`, and `aad` is the only part it can read — which is why `aad` carries ids and never words.
+ */
+export const SealedEnvelope = z.object({
+  v: z.literal(SEAL_ENVELOPE_VERSION),
+  /** The ephemeral X25519 public key, raw. */
+  epk: base64url(32),
+  recipients: z.array(SealedRecipient).min(1).max(32),
+  nonce: base64url(12),
+  /** Ciphertext + 16-byte tag. Sized by the bridge's chunker, not by this cap. */
+  ct: base64url().max(262_144),
+  aad: SealAad,
+});
+export type SealedEnvelope = z.infer<typeof SealedEnvelope>;
+
+/** Plaintext facts about a frame. Never its content. */
+export const FrameMeta = z.object({
+  turnId: z.string().min(1).max(200).optional(),
+  parentFrameId: z.string().min(1).max(200).optional(),
+  actionType: ApprovalActionType.optional(),
+  status: z.enum(['ok', 'error', 'interrupted', 'streaming']).optional(),
+  /** False while a streaming frame is still being appended to. */
+  final: z.boolean().optional(),
+  subagent: z
+    .object({ id: z.string().min(1).max(200), depth: z.number().int().nonnegative().max(8) })
+    .optional(),
+  /** Size of the body BEFORE sealing, so the phone can show "truncated" honestly. */
+  bytes: z.number().int().nonnegative(),
+  truncated: z.boolean().default(false),
+  chunk: FrameChunk.optional(),
+  /** Where the bridge read it: the agent's stdio, the on-disk transcript, the app server, or a backfill. */
+  source: z.enum(['stdio', 'transcript', 'app_server', 'backfill']),
+  delivery: z
+    .object({
+      state: z.enum(['queued', 'picked_up', 'delivered']),
+      followupId: z.string().min(1).max(200).optional(),
+    })
+    .optional(),
+});
+export type FrameMeta = z.infer<typeof FrameMeta>;
+
+// ---------- v2: control, approvals, questions ----------
+
+/**
+ * How much of a session Pagr may drive. A session Pagr started is `full`; a terminal session with
+ * a bound channel is `full`, without one `approvals_only`; a Codex TUI thread is `mirror_only`;
+ * an unregistered working directory is `none`.
+ */
+export const ControlLevel = z.enum(['full', 'approvals_only', 'mirror_only', 'none']);
+export type ControlLevel = z.infer<typeof ControlLevel>;
+
+/** Who started the session, as far as the bridge can tell. */
+export const SessionOrigin = z.enum(['pagr', 'terminal', 'ide', 'unknown']);
+export type SessionOrigin = z.infer<typeof SessionOrigin>;
+
+/** Whether the session's directory is a project the user has registered. */
+export const ProjectStatus = z.enum(['registered', 'unregistered']);
+export type ProjectStatus = z.infer<typeof ProjectStatus>;
+
+/**
+ * What the agent itself offers for an approval. `optionId` is the agent's own identifier (for
+ * Claude and Codex it equals `kind`); the phone renders the options in the order given and never
+ * invents one.
+ */
+export const ApprovalOptionKind = z.enum([
+  'allow_once',
+  'allow_always',
+  'allow_session',
+  'reject_once',
+  'reject_always',
+]);
+export type ApprovalOptionKind = z.infer<typeof ApprovalOptionKind>;
+
+export const ApprovalOption = z.object({
+  optionId: z.string().min(1).max(64),
+  kind: ApprovalOptionKind,
+  label: z.string().min(1).max(120),
+});
+export type ApprovalOption = z.infer<typeof ApprovalOption>;
+
+/** A / B / C, coarsest first. The cloud takes the higher of this and its own hint-based tier. */
+export const RiskTier = z.enum(['A', 'B', 'C']);
+export type RiskTier = z.infer<typeof RiskTier>;
+
+/** What `agent.send_instruction` did with the instruction, reported in its `command.ack.result`. */
+export const InstructionDelivery = z.enum(['steered', 'queued', 'new_turn']);
+export type InstructionDelivery = z.infer<typeof InstructionDelivery>;
+export const SendInstructionResult = z.object({ delivered: InstructionDelivery });
+export type SendInstructionResult = z.infer<typeof SendInstructionResult>;
+
+/** What `repo.scan` answers with, in its `command.ack.result`. Handles, never paths. */
+export const RepoScanResult = z.object({
+  repos: z
+    .array(
+      z.object({
+        handle: RepoHandle,
+        displayName: z.string().min(1).max(80),
+        repoHint: z
+          .object({
+            host: z.string().optional(),
+            name: z.string().optional(),
+            defaultBranch: z.string().optional(),
+          })
+          .optional(),
+        /** Set when this repository is already a registered project. */
+        registeredAs: ProjectId.optional(),
+      }),
+    )
+    .max(500),
+  truncated: z.boolean().default(false),
+});
+export type RepoScanResult = z.infer<typeof RepoScanResult>;
+
+// ---------- v2: recipient keys ----------
+
+/** Feature flags the gateway tells the bridge about; they decide what may be sent in the clear. */
+export const ProtocolFeatures = z.object({
+  /** The user has an iMessage thread linked, so plaintext `imessage` text is allowed. */
+  imessage: z.boolean().default(false),
+});
+export type ProtocolFeatures = z.infer<typeof ProtocolFeatures>;
+
+/**
+ * One phone the bridge seals to.
+ *
+ * `kid` and `x25519` are checked hard — the bridge re-derives the fingerprint from the key and
+ * refuses a set where they disagree. The descriptive fields are optional because this parse must
+ * never be STRICTER than whatever a gateway signed: the signature is verified over the bytes as
+ * received, so a set that a slightly older (or newer) cloud issued must still parse here, or the
+ * bridge would reject a perfectly valid rotation it could verify.
+ */
+export const RecipientKey = z.object({
+  kid: KeyFingerprint,
+  /** Raw X25519 public key. */
+  x25519: base64url(32),
+  name: z.string().min(1).max(80).optional(),
+  registeredAt: IsoDate.optional(),
+});
+export type RecipientKey = z.infer<typeof RecipientKey>;
+
+/**
+ * The set of phones a bridge seals frames for. Signed by the gateway under
+ * `RECIPIENT_KEY_SET_CONTEXT + canonicalize(set)`; the bridge accepts an unsigned set only when
+ * it grants no new trust (the same set again, or a narrower one), exactly as it treats server
+ * keys — otherwise a gateway that has been talked into serving one extra key could read
+ * everything from then on.
+ */
+export const RecipientKeySet = z.object({
+  v: z.literal(1),
+  userId: UserId,
+  keys: z.array(RecipientKey).max(32),
+  features: ProtocolFeatures.optional(),
+  issuedAt: IsoDate.optional(),
+});
+export type RecipientKeySet = z.infer<typeof RecipientKeySet>;
+
+export const RecipientKeySetSignature = z.object({
+  keyId: z.string().min(1).max(32),
+  signature: z.string().min(1).max(200),
+});
+export type RecipientKeySetSignature = z.infer<typeof RecipientKeySetSignature>;
+
+/**
+ * A session as v2 describes it. Every added field is optional so a v1 bridge's summary — which
+ * has none of them — parses through this same schema unchanged; absent `controlLevel` means the
+ * v1 answer, full control of a session Pagr started.
+ */
+export const SessionSummaryV2 = SessionSummary.extend({
+  controlLevel: ControlLevel.optional(),
+  origin: SessionOrigin.optional(),
+  projectStatus: ProjectStatus.optional(),
+  /** Highest frame sequence the bridge has journaled for this session. */
+  lastSeq: z.number().int().nonnegative().optional(),
+});
+export type SessionSummaryV2 = z.infer<typeof SessionSummaryV2>;
+
 // Builds a properly-typed discriminated union from a `{ type: payloadSchema }` map.
 type VariantsOf<M extends Record<string, z.ZodTypeAny>> = {
   [K in keyof M & string]: z.ZodObject<{ type: z.ZodLiteral<K>; payload: M[K] }>;
@@ -159,10 +472,66 @@ export const CommandPayloads = {
     /** sha256 of the preview shown to the user; bridge re-checks against its retained request. */
     previewHash: z.string().regex(/^[0-9a-f]{64}$/),
     decision: z.enum(['allow', 'deny']),
+    /**
+     * v2. The exact option the user chose, from `approval.requested.options`. `decision` stays
+     * required and stays the truth for a v1 bridge, which has never heard of options; a v2 bridge
+     * answers the agent with this id (so "allow always" really is the agent's own "always").
+     */
+    optionId: z.string().min(1).max(64).optional(),
   }),
   'settings.sync_public_policy': z.object({
     approvalTimeoutSeconds: z.number().int().min(30).max(3600).default(600),
   }),
+
+  // ---- v2 ----
+
+  /** Answer a question the agent asked. Indexes, not text: the options came from the agent. */
+  'agent.answer_question': z.object({
+    questionId: QuestionId,
+    sessionId: SessionId,
+    providerRequestId: z.string().min(1).max(200),
+    answers: z
+      .array(
+        z.object({
+          questionIndex: z.number().int().nonnegative().max(50),
+          optionIndexes: z.array(z.number().int().nonnegative().max(200)).max(50),
+          freeText: z.string().max(4000).optional(),
+        }),
+      )
+      .min(1)
+      .max(50),
+  }),
+  /** List sessions the bridge knows about but has not streamed, so the phone can ask for them. */
+  'session.list_history': z.object({
+    provider: Provider.optional(),
+    projectId: ProjectId.optional(),
+    sinceDays: z.number().int().min(1).max(365).default(30),
+    limit: z.number().int().min(1).max(200).default(50),
+  }),
+  /** Replay journaled frames the phone does not have. Bounded, because it competes with live traffic. */
+  'session.backfill': z.object({
+    sessionId: SessionId,
+    fromSeq: z.number().int().nonnegative(),
+    toSeq: z.number().int().nonnegative().optional(),
+    maxBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(8 * 1024 * 1024)
+      .default(1024 * 1024),
+  }),
+  /**
+   * List the repositories on this Mac as opaque handles, so a phone can add a project without
+   * anybody — the cloud included — learning a path. Rate limited by the bridge.
+   */
+  'repo.scan': z.object({}),
+  /** Register one of those handles as a project. The bridge resolves the handle locally. */
+  'project.register_handle': z.object({
+    handle: RepoHandle,
+    displayName: z.string().min(1).max(80).optional(),
+  }),
+  /** Ask the gateway to re-send the recipient key set (after a phone was added or revoked). */
+  'keys.sync': z.object({}),
 } as const;
 
 export type CommandType = keyof typeof CommandPayloads;
@@ -173,7 +542,8 @@ const commandVariants = variantsOf(CommandPayloads);
 /** The unsigned portion of a command. Signed as canonical JSON (see `canonicalize`). */
 export const CommandBody = z
   .object({
-    version: z.literal(PROTOCOL_VERSION),
+    /** 1 or 2 — see the header. The *negotiated* version decides what may be sent. */
+    version: ProtocolVersion,
     commandId: CommandId,
     userId: UserId,
     deviceId: DeviceId,
@@ -197,23 +567,30 @@ export type CommandPayload<T extends CommandType> = z.infer<(typeof CommandPaylo
 
 // ---------- bridge → cloud events ----------
 
-export const ApprovalActionType = z.enum([
-  'command_execution',
-  'file_change',
-  'permission',
-  'tool_use',
-  'other',
-]);
-
 export const EventPayloads = {
   'device.hello': z.object({
     bridgeVersion: z.string(),
-    protocolVersion: z.literal(PROTOCOL_VERSION),
+    protocolVersion: ProtocolVersion,
     platform: z.enum(['darwin']),
     osVersion: z.string().optional(),
     agents: z.array(AgentConnectionStatus),
     projects: z.array(ProjectSummary),
-    sessions: z.array(SessionSummary),
+    sessions: z.array(SessionSummaryV2),
+    /** v2. Named capabilities (`frames.v1`, `seal.v1`, …) so the cloud gates features on facts. */
+    capabilities: z.array(z.string().min(1).max(64)).max(64).optional(),
+    /** v2. Approval classes the user has lifted off the floor on this Mac. */
+    floor: z.object({ lifted: z.array(z.string().min(1).max(64)).max(64) }).optional(),
+    /** v2. State of the Claude channel install, for `pagr doctor` and the app's Security screen. */
+    channel: z
+      .object({
+        serverInstalled: z.boolean(),
+        shimOnPath: z.boolean(),
+        boundSessions: z.number().int().nonnegative(),
+        mode: z.string().max(40),
+      })
+      .optional(),
+    /** v2. Which phones this bridge is currently sealing to, so a mismatch is visible. */
+    recipientKeyIds: z.array(KeyFingerprint).max(32).optional(),
   }),
   'device.heartbeat': z.object({ activeSessions: z.number().int().nonnegative() }),
   'command.ack': z.object({
@@ -232,15 +609,26 @@ export const EventPayloads = {
         'capability_unsupported',
         'provider_error',
         'invalid_payload',
+        /** v2. The question id is not pending any more: it expired, or was already answered. */
+        'unknown_question',
+        /** v2. The bridge is throttling this command class (a repeated `repo.scan`, say). */
+        'rate_limited',
+        /** v2. A v2-only command arrived on a link that negotiated v1. */
+        'not_negotiated',
       ])
       .optional(),
     message: z.string().max(500).optional(),
+    /**
+     * Command-specific payload. Typed per command by the schemas above: `SendInstructionResult`
+     * for `agent.send_instruction`, `RepoScanResult` for `repo.scan`. Left `unknown` here because
+     * an ack does not carry the type of the command it answers — the caller knows it from the row.
+     */
     result: z.unknown().optional(),
   }),
   'project.registered': ProjectSummary,
   'project.removed': z.object({ projectId: ProjectId }),
   'agent.connection': AgentConnectionStatus,
-  'session.updated': SessionSummary,
+  'session.updated': SessionSummaryV2,
   'session.event': z.object({
     sessionId: SessionId,
     projectId: ProjectId,
@@ -267,8 +655,15 @@ export const EventPayloads = {
     provider: Provider,
     providerRequestId: z.string().min(1).max(200),
     actionType: ApprovalActionType,
-    /** Short, user-safe preview: the command line or file list. Never full file contents. */
-    preview: z.string().max(1500),
+    /**
+     * Short, user-safe preview: the command line or file list. Never full file contents.
+     *
+     * v1 always sends it and keeps working exactly as before. v2 sends the preview sealed, in its
+     * own `approval_preview` frame, so this plaintext copy defaults away — one schema cannot ask
+     * for a field conditionally, and defaulting is what lets a v1 payload and a v2 payload both
+     * parse without the cloud having to guess which it is holding.
+     */
+    preview: z.string().max(1500).default(''),
     previewHash: z.string().regex(/^[0-9a-f]{64}$/),
     /** Deterministic risk hints computed locally; cloud applies final tiering. */
     hints: z
@@ -283,15 +678,93 @@ export const EventPayloads = {
       })
       .default({}),
     expiresAt: IsoDate,
+    /** v2. The agent's own options, in the agent's order. The phone renders exactly these. */
+    options: z.array(ApprovalOption).max(8).optional(),
+    /** v2. The bridge's local tier; the cloud takes the higher of this and its own. */
+    riskTier: RiskTier.optional(),
+    /** v2. Sequence of the sealed `approval_preview` frame carrying the full preview. */
+    frameSeq: z.number().int().nonnegative().optional(),
+    /** v2. Plaintext line for the iMessage thread; only sent when iMessage is linked. */
+    imessage: z.string().max(1500).optional(),
   }),
   'approval.resolved_locally': z.object({
     approvalId: ApprovalId,
     resolution: z.enum(['allowed', 'denied', 'timed_out', 'canceled']),
+    /** v2. Where the answer came from, so the phone can say "answered on your Mac". */
+    source: z.enum(['terminal', 'ide', 'provider', 'bridge', 'timeout']).optional(),
+    /**
+     * v2. True when somebody answered it somewhere else while the phone was showing it — the
+     * phone dismisses its card instead of reporting an error.
+     */
+    answeredElsewhere: z.boolean().default(false),
   }),
   'attachment.consumed': z.object({
     attachmentId: AttachmentId,
     ok: z.boolean(),
     error: z.string().optional(),
+  }),
+
+  // ---- v2 ----
+
+  /**
+   * One transcript frame. The body is inside `sealed`; everything outside it is routing metadata
+   * the cloud is allowed to see. `seq` is allocated by the bridge's journal and is monotonic per
+   * session, which is what makes replay and backfill exact.
+   */
+  'session.frame': z.object({
+    sessionId: SessionId,
+    projectId: ProjectId,
+    provider: Provider,
+    seq: z.number().int().nonnegative(),
+    kind: FrameKind,
+    at: IsoDate,
+    /** The provider's own id for the record this frame came from; used to de-duplicate. */
+    providerRecordId: z.string().min(1).max(200).optional(),
+    sealed: SealedEnvelope,
+    meta: FrameMeta,
+    /** Plaintext line for the iMessage thread; only sent when iMessage is linked. */
+    imessage: z.string().max(1500).optional(),
+  }),
+  /**
+   * The agent asked the user something. The text and the option labels are in the sealed frame at
+   * `seq`; `meta` says only what the phone needs to lay the answer sheet out before decrypting.
+   */
+  'question.asked': z.object({
+    questionId: QuestionId,
+    sessionId: SessionId,
+    projectId: ProjectId,
+    provider: Provider,
+    providerRequestId: z.string().min(1).max(200),
+    seq: z.number().int().nonnegative(),
+    meta: z.object({
+      /** False when only the Mac can answer (a terminal dialog Pagr cannot reach). */
+      answerable: z.boolean(),
+      reason: z.string().max(80).optional(),
+      multiSelect: z.array(z.boolean()).max(50),
+      optionCount: z.array(z.number().int().nonnegative().max(200)).max(50),
+      /** Per question: the answer must never be echoed back or stored in the clear. */
+      secret: z.array(z.boolean()).max(50),
+    }),
+    expiresAt: IsoDate,
+    imessage: z.string().max(1500).optional(),
+  }),
+  'question.answered': z.object({
+    questionId: QuestionId,
+    /** True when the Mac answered it while the phone had it open. */
+    answeredElsewhere: z.boolean().default(false),
+  }),
+  /**
+   * The agent actually applied a decision. This is what moves the phone's card from `sending` to
+   * `acknowledged`: the command ack only says the bridge received the instruction.
+   */
+  'approval.applied': z.object({
+    approvalId: ApprovalId,
+    sessionId: SessionId,
+    optionId: z.string().min(1).max(64),
+    applied: z.boolean(),
+    /** What the agent did with it, when that differs from the option asked for. */
+    appliedAs: z.string().min(1).max(64).optional(),
+    error: z.string().max(500).optional(),
   }),
 } as const;
 
@@ -302,7 +775,7 @@ const eventVariants = variantsOf(EventPayloads);
 
 export const DeviceEvent = z
   .object({
-    version: z.literal(PROTOCOL_VERSION),
+    version: ProtocolVersion,
     eventId: z.string().min(8).max(64),
     deviceId: DeviceId,
     at: IsoDate,
@@ -330,7 +803,8 @@ export const AuthResponse = z.object({
   nonce: z.string(),
   signature: z.string(), // base64url Ed25519 over `${deviceId}.${nonce}`
   bridgeVersion: z.string(),
-  protocolVersion: z.literal(PROTOCOL_VERSION),
+  /** The highest version this bridge speaks — an OFFER. The gateway's answer is what binds. */
+  protocolVersion: ProtocolVersion,
 });
 export const AuthResult = z.object({
   kind: z.literal('auth.result'),
@@ -348,16 +822,54 @@ export const AuthResult = z.object({
     .object({ keyId: z.string().min(1).max(32), signature: z.string().min(1).max(200) })
     .optional(),
   minBridgeVersion: z.string().optional(),
+  /**
+   * v2. The version the gateway ACCEPTS for this connection, answering the bridge's offer.
+   * Absent means 1 — which is what every gateway deployed before v2 sends, and why nothing
+   * v2-only may be emitted until this says 2.
+   */
+  protocolVersion: ProtocolVersion.optional(),
+  /** v2. The phones to seal frames for. Empty set → the bridge journals frames and sends none. */
+  recipientKeys: RecipientKeySet.optional(),
+  /** v2. Signature over `RECIPIENT_KEY_SET_CONTEXT + canonicalize(recipientKeys)`. */
+  recipientKeysSignature: RecipientKeySetSignature.optional(),
+  /** v2. What the account has switched on; `imessage` gates every plaintext `imessage` field. */
+  features: ProtocolFeatures.optional(),
 });
 
 /** Domain separator for `serverKeysSignature`, so a command signature can never be replayed as one. */
 export const SERVER_KEY_SET_CONTEXT = 'pagr.server-keys.v1:';
+
+/**
+ * v2. The gateway has persisted every frame up to `cursors[sessionId]`. The bridge resumes from
+ * its journal for any session where what it sent is ahead of what was acked, which is what makes
+ * a dropped socket lossless rather than a gap in the transcript.
+ */
+export const GatewayAck = z.object({
+  kind: z.literal('ack'),
+  cursors: z.record(z.number().int().nonnegative()),
+});
+
+/** v2. A phone was added or revoked; seal to this set from now on. Same trust rule as `auth.result`. */
+export const KeysUpdated = z.object({
+  kind: z.literal('keys.updated'),
+  recipientKeys: RecipientKeySet,
+  recipientKeysSignature: RecipientKeySetSignature.optional(),
+});
+
+/** v2. A feature was switched on or off mid-connection (linking iMessage, say). */
+export const SettingsUpdated = z.object({
+  kind: z.literal('settings.updated'),
+  features: ProtocolFeatures,
+});
 
 export const GatewayFrame = z.discriminatedUnion('kind', [
   AuthChallenge,
   AuthResult,
   z.object({ kind: z.literal('command'), envelope: CommandEnvelope }),
   z.object({ kind: z.literal('ping') }),
+  GatewayAck,
+  KeysUpdated,
+  SettingsUpdated,
 ]);
 export const BridgeFrame = z.discriminatedUnion('kind', [
   AuthChallengeRequest,

@@ -70,6 +70,12 @@ interface FakeGateway {
   /** Stop reading from every accepted socket: it stays open but answers nothing. */
   deafen(): void;
   authAttempts: number;
+  /** Protocol version to ANSWER with in `auth.result`; null sends none, which means v1. */
+  protocolVersion: 1 | 2 | null;
+  /** A gateway that has not been upgraded yet: it refuses any offer above v1. */
+  refuseVersion2: boolean;
+  /** Every `auth.response.protocolVersion` this gateway was offered, in order. */
+  offers: number[];
 }
 
 async function startFakeGateway(publicKeyRaw: string, deviceId: string): Promise<FakeGateway> {
@@ -93,6 +99,9 @@ async function startFakeGateway(publicKeyRaw: string, deviceId: string): Promise
     replaceOlder: false,
     silent: false,
     authAttempts: 0,
+    protocolVersion: null,
+    refuseVersion2: false,
+    offers: [],
     deafen: () => {
       deaf = true;
       for (const s of gw.sockets) s.pause();
@@ -117,10 +126,15 @@ async function startFakeGateway(publicKeyRaw: string, deviceId: string): Promise
       if (f.kind === 'auth.request') sock.send(JSON.stringify({ kind: 'auth.challenge', nonce }));
       if (f.kind === 'auth.response') {
         gw.authAttempts++;
+        const offered = f.protocolVersion ?? 1;
+        gw.offers.push(offered);
         const valid =
           verifyRaw(publicKeyRaw, `${deviceId}.${nonce}`, f.signature) && f.deviceId === deviceId;
-        const ok = valid && gw.authOk;
-        const res: GatewayFrame = {
+        const versionOk = !(gw.refuseVersion2 && offered > 1);
+        const ok = valid && gw.authOk && versionOk;
+        // Deliberately not typed as `GatewayFrame`: several tests hand this gateway a malformed
+        // or forward-compatible key set on purpose, and the point is that the BRIDGE refuses it.
+        const res: Record<string, unknown> = {
           kind: 'auth.result',
           ok,
           ...(ok
@@ -132,8 +146,9 @@ async function startFakeGateway(publicKeyRaw: string, deviceId: string): Promise
                   ? { recipientKeysSignature: gw.recipientKeysSignature }
                   : {}),
                 ...(gw.features ? { features: gw.features } : {}),
+                ...(gw.protocolVersion ? { protocolVersion: gw.protocolVersion } : {}),
               }
-            : { error: gw.authError }),
+            : { error: versionOk ? gw.authError : 'protocol_version' }),
           ...(gw.minBridgeVersion ? { minBridgeVersion: gw.minBridgeVersion } : {}),
         };
         sock.send(JSON.stringify(res));
@@ -450,6 +465,131 @@ describe('GatewayClient', () => {
     expect(client.nextDelayMs(10)).toBe(60_000);
     const c2 = make({ random: () => 0, backoff: { baseMs: 1000, maxMs: 60_000 } });
     expect(c2.nextDelayMs(0)).toBe(500);
+  });
+
+  // ---- protocol negotiation (v2) ----
+
+  it('offers the newest version it speaks and uses what the gateway answers', async () => {
+    gw.protocolVersion = 2;
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(gw.offers).toEqual([2]);
+    expect(client.negotiatedVersion).toBe(2);
+  });
+
+  it('falls back to v1 when the gateway answers nothing, or answers 1', async () => {
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.negotiatedVersion).toBe(1);
+    await client.stop();
+
+    gw.protocolVersion = 1;
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.negotiatedVersion).toBe(1);
+  });
+
+  it('never emits a v2-only event on a link that negotiated v1', async () => {
+    const frame = () =>
+      makeEvent(deviceId, 'session.frame', {
+        sessionId: ids.ses(),
+        projectId: ids.proj(),
+        provider: 'claude',
+        seq: 1,
+        kind: 'assistant',
+        at: new Date().toISOString(),
+        sealed: {
+          v: 1,
+          epk: 'A'.repeat(43),
+          recipients: [{ kid: '0011:2233:4455:6677', nonce: 'B'.repeat(16), wrap: 'C'.repeat(64) }],
+          nonce: 'D'.repeat(16),
+          ct: 'E'.repeat(64),
+          aad: { sessionId: ids.ses(), seq: 1, kind: 'assistant' },
+        },
+        meta: { bytes: 12, source: 'stdio' },
+      });
+
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.sendEvent(frame())).toBe(false);
+    // A v1 event on the same link still goes out, so this is a gate and not a stall.
+    expect(client.sendEvent(makeEvent(deviceId, 'device.heartbeat', { activeSessions: 1 }))).toBe(
+      true,
+    );
+    await until(() =>
+      gw.frames.some((f) => f.kind === 'event' && f.event.type === 'device.heartbeat'),
+    );
+    expect(gw.frames.some((f) => f.kind === 'event' && f.event.type === 'session.frame')).toBe(
+      false,
+    );
+    await client.stop();
+
+    gw.frames.length = 0;
+    gw.protocolVersion = 2;
+    client = make();
+    client.start();
+    await until(() => client.state === 'connected');
+    expect(client.sendEvent(frame())).toBe(true);
+    await until(() =>
+      gw.frames.some((f) => f.kind === 'event' && f.event.type === 'session.frame'),
+    );
+  });
+
+  it('drops buffered v2-only events at flush time when the gateway turns out to speak v1', async () => {
+    client = make();
+    // Queued while offline: the version is only known after the handshake.
+    expect(
+      client.sendEvent(
+        makeEvent(deviceId, 'question.answered', {
+          questionId: ids.qst(),
+          answeredElsewhere: false,
+        }),
+      ),
+    ).toBe(true);
+    expect(client.sendEvent(makeEvent(deviceId, 'device.heartbeat', { activeSessions: 0 }))).toBe(
+      true,
+    );
+    client.start();
+    await until(() => client.state === 'connected');
+    await until(() =>
+      gw.frames.some((f) => f.kind === 'event' && f.event.type === 'device.heartbeat'),
+    );
+    expect(gw.frames.some((f) => f.kind === 'event' && f.event.type === 'question.answered')).toBe(
+      false,
+    );
+    expect(client.bufferedCount).toBe(0);
+  });
+
+  it('offers v1 once more when the gateway refuses v2, and only gives up if that fails too', async () => {
+    gw.refuseVersion2 = true;
+    const failures: string[] = [];
+    client = make();
+    client.on('auth_failed', (code) => failures.push(code));
+    client.start();
+    // The first offer (2) is refused; the retry offers 1 and connects.
+    await until(() => client.state === 'connected', 4000);
+    expect(gw.offers).toEqual([2, 1]);
+    expect(client.negotiatedVersion).toBe(1);
+    // The refusal was reported once, and the bridge is connected rather than unauthorized.
+    expect(failures).toEqual(['protocol_version']);
+    expect(client.lastFailure).toBeNull();
+    expect(client.offeredProtocolVersion).toBe(1);
+  });
+
+  it('treats a refusal of the v1 offer as fatal, as it always has', async () => {
+    gw.authOk = false;
+    gw.authError = 'protocol_version';
+    client = make();
+    client.start();
+    // Offer 2 refused → not fatal, retry at 1; refused again → unauthorized.
+    await until(() => client.state === 'unauthorized', 4000);
+    expect(gw.offers).toEqual([2, 1]);
+    expect(client.lastFailure?.fatal).toBe(true);
+    expect(client.lastFailure?.code).toBe('protocol_version');
   });
 });
 
@@ -921,39 +1061,33 @@ describe('recipient keys over the wire', () => {
 
   it('never puts a frame body on the wire in the clear', async () => {
     gw.recipientKeys = setOf([phoneA]);
+    // `session.frame` is a v2-only event, so the link has to have agreed on v2 before one may be
+    // emitted at all (MOB-030). That gate is what this test then sends a real sealed frame past.
+    gw.protocolVersion = 2;
     client = make();
     client.start();
     await until(() => client.state === 'connected');
 
     const secret = 'ssh deploy@prod "psql -c \\"drop table users\\""';
-    const aad = { sessionId: ids.ses(), seq: 3, kind: 'terminal' };
+    const aad = { sessionId: ids.ses(), seq: 3, kind: 'terminal' as const };
     const sealed = sealFrame(
       new TextEncoder().encode(JSON.stringify({ command: secret, exitCode: 0 })),
       aad,
       importRecipientKeys(client.recipientKeys),
     );
-    // `session.frame` lands in `@pagr/protocol` with MOB-030; the transport only cares that a
-    // frame is JSON, so the v2 shape rides through as-is until then.
-    const frame = {
-      version: 1,
-      eventId: 'evt_sealed',
-      deviceId,
+    const frame = makeEvent(deviceId, 'session.frame', {
+      sessionId: aad.sessionId,
+      projectId: ids.proj(),
+      provider: 'claude',
+      seq: aad.seq,
+      kind: aad.kind,
       at: new Date().toISOString(),
-      type: 'session.frame',
-      payload: {
-        sessionId: aad.sessionId,
-        projectId: ids.proj(),
-        provider: 'claude',
-        seq: aad.seq,
-        kind: aad.kind,
-        at: new Date().toISOString(),
-        sealed,
-        meta: { bytes: 64, truncated: false, source: 'stdio' },
-      },
-    } as unknown as DeviceEvent;
+      sealed,
+      meta: { bytes: 64, truncated: false, source: 'stdio' },
+    });
     expect(client.sendEvent(frame)).toBe(true);
     await until(() =>
-      gw.frames.some((f) => f.kind === 'event' && f.event.type === ('session.frame' as never)),
+      gw.frames.some((f) => f.kind === 'event' && f.event.type === 'session.frame'),
     );
 
     // Every byte this Mac has sent since it connected, frame by frame.
