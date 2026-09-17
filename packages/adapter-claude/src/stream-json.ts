@@ -1,27 +1,78 @@
+import type { ToolKind } from '@pagr/bridge-core';
 import { relativizePaths } from './heuristics.js';
 /**
  * Parser for Claude Code `--output-format stream-json` lines (Claude Code 2.1.220, verified
- * 2026-08-24 against real output + https://code.claude.com/docs/en/headless).
+ * 2026-08-24 against real output + https://code.claude.com/docs/en/headless; block fidelity and
+ * `tool_use_result` re-verified 2026-09-17 against a live `--verbose` run).
  *
  * Shapes observed on the wire:
  *   {"type":"system","subtype":"init","session_id":"…","cwd":"…","tools":[…]}
+ *   {"type":"system","subtype":"hook_started"|"hook_response"|"notification"|"thinking_tokens",…}
  *   {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"…"} |
  *        {"type":"tool_use","id":"toolu_…","name":"Bash","input":{…}} | {"type":"thinking",…}]},…}
  *   {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"…",
- *        "content":"…","is_error":false}]},…}
+ *        "content":"…","is_error":false}]},"tool_use_result":{…},"uuid":"…","timestamp":"…"}
  *   {"type":"result","subtype":"success"|"error_*","is_error":bool,"result":"…","session_id":"…",
  *        "num_turns":n,"total_cost_usd":…}
  *   With `--permission-prompt-tool stdio` (SDK control protocol):
  *   {"type":"control_request","request_id":"…","request":{"subtype":"can_use_tool","tool_name":"Write",
  *        "input":{…},"tool_use_id":"toolu_…","permission_suggestions":[…]}}
  *   {"type":"control_cancel_request","request_id":"…"}
+ *
+ * Two views of the same line:
+ *
+ *   - `parseStreamRecord` — EVERY content block, in order, plus the line's own `uuid`, `timestamp`
+ *     and (on a `user` line) the `tool_use_result` sidecar. This is what the frame path reads: a
+ *     turn's thinking, its second and third tool call and the bodies of its results are all things
+ *     the phone is entitled to see, and the old parser threw them away.
+ *   - `parseStreamLine` — the original one-event-per-line view, derived from the record. It still
+ *     collapses an assistant message to `tools[0]` or its joined text, because that is exactly
+ *     what the clipped `session.event` summaries want, and every existing caller reads it.
+ *
+ * `tool_use_result` (snake_case on the wire; `toolUseResult` in the on-disk transcript) is the same
+ * object in both places — `{stdout, stderr, interrupted, …}` for Bash, `{structuredPatch,
+ * originalFile, oldString, newString, replaceAll, …}` for Edit, `{content, filePath,
+ * structuredPatch, originalFile, type:'create'}` for Write. Verified 2026-09-17 on 2.1.220 with
+ * `--verbose`, which is a flag the bridge already passes, so diffs and terminal output need no
+ * transcript read in the normal case (see `diffs.ts` for the fallback that covers the abnormal one).
  */
 
-export type StreamEvent =
-  | { type: 'init'; sessionId: string }
-  | { type: 'assistant_text'; text: string }
+// ---------- blocks ----------
+
+/** One block of an `assistant` message. Unknown block types survive as `other`, never dropped. */
+export type AssistantBlock =
+  | { type: 'text'; text: string }
+  | { type: 'thinking'; text: string }
   | { type: 'tool_use'; toolUseId: string; name: string; input: Record<string, unknown> }
+  | { type: 'other'; blockType: string };
+
+/** One block of a `user` message: a tool's output, the person's own words, or an image. */
+export type UserBlock =
   | { type: 'tool_result'; toolUseId: string; isError: boolean; content: string }
+  | { type: 'text'; text: string }
+  | { type: 'image' }
+  | { type: 'other'; blockType: string };
+
+/** Every line shape, with nothing collapsed. */
+export type StreamRecord =
+  | { type: 'init'; sessionId: string; raw: Record<string, unknown> }
+  | { type: 'system'; subtype: string; text: string; raw: Record<string, unknown> }
+  | {
+      type: 'assistant_blocks';
+      blocks: AssistantBlock[];
+      uuid?: string;
+      at?: string;
+      raw: Record<string, unknown>;
+    }
+  | {
+      type: 'user_blocks';
+      blocks: UserBlock[];
+      /** Claude's own structured result for the tool, when the line carried one. */
+      toolUseResult?: unknown;
+      uuid?: string;
+      at?: string;
+      raw: Record<string, unknown>;
+    }
   | { type: 'result'; ok: boolean; subtype: string; text: string; sessionId: string | null }
   | {
       type: 'permission_request';
@@ -34,7 +85,27 @@ export type StreamEvent =
   | { type: 'other'; raw: Record<string, unknown> }
   | { type: 'invalid'; line: string };
 
-export function parseStreamLine(line: string): StreamEvent {
+/** The original, collapsed view. Derived from `StreamRecord`; unchanged for every caller. */
+export type StreamEvent =
+  | { type: 'init'; sessionId: string }
+  | { type: 'assistant_text'; text: string }
+  | { type: 'tool_use'; toolUseId: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; toolUseId: string; isError: boolean; content: string }
+  | { type: 'result'; ok: boolean; subtype: string; text: string; sessionId: string | null }
+  | {
+      type: 'permission_request';
+      requestId: string;
+      toolUseId: string;
+      toolName: string;
+      input: Record<string, unknown>;
+    }
+  | { type: 'permission_cancel'; requestId: string }
+  | { type: 'other'; raw: Record<string, unknown> }
+  | { type: 'invalid'; line: string };
+
+// ---------- the record parser ----------
+
+export function parseStreamRecord(line: string): StreamRecord {
   const trimmed = line.trim();
   if (!trimmed) return { type: 'invalid', line };
   let m: unknown;
@@ -45,40 +116,39 @@ export function parseStreamLine(line: string): StreamEvent {
   }
   if (!m || typeof m !== 'object' || Array.isArray(m)) return { type: 'invalid', line };
   const o = m as Record<string, unknown>;
+  const uuid = typeof o.uuid === 'string' ? o.uuid : undefined;
+  const at = typeof o.timestamp === 'string' ? o.timestamp : undefined;
   switch (o.type) {
-    case 'system':
-      if (o.subtype === 'init' && typeof o.session_id === 'string') {
-        return { type: 'init', sessionId: o.session_id };
-      }
-      return { type: 'other', raw: o };
-    case 'assistant': {
-      const content = contentOf(o);
-      const texts = content.filter((c) => c.type === 'text' && typeof c.text === 'string');
-      const tools = content.filter((c) => c.type === 'tool_use');
-      if (tools.length > 0) {
-        const t = tools[0] as { id?: string; name?: string; input?: unknown };
-        return {
-          type: 'tool_use',
-          toolUseId: String(t.id ?? ''),
-          name: String(t.name ?? 'tool'),
-          input: (t.input && typeof t.input === 'object' ? t.input : {}) as Record<string, unknown>,
-        };
-      }
-      if (texts.length > 0) {
-        return { type: 'assistant_text', text: texts.map((t) => String(t.text)).join('\n') };
-      }
-      return { type: 'other', raw: o };
-    }
-    case 'user': {
-      const r = contentOf(o).find((c) => c.type === 'tool_result') as
-        | { tool_use_id?: string; is_error?: boolean; content?: unknown }
-        | undefined;
-      if (!r) return { type: 'other', raw: o };
+    case 'system': {
+      if (o.subtype === 'init' && typeof o.session_id === 'string')
+        return { type: 'init', sessionId: o.session_id, raw: o };
+      // Every other subtype — `hook_started`, `hook_response`, `notification`, `thinking_tokens`,
+      // `compact_boundary` — is a real thing that happened in the session, so it is named rather
+      // than lumped into `other`. The text is whatever human-readable field the subtype carries.
       return {
-        type: 'tool_result',
-        toolUseId: String(r.tool_use_id ?? ''),
-        isError: r.is_error === true,
-        content: typeof r.content === 'string' ? r.content : JSON.stringify(r.content ?? ''),
+        type: 'system',
+        subtype: String(o.subtype ?? 'unknown'),
+        text: systemText(o),
+        raw: o,
+      };
+    }
+    case 'assistant':
+      return {
+        type: 'assistant_blocks',
+        blocks: contentOf(o).map(assistantBlock),
+        ...(uuid ? { uuid } : {}),
+        ...(at ? { at } : {}),
+        raw: o,
+      };
+    case 'user': {
+      const sidecar = o.tool_use_result ?? o.toolUseResult;
+      return {
+        type: 'user_blocks',
+        blocks: contentOf(o).map(userBlock),
+        ...(sidecar !== undefined ? { toolUseResult: sidecar } : {}),
+        ...(uuid ? { uuid } : {}),
+        ...(at ? { at } : {}),
+        raw: o,
       };
     }
     case 'result':
@@ -108,6 +178,106 @@ export function parseStreamLine(line: string): StreamEvent {
     default:
       return { type: 'other', raw: o };
   }
+}
+
+function assistantBlock(c: Record<string, unknown>): AssistantBlock {
+  switch (c.type) {
+    case 'text':
+      return { type: 'text', text: typeof c.text === 'string' ? c.text : '' };
+    case 'thinking':
+      // `signature` rides along and is a model artefact, not something anyone reads. Dropped.
+      return { type: 'thinking', text: typeof c.thinking === 'string' ? c.thinking : '' };
+    case 'tool_use':
+      return {
+        type: 'tool_use',
+        toolUseId: String(c.id ?? ''),
+        name: String(c.name ?? 'tool'),
+        input: (c.input && typeof c.input === 'object' ? c.input : {}) as Record<string, unknown>,
+      };
+    default:
+      return { type: 'other', blockType: String(c.type ?? 'unknown') };
+  }
+}
+
+function userBlock(c: Record<string, unknown>): UserBlock {
+  switch (c.type) {
+    case 'tool_result':
+      return {
+        type: 'tool_result',
+        toolUseId: String(c.tool_use_id ?? ''),
+        isError: c.is_error === true,
+        content: typeof c.content === 'string' ? c.content : JSON.stringify(c.content ?? ''),
+      };
+    case 'text':
+      return { type: 'text', text: typeof c.text === 'string' ? c.text : '' };
+    case 'image':
+      // The bytes are never journaled, sealed or logged: only the fact that one rode along.
+      return { type: 'image' };
+    default:
+      return { type: 'other', blockType: String(c.type ?? 'unknown') };
+  }
+}
+
+/** Whatever a non-`init` system line says in words, if it says anything. */
+function systemText(o: Record<string, unknown>): string {
+  for (const k of ['message', 'text', 'notification', 'hook_name', 'title']) {
+    const v = o[k];
+    if (typeof v === 'string' && v) return v;
+  }
+  return '';
+}
+
+// ---------- the derived, collapsed view ----------
+
+/**
+ * Collapse a record into the legacy one-event view.
+ *
+ * This is the lossy half on purpose: `session.event` summaries are one clipped line each, and a
+ * turn that called three tools still only needs the first one named. Everything the collapse
+ * throws away is carried by the record, which is what the frame path reads.
+ */
+export function legacyEvent(r: StreamRecord): StreamEvent {
+  switch (r.type) {
+    case 'init':
+      return { type: 'init', sessionId: r.sessionId };
+    case 'system':
+      return { type: 'other', raw: r.raw };
+    case 'assistant_blocks': {
+      const tool = r.blocks.find((b) => b.type === 'tool_use');
+      if (tool && tool.type === 'tool_use')
+        return {
+          type: 'tool_use',
+          toolUseId: tool.toolUseId,
+          name: tool.name,
+          input: tool.input,
+        };
+      const texts = r.blocks.filter((b) => b.type === 'text');
+      if (texts.length > 0)
+        return {
+          type: 'assistant_text',
+          text: texts.map((t) => (t.type === 'text' ? t.text : '')).join('\n'),
+        };
+      return { type: 'other', raw: r.raw };
+    }
+    case 'user_blocks': {
+      const res = r.blocks.find((b) => b.type === 'tool_result');
+      if (res?.type !== 'tool_result') return { type: 'other', raw: r.raw };
+      return {
+        type: 'tool_result',
+        toolUseId: res.toolUseId,
+        isError: res.isError,
+        content: res.content,
+      };
+    }
+    case 'permission_request':
+      return { ...r, toolUseId: r.toolUseId ?? '' };
+    default:
+      return r;
+  }
+}
+
+export function parseStreamLine(line: string): StreamEvent {
+  return legacyEvent(parseStreamRecord(line));
 }
 
 function contentOf(o: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -178,6 +348,43 @@ export function actionTypeForTool(
   if (toolName === 'Bash') return 'command_execution';
   if (['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(toolName)) return 'file_change';
   return 'tool_use';
+}
+
+/**
+ * Claude Code's tool names → the ACP kind the phone draws a glyph from.
+ *
+ * The phone must not need a table of Claude's tool names to know that something was read, searched
+ * for, edited or run — that is the whole point of the ACP kind, and it is what lets a Codex or an
+ * ACP agent's frames render in the same list. Anything unrecognised, MCP tools (`mcp__*`) and
+ * subagents included, is honestly `other` rather than guessed at.
+ */
+export function mapToolKind(toolName: string): ToolKind {
+  switch (toolName) {
+    case 'Read':
+    case 'NotebookRead':
+      return 'read';
+    case 'Glob':
+    case 'Grep':
+      return 'search';
+    case 'Edit':
+    case 'Write':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+      return 'edit';
+    case 'Bash':
+    case 'BashOutput':
+    case 'KillShell':
+      return 'execute';
+    case 'WebFetch':
+    case 'WebSearch':
+      return 'fetch';
+    case 'ExitPlanMode':
+      return 'switch_mode';
+    default:
+      // Task/Agent (a subagent is its own transcript), AskUserQuestion (B7 turns it into a
+      // `question` frame; until then it is an ordinary tool call), TodoWrite, every MCP tool.
+      return 'other';
+  }
 }
 
 export function filePathsOf(input: Record<string, unknown>): string[] {

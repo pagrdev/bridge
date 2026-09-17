@@ -1180,7 +1180,7 @@ export class Dispatcher {
         return;
       case 'frame':
         // The adapter said what happened; the journal says when and in what order, and the seal
-        // says who may read it. B4 wires the Claude adapter to this; nothing emits it yet.
+        // says who may read it.
         this.emitFrame(e.sessionId, e.body, {
           projectId: e.projectId,
           provider,

@@ -8,16 +8,35 @@ import type {
   AgentConnectionStatus,
   ChannelBridge,
   CodingAgentAdapter,
+  FrameBody,
+  JournalMeta,
   SendInstructionInput,
   SessionSummary,
   StartSessionInput,
 } from '@pagr/bridge-core';
 import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.js';
 import { ClaudeProcess, sealedModeEnabled } from './claude-process.js';
+import {
+  asToolUseResult,
+  type ClaudeToolUseResult,
+  diffBodyFor,
+  EDIT_TOOLS,
+  readPersistedOutput,
+  TranscriptResultLookup,
+  terminalBodyFor,
+} from './diffs.js';
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 import { FileLogger } from './logger.js';
 import { type PersistedSession, SessionMap } from './session-map.js';
-import { actionTypeForTool, filePathsOf, previewForTool, type StreamEvent } from './stream-json.js';
+import {
+  actionTypeForTool,
+  filePathsOf,
+  mapToolKind,
+  previewForTool,
+  type StreamEvent,
+  type StreamRecord,
+  type UserBlock,
+} from './stream-json.js';
 
 export interface ClaudeAdapterOptions {
   home: string;
@@ -38,6 +57,11 @@ export interface ClaudeAdapterOptions {
   versionCacheMs?: number;
   /** Override the sign-in memo TTL (tests); 0 disables memoisation. */
   authCacheMs?: number;
+  /**
+   * How long a diff may wait for Claude's own patch to reach the session transcript before the
+   * bridge falls back to the one it can compute itself. 0 skips the wait entirely.
+   */
+  transcriptLookupMs?: number;
   log?: boolean;
   /** ADR 0001 `approved-channel`. Set by `createClaudeAdapter` from `PAGR_CLAUDE_CHANNEL=1`. */
   channel?: boolean;
@@ -63,6 +87,12 @@ const credentialsPresent = (): boolean => {
   );
 };
 
+/** A tool call this session made, kept until its result arrives so the two can be joined. */
+interface ToolCallRecord {
+  name: string;
+  input: Record<string, unknown>;
+}
+
 interface LiveSession {
   summary: SessionSummary;
   claudeSessionId: string;
@@ -74,6 +104,14 @@ interface LiveSession {
   queued: Array<{ instruction: string; images: string[] }>;
   /** For LRU eviction of idle processes when the pool is full. */
   lastActivityMs: number;
+  /**
+   * `tool_use_id` → what was called, so a `tool_result` can be turned into the right kind of frame.
+   *
+   * A result line names only the id: whether it is a command's output or a file's new contents is
+   * something only the call knew. Bounded (`MAX_REMEMBERED_TOOL_CALLS`) because a long session
+   * makes thousands of these and nothing ever asks about an old one again.
+   */
+  toolCalls: Map<string, ToolCallRecord>;
 }
 
 interface PendingApproval {
@@ -86,9 +124,20 @@ interface PendingApproval {
 }
 
 export const newApprovalId = (): string => `apr_${randomUUID().replace(/-/g, '')}`;
+
+/**
+ * Dedupe key for one block of one line. A transcript read twice — a resume, a re-tail — must
+ * produce the frame once, and the line's `uuid` plus the block's position is what says "the same
+ * block", where Claude gives no per-block id of its own.
+ */
+const blockId = (uuid: string | undefined, index: number): string | undefined =>
+  uuid ? `${uuid}:${index}` : undefined;
 const now = () => new Date().toISOString();
 
 const TERMINAL = new Set<SessionSummary['status']>(['completed', 'failed', 'stopped']);
+
+/** Tool calls a session remembers while waiting for their results. */
+export const MAX_REMEMBERED_TOOL_CALLS = 512;
 
 /**
  * How a session with no live process is reported. A finished session keeps the status it
@@ -146,6 +195,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   private readonly channel: ChannelMode | null;
   private shuttingDown = false;
   private versionCache: { value: string | null; atMs: number } | null = null;
+  private readonly unknownBlockTypes = new Set<string>();
   private authCache: { value: AgentConnectionStatus['authStatus']; atMs: number } | null = null;
 
   constructor(private readonly opts: ClaudeAdapterOptions) {
@@ -283,6 +333,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       lastText: '',
       queued: [],
       lastActivityMs: Date.now(),
+      toolCalls: new Map(),
     };
     this.sessions.set(input.sessionId, live);
     this.map.set(input.sessionId, {
@@ -468,6 +519,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       lastText: '',
       queued: [],
       lastActivityMs: Date.now(),
+      toolCalls: new Map(),
     };
     this.sessions.set(sessionId, live);
     return live;
@@ -571,6 +623,7 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     });
     live.proc = proc;
     proc.on('event', (ev) => this.onEvent(live, proc, ev));
+    proc.on('record', (rec) => this.onRecord(live, proc, rec));
     proc.on('exit', ({ code, signal }) => {
       if (live.proc !== proc) return; // superseded or stopped
       live.proc = null;
@@ -665,6 +718,218 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       default:
         return;
     }
+  }
+
+  // ---------- frames (MOB-033) ----------
+
+  /**
+   * Every content block of a line, as a transcript frame.
+   *
+   * This runs ALONGSIDE `onEvent`, not instead of it: the clipped `session.event` summaries are
+   * what a v1 gateway and the iMessage thread get, and they keep flowing exactly as before. What
+   * changes is that a phone on v2 also gets the thing itself — the thinking, every tool call in a
+   * message rather than the first, the output, the patch — sealed, in order, one frame each.
+   */
+  private onRecord(live: LiveSession, proc: ClaudeProcess, rec: StreamRecord): void {
+    if (live.proc !== proc) return;
+    if (rec.type === 'assistant_blocks') this.onAssistantBlocks(live, rec);
+    else if (rec.type === 'user_blocks') this.onUserBlocks(live, rec);
+  }
+
+  private onAssistantBlocks(
+    live: LiveSession,
+    rec: Extract<StreamRecord, { type: 'assistant_blocks' }>,
+  ): void {
+    rec.blocks.forEach((b, i) => {
+      switch (b.type) {
+        case 'thinking':
+          if (!b.text.trim()) return;
+          this.frame(live, { kind: 'thinking', text: b.text }, {}, blockId(rec.uuid, i), rec.at);
+          return;
+        case 'text':
+          if (!b.text.trim()) return;
+          this.frame(live, { kind: 'assistant', text: b.text }, {}, blockId(rec.uuid, i), rec.at);
+          return;
+        case 'tool_use':
+          this.rememberToolCall(live, b.toolUseId, { name: b.name, input: b.input });
+          this.frame(
+            live,
+            {
+              kind: 'tool_call',
+              toolCallId: b.toolUseId,
+              toolName: b.name,
+              toolKind: mapToolKind(b.name),
+              title: previewForTool(b.name, b.input, live.projectPath),
+              input: b.input,
+            },
+            // The call's own id is the thread every frame about it hangs from: its result, the
+            // command output, the patch. The phone groups on `parentFrameId` alone.
+            { parentFrameId: b.toolUseId, actionType: actionTypeForTool(b.name) },
+            b.toolUseId,
+            rec.at,
+          );
+          return;
+        default:
+          this.noteUnknownBlock(b.blockType);
+      }
+    });
+  }
+
+  private onUserBlocks(
+    live: LiveSession,
+    rec: Extract<StreamRecord, { type: 'user_blocks' }>,
+  ): void {
+    const results = rec.blocks.filter((b) => b.type === 'tool_result');
+    // `tool_use_result` describes THE tool call the line carries. On a line with two results there
+    // is no way to say which one it belongs to, so it belongs to neither.
+    const sidecar = results.length === 1 ? asToolUseResult(rec.toolUseResult) : null;
+    for (const b of rec.blocks) {
+      if (b.type === 'other') {
+        this.noteUnknownBlock(b.blockType);
+        continue;
+      }
+      if (b.type !== 'tool_result') continue;
+      this.frame(
+        live,
+        { kind: 'tool_result', toolCallId: b.toolUseId, content: b.content, isError: b.isError },
+        { parentFrameId: b.toolUseId, status: b.isError ? 'error' : 'ok' },
+        `${b.toolUseId}:result`,
+        rec.at,
+      );
+      const call = live.toolCalls.get(b.toolUseId);
+      if (!call) continue;
+      if (call.name === 'Bash') this.emitTerminal(live, b, call, sidecar, rec.at);
+      else if (EDIT_TOOLS.has(call.name)) this.emitDiff(live, b.toolUseId, call, sidecar, rec.at);
+    }
+  }
+
+  /** A Bash result, with its streams kept apart and a spilled body read back in full. */
+  private emitTerminal(
+    live: LiveSession,
+    res: Extract<UserBlock, { type: 'tool_result' }>,
+    call: ToolCallRecord,
+    sidecar: ClaudeToolUseResult | null,
+    at?: string,
+  ): void {
+    const spillPath = sidecar?.persistedOutputPath;
+    const spilled =
+      typeof spillPath === 'string'
+        ? readPersistedOutput(spillPath, { home: this.claudeHome() })
+        : null;
+    const body = terminalBodyFor({
+      command: typeof call.input.command === 'string' ? call.input.command : '',
+      content: res.content,
+      isError: res.isError,
+      result: sidecar,
+      spilled,
+    });
+    this.frame(
+      live,
+      body,
+      {
+        parentFrameId: res.toolUseId,
+        status: body.interrupted ? 'interrupted' : res.isError ? 'error' : 'ok',
+      },
+      `${res.toolUseId}:terminal`,
+      at,
+    );
+  }
+
+  /**
+   * A file change, from Claude's own patch.
+   *
+   * `--verbose` puts `tool_use_result` — `structuredPatch`, `originalFile`, the replacement
+   * strings — straight onto the result line, so the usual case is synchronous and reads nothing.
+   * When it is absent the same object is in the session's transcript a moment later; that read is
+   * bounded, and what it cannot supply in time is sent as the bridge's own approximate diff.
+   */
+  private emitDiff(
+    live: LiveSession,
+    toolUseId: string,
+    call: ToolCallRecord,
+    sidecar: ClaudeToolUseResult | null,
+    at?: string,
+  ): void {
+    const direct = diffBodyFor({ toolName: call.name, input: call.input, result: sidecar });
+    if (direct && direct.approx !== true) {
+      this.frame(live, direct, { parentFrameId: toolUseId }, `${toolUseId}:diff`, at);
+      return;
+    }
+    void this.emitDiffFromTranscript(live, toolUseId, call, direct, at);
+  }
+
+  private async emitDiffFromTranscript(
+    live: LiveSession,
+    toolUseId: string,
+    call: ToolCallRecord,
+    fallback: Extract<FrameBody, { kind: 'diff' }> | null,
+    at?: string,
+  ): Promise<void> {
+    let found: ClaudeToolUseResult | null = null;
+    const waitMs = this.opts.transcriptLookupMs ?? 2000;
+    if (waitMs > 0) {
+      try {
+        found = await new TranscriptResultLookup({
+          home: this.claudeHome(),
+          cwd: live.projectPath,
+          claudeSessionId: live.claudeSessionId,
+          timeoutMs: waitMs,
+        }).find(toolUseId);
+      } catch (err) {
+        this.logger.log('warn', 'could not read the session transcript for a diff', {
+          message: (err as Error).message,
+        });
+      }
+    }
+    const body =
+      (found && diffBodyFor({ toolName: call.name, input: call.input, result: found })) ?? fallback;
+    if (!body || this.shuttingDown) return;
+    this.frame(live, body, { parentFrameId: toolUseId }, `${toolUseId}:diff`, at);
+  }
+
+  private frame(
+    live: LiveSession,
+    body: FrameBody,
+    meta: Omit<Partial<JournalMeta>, 'source'> = {},
+    providerRecordId?: string,
+    at?: string,
+  ): void {
+    this.emit({
+      kind: 'frame',
+      sessionId: live.summary.sessionId,
+      projectId: live.summary.projectId,
+      body,
+      meta: { source: 'stdio', ...meta },
+      ...(providerRecordId ? { providerRecordId } : {}),
+      ...(at ? { at } : {}),
+    });
+  }
+
+  private rememberToolCall(live: LiveSession, id: string, call: ToolCallRecord): void {
+    if (!id) return;
+    live.toolCalls.set(id, call);
+    while (live.toolCalls.size > MAX_REMEMBERED_TOOL_CALLS) {
+      const oldest = live.toolCalls.keys().next();
+      if (oldest.done) break;
+      live.toolCalls.delete(oldest.value);
+    }
+  }
+
+  /**
+   * A content block this parser has no frame for. Logged the first time each type is seen and
+   * never again: a new block type is news once, not on every message of every session.
+   */
+  private noteUnknownBlock(blockType: string): void {
+    if (this.unknownBlockTypes.has(blockType)) return;
+    this.unknownBlockTypes.add(blockType);
+    this.logger.log('info', 'unrecognised Claude content block; no frame made for it', {
+      blockType,
+    });
+  }
+
+  /** `$HOME` as the spawned `claude` sees it — the root of `~/.claude/projects`. */
+  private claudeHome(): string {
+    return this.opts.env?.HOME ?? process.env.HOME ?? os.homedir();
   }
 
   private onPermissionRequest(
