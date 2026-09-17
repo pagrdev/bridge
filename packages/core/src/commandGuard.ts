@@ -246,6 +246,15 @@ export function referencedIds(body: CommandBody): { projectId?: string; sessionI
     case 'repo.scan':
     case 'project.register_handle':
       return {};
+    // `session.backfill` names a session on purpose and is NOT checked here. The whole point of a
+    // backfill is a session this Mac can still serve but no longer has a row for — one that ran
+    // before Pagr was installed, or whose `sessions.json` entry aged out weeks ago. Rejecting it
+    // as `unknown_session` at the guard would make the command useless for exactly the sessions it
+    // exists for; the dispatcher answers `unknown_session` itself, after asking the journal and
+    // every history source whether anything can be replayed.
+    case 'session.backfill':
+    case 'session.list_history':
+      return {};
     default:
       return {};
   }

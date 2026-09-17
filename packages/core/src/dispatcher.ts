@@ -35,6 +35,17 @@ import {
 } from './approvals.js';
 import { AttachmentLeaseRegistry } from './attachmentLease.js';
 import { deleteAttachment, type FetchLike, fetchAttachment } from './attachments.js';
+import {
+  BackfillError,
+  BackfillGuard,
+  type BackfillRequest,
+  type BackfillResult,
+  BackfillService,
+  type BackfillSource,
+  type DiscoveredSession,
+  type HistoryQuery,
+  type ReplayFrame,
+} from './backfill.js';
 import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.js';
 import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFloor.js';
 import { type EventPayloadInput, makeEvent } from './events.js';
@@ -42,6 +53,7 @@ import { chunkFrame, type FrameBody } from './frames.js';
 import type { JournalEntry, JournalMeta, JournalStore, OutboxCursors } from './journal.js';
 import type { Logger } from './logging.js';
 import { silentLogger } from './logging.js';
+import type { MirrorProject } from './mirrorBridge.js';
 import { PublicPolicy, readPolicy, writePolicy } from './policy.js';
 import { ProjectError, type ProjectRegistry } from './projects.js';
 import {
@@ -219,6 +231,27 @@ export interface DispatcherOptions {
    * throwing — a bridge that cannot journal must not pretend to have sent anything.
    */
   frames?: FrameChannel;
+  /**
+   * History and backfill (v2). Absent means the two commands ack `capability_unsupported`: a
+   * bridge that cannot read a transcript must say so rather than answer "no history".
+   */
+  backfill?: BackfillChannel;
+}
+
+/** Everything `session.list_history` and `session.backfill` need that the dispatcher does not own. */
+export interface BackfillChannel {
+  /** `$HOME` holding `.claude`. Null or absent turns the Claude transcript source off. */
+  claudeHome?: string | null;
+  /** Codex, and anything later. The Claude transcripts are built into the service. */
+  sources?: BackfillSource[];
+  /** Replay a Claude transcript into frames. Supplied by the Claude adapter. */
+  replayTranscript?: (session: DiscoveredSession) => Promise<ReplayFrame[] | null>;
+  /** Which project a directory belongs to. Defaults to the daemon's mirror bridge. */
+  projectFor?: (cwd: string) => MirrorProject | null;
+  /** Hold the Mac awake for the duration of a backfill. Returns the release. */
+  hold?: (reason: string) => () => void;
+  /** Shared so `pagr sessions backfill` and a phone contend for the same single slot. */
+  guard?: BackfillGuard;
 }
 
 /** Everything `emitFrame` needs that the dispatcher does not own. */
@@ -600,6 +633,24 @@ export class Dispatcher {
         return this.respondToApproval(body.payload);
       case 'agent.answer_question':
         return this.answerQuestion(body.payload);
+      case 'session.list_history':
+        this.assertV2(body.version, 'session.list_history');
+        return {
+          sessions: await this.listHistory({
+            sinceDays: body.payload.sinceDays,
+            limit: body.payload.limit,
+            ...(body.payload.provider ? { provider: body.payload.provider } : {}),
+            ...(body.payload.projectId ? { projectId: body.payload.projectId } : {}),
+          }),
+        };
+      case 'session.backfill':
+        this.assertV2(body.version, 'session.backfill');
+        return this.runBackfill({
+          sessionId: body.payload.sessionId,
+          fromSeq: body.payload.fromSeq,
+          maxBytes: body.payload.maxBytes,
+          ...(body.payload.toSeq !== undefined ? { toSeq: body.payload.toSeq } : {}),
+        });
       case 'repo.scan':
         return this.scanRepositories();
       case 'project.register_handle':
@@ -726,6 +777,115 @@ export class Dispatcher {
       projects: out.projects.length,
     });
     return out;
+  }
+
+  // ---------- history and backfill (v2) ----------
+
+  /**
+   * The service, built once.
+   *
+   * Once, because `BackfillGuard` is the single slot this Mac serialises backfills through: a new
+   * service per command would be a new guard per command, which is no guard at all.
+   */
+  private backfillSvc: BackfillService | null = null;
+  /** Live summaries for the current `listHistory`, refreshed from the adapters before each call. */
+  private liveSummaries = new Map<string, SessionSummaryV2>();
+
+  private backfillService(): BackfillService {
+    const channel = this.o.backfill;
+    if (!channel)
+      throw new DispatchError(
+        'capability_unsupported',
+        'this bridge has no transcript history wired up',
+      );
+    if (this.backfillSvc) return this.backfillSvc;
+    this.backfillSvc = new BackfillService({
+      journal: this.frameChannel().journal,
+      // The same sealing path a live frame takes, so a replayed frame is byte-identical to the
+      // one the phone would have received at the time — only `meta.source` differs.
+      seal: (entry) => this.frameEvents(entry),
+      emit: (event) => this.o.emit(event),
+      live: (sessionId) => this.liveSummaries.get(sessionId) ?? null,
+      record: (sessionId) => this.o.sessions.get(sessionId),
+      logger: this.logger,
+      now: this.now,
+      guard: channel.guard ?? new BackfillGuard(),
+      onProgress: (p) =>
+        this.send('session.event', {
+          sessionId: p.sessionId,
+          projectId: p.projectId,
+          provider: p.provider,
+          kind: 'progress',
+          summary: `backfilled ${p.frames} frame(s) up to #${p.lastSeq}`,
+          at: this.now().toISOString(),
+        }),
+      ...(channel.claudeHome !== undefined ? { claudeHome: channel.claudeHome } : {}),
+      ...(channel.sources ? { sources: channel.sources } : {}),
+      ...(channel.replayTranscript ? { replayTranscript: channel.replayTranscript } : {}),
+      ...(channel.projectFor ? { projectFor: channel.projectFor } : {}),
+      ...(channel.hold ? { hold: channel.hold } : {}),
+    });
+    return this.backfillSvc;
+  }
+
+  private frameChannel(): FrameChannel {
+    if (!this.o.frames)
+      throw new DispatchError(
+        'capability_unsupported',
+        'this bridge has no frame journal, so it has no history to serve',
+      );
+    return this.o.frames;
+  }
+
+  /**
+   * Both commands are v2. A v1 link has never heard of `session.frame`, so answering a backfill on
+   * one would journal work nobody could receive and report a frame count that never arrived.
+   */
+  private assertV2(version: number, what: string): void {
+    if (version < 2) throw new DispatchError('not_negotiated', `${what} is a protocol v2 command`);
+  }
+
+  /**
+   * Sessions this Mac can still produce frames for, live ones described by themselves.
+   *
+   * The adapters are asked first and their answers win: a session that is running right now knows
+   * its own control level, and nothing read off a finished file could work it out.
+   */
+  async listHistory(q: HistoryQuery): Promise<SessionSummaryV2[]> {
+    const svc = this.backfillService();
+    this.liveSummaries = new Map();
+    for (const adapter of this.o.adapters.values()) {
+      try {
+        // `authoritative` is typed on the v1 summary and returns the same object when it has
+        // nothing to correct; spreading keeps the v2 fields it does not know about.
+        for (const s of await adapter.listSessions())
+          this.liveSummaries.set(
+            s.sessionId,
+            this.withLastSeq({ ...s, ...(this.authoritative(s) as SessionSummaryV2) }),
+          );
+      } catch {
+        // An adapter that cannot list is not an error here: history is the fallback, not the
+        // other way round, and the transcript on disk says what that session did anyway.
+      }
+    }
+    return svc.listHistory(q);
+  }
+
+  /**
+   * Replay journaled frames to the phone, building the journal from the provider's own record
+   * first when this bridge never streamed the session.
+   *
+   * A second request while one is running is `rate_limited`, not a queue: a backfill competes with
+   * live frames for the socket and the disk, and a phone that fired twice deserves a fast answer.
+   */
+  async runBackfill(p: BackfillRequest): Promise<BackfillResult> {
+    const svc = this.backfillService();
+    try {
+      return await svc.backfill(p);
+    } catch (err) {
+      if (err instanceof BackfillError) throw new DispatchError(err.code, err.message);
+      throw err;
+    }
   }
 
   private adapterFor(provider: Provider): CodingAgentAdapter {

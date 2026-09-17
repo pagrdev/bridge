@@ -4,6 +4,7 @@ export * from './approvalOptions.js';
 export * from './approvals.js';
 export * from './attachmentLease.js';
 export * from './attachments.js';
+export * from './backfill.js';
 export * from './commandGuard.js';
 export * from './concurrency.js';
 export * from './config.js';

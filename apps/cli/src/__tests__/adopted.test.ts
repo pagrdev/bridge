@@ -94,7 +94,10 @@ describe('pagr sessions', () => {
   it('marks the ones Pagr did not start, and says what it cannot do with them', async () => {
     expect(await h.run(['sessions'])).toBe(EXIT.ok);
     const text = out();
-    expect(text).toContain('yours');
+    // B12 renamed the column to ORIGIN and gave it the protocol's own vocabulary, so the CLI and
+    // the phone call the same thing by the same name.
+    expect(text).toContain('ORIGIN');
+    expect(text).toContain('terminal');
     expect(text).toMatch(/approvals only|cannot be steered|relay approvals/i);
   });
 
@@ -105,9 +108,22 @@ describe('pagr sessions', () => {
     expect(text).toContain('pagr projects add');
   });
 
-  it('passes the raw records through untouched with --json', async () => {
+  it('passes the records through with --json, plus what the journal knows', async () => {
     expect(await h.run(['sessions', '--json'])).toBe(EXIT.ok);
-    expect(lastJson(h)).toEqual(sessions());
+    const rows = lastJson(h) as Array<Record<string, unknown>>;
+    // Every field of the record survives verbatim…
+    expect(rows.map((r) => sessions().find((s) => s.sessionId === r.sessionId))).toEqual(
+      sessions(),
+    );
+    for (const [i, rec] of sessions().entries()) expect(rows[i]).toMatchObject(rec);
+    // …and the three columns B12 added are there for a script as well as for the table.
+    expect(rows[0]).toMatchObject({
+      origin: 'pagr',
+      controlLevel: 'full',
+      journal: { lastSeq: 0, bytes: 0, sent: 0, acked: 0 },
+    });
+    expect(rows[1]).toMatchObject({ origin: 'terminal', controlLevel: 'approvals' });
+    expect(rows[2]).toMatchObject({ origin: 'terminal', controlLevel: 'none' });
   });
 });
 

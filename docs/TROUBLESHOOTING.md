@@ -174,7 +174,7 @@ If a prompt from your own `claude` does not reach your phone:
 
 What Pagr can do with a session it did not start is narrower than one it started: approvals only.
 No instructions, no stop, no resume — that terminal owns the session. `pagr sessions` marks them
-under `STARTED BY`.
+`terminal` under `ORIGIN`, with what Pagr may do under `CONTROL`.
 
 Removing it: `pagr logout` and `pagr uninstall` take the entry back out, as does
 `pagr claude hook-remove`. Only Pagr's own entry is touched; a copy of the file as it was is left
@@ -185,6 +185,49 @@ entry to `.mcp.json` for the research-preview channel mode. It is opt-in, unrela
 hooks, and not needed for normal use.)
 
 Note that Claude Code cannot be steered mid-turn: instructions sent while a turn is active are queued and delivered when it ends (`queued_followup` → `followup_delivered` in `pagr sessions`).
+
+## Older history missing on a new phone
+
+A new phone starts empty, and the cloud only keeps sealed frames for 30 days. Everything before that
+is on the Mac — in `~/.pagr/journal/` for sessions Pagr has already framed, and in Claude Code's and
+Codex's own records for everything else — and the phone asks for it rather than being sent it.
+
+In the app: open the session and pull for older messages, or find it under History. That sends
+`session.list_history` and then `session.backfill` to this Mac.
+
+What has to be true for it to work:
+
+- **The Mac must be online and the daemon running.** The cloud holds no copy it could serve instead.
+  `pagr status` should say the gateway is connected; if it is not, see *Daemon not connecting*.
+- **The session's folder must be a registered project.** Nothing in an unregistered directory is
+  read, journaled or sealed, so there is nothing to backfill. `pagr projects add <dir>`, then ask
+  again — or tap the "add this folder" button on the session card, which does the same thing.
+- **One at a time.** A second backfill while one is running is refused rather than queued. Wait for
+  the first to finish; the app shows progress every hundred frames.
+- **A long session arrives in pieces.** Each request has a byte budget, and the reply says whether
+  there is more. The app asks again from where it stopped; a very long session can take several
+  rounds.
+
+To check it from the Mac, without a phone:
+
+```
+pagr sessions                          # SEQ is how many frames this Mac has for each session
+pagr sessions backfill ses_…           # replay it; --from N to start partway
+pagr sessions backfill ses_… --json    # {frames, bytes, lastSeq, truncated}
+```
+
+`SEQ` showing `—` means this Mac has never framed that session. That is normal for one that ran
+before Pagr was installed: the first backfill reads the provider's own transcript, builds the
+journal from it, and streams that — which is why the first one is slower than the second.
+
+If a backfill answers `unknown_session`, this Mac genuinely has nothing: the journal was purged
+*and* the provider's transcript is gone (Claude Code prunes `~/.claude/projects` on its own
+schedule, and `codex` threads can be deleted). Nothing can recover that; the phone keeps whatever it
+already had.
+
+If your Mac is running low on disk, `pagr sessions purge --older-than 30d --yes` deletes journals
+past their retention. It never touches `~/.claude`, and anything whose transcript is still there can
+be backfilled again afterwards.
 
 ## A question never reached my phone
 

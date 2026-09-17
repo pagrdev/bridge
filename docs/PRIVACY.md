@@ -30,6 +30,26 @@ network call sites: `transport.ts` (gateway), `pairing.ts` (pairing API), `attac
 | `session.frame` | session/project/provider ids, a sequence number, the frame's **kind** (`assistant`, `tool_call`, `diff`, `terminal`…), a timestamp, its size, whether it was clipped, and the **sealed** body | anything readable. The body is encrypted on this Mac for the phones you have paired, and the cloud relays ciphertext it holds no key for. A frame over 512 KiB is clipped for the wire (command output keeps its first 8 KiB and last 56 KiB) and the full text stays in `~/.pagr/journal/` |
 | `attachment.consumed` | attachment id and ok/error | image bytes |
 
+### Backfill reads nothing new
+
+`session.list_history` and `session.backfill` (protocol v2) let a phone ask this Mac for a part of a
+transcript it does not have. Nothing about them widens what leaves the Mac in the clear:
+
+- **Same files.** A backfill reads `~/.claude/projects/<project>/<session>.jsonl` and its superseded
+  variants, the session's `subagents/agent-*.jsonl` and its `tool-results/` spill files, or Codex's
+  own `thread/read` — exactly the files the transcript mirror already reads, under exactly the same
+  rule that nothing in a directory outside a registered project is read, journaled or sealed.
+- **Same envelope.** A backfilled frame is a `session.frame`, sealed for your phones with the same
+  key and the same caps as a live one. The cloud relays the same ciphertext it cannot read. The only
+  difference is one plaintext word in the routing metadata: `meta.source` says `backfill` instead of
+  `transcript`, so the app can tell a replay from something happening now.
+- **Same listing.** `session.list_history` sends session ids, project ids, display names, statuses
+  and timestamps — the fields `device.hello` already sends. Never a path: a session whose directory
+  is not a registered project is not listed at all, and one whose folder could be added travels as
+  an `rh_…` handle only this Mac can resolve.
+- **No new reach.** Both commands are signed, device-bound cloud commands like every other, refused
+  on a v1 link, and one at a time. `pagr sessions backfill` runs the same code path locally.
+
 ## What stays local
 
 Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS Keychain:
@@ -44,7 +64,7 @@ Everything under `~/.pagr/` (mode 0700), and the device private key in the macOS
 | `policy.json` | the public approval policy synced from your dashboard settings. |
 | `device-policy.json` | your local approval floor. Written only by you; no command can change it, and it is never sent anywhere. See `docs/SECURITY.md`. |
 | `logs/daemon.log` | local JSON log. Home directory is rewritten to `~`. Never uploaded. |
-| `journal/<sessionId>.log` | **plaintext copies of your own sessions, on your own disk** (0600, in a 0700 directory): one NDJSON line per transcript frame — the assistant's words, your messages, tool calls and their output, diffs, terminal blocks. It is the archive the phone's transcript is served from, and the reason a dropped connection costs a re-send rather than a hole. Pruned whole sessions at a time: nothing older than 30 days, and never more than 2 GiB in total. Never uploaded as it stands — what leaves this Mac is the sealed, capped copy described above. `pagr uninstall` deletes it with the rest of `~/.pagr/`. |
+| `journal/<sessionId>.log` | **plaintext copies of your own sessions, on your own disk** (0600, in a 0700 directory): one NDJSON line per transcript frame — the assistant's words, your messages, tool calls and their output, diffs, terminal blocks. It is the archive the phone's transcript is served from, and the reason a dropped connection costs a re-send rather than a hole. Pruned whole sessions at a time: nothing older than 30 days, and never more than 2 GiB in total, on the daemon's hourly tick or on demand with `pagr sessions purge [--older-than 30d] --yes` — which deletes journals and nothing else, never anything under `~/.claude`, and costs nothing permanent while the provider's own transcript is still there, since a later backfill rebuilds the journal from it. Never uploaded as it stands — what leaves this Mac is the sealed, capped copy described above. `pagr uninstall` deletes it with the rest of `~/.pagr/`. |
 | `journal/<sessionId>.idx` | byte offsets into that log so a resume is a seek, not a scan (0600). Rebuilt from the log whenever it does not match it; holds no content of its own. |
 | `journal/outbox.json` | per session, how far the frames have been sent and how far the cloud confirmed them (`{sent, acked}`). Ids and numbers only. |
 | `tailer-state.json` | how far the transcript mirror has read each Claude transcript file: its inode, a byte offset, and the tail of a line that was still being written when the daemon last looked. It exists so a restart resumes instead of replaying every session on the Mac. Entries for files that are gone are swept on startup. |
