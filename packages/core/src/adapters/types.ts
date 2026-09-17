@@ -6,6 +6,8 @@ import type {
   SessionSummary,
 } from '@pagr/protocol';
 import type { LocalActionDetail } from '../deviceFloor.js';
+import type { FrameBody } from '../frames.js';
+import type { JournalMeta } from '../journal.js';
 
 export interface LocalProject {
   projectId: string;
@@ -73,6 +75,29 @@ export type AdapterEvent =
        */
       local?: LocalActionDetail;
       expiresAt: string;
+    }
+  /**
+   * One transcript frame: an assistant message, a tool call, a diff, a terminal block.
+   *
+   * The adapter produces the BODY and says where it read it; everything else — the sequence
+   * number, the journal line, the seal, whether a v1 gateway means it stays local — belongs to
+   * the dispatcher (`emitFrame`). An adapter never seals and never numbers.
+   */
+  | {
+      kind: 'frame';
+      sessionId: string;
+      projectId: string;
+      body: FrameBody;
+      meta: JournalMeta;
+      /**
+       * The provider's own id for the record this came from. Supplying it is what makes a
+       * transcript that is read twice produce one frame instead of two.
+       */
+      providerRecordId?: string;
+      /** When it happened, if the provider said; otherwise the dispatcher's clock. */
+      at?: string;
+      /** Plaintext one-liner for the iMessage thread; only sent when iMessage is linked. */
+      imessage?: string;
     }
   | {
       kind: 'approval_resolved_locally';

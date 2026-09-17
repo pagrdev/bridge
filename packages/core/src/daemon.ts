@@ -25,6 +25,12 @@ import {
   IpcSocketBusyError,
   registerChannelMethods,
 } from './ipc.js';
+import {
+  JOURNAL_MAX_TOTAL_BYTES,
+  JOURNAL_RETENTION_DAYS,
+  JournalStore,
+  OutboxCursors,
+} from './journal.js';
 import { KeepAwake, type KeepAwakeSpawn, type KeepAwakeStatus } from './keepAwake.js';
 import { type SecretStore, SecretStoreError } from './keychain.js';
 import { DAEMON_EXIT } from './launchAgent.js';
@@ -61,6 +67,10 @@ export interface CreateDaemonOptions {
   livenessTimeoutMs?: number;
   authTimeoutMs?: number;
   tmpCleanupOlderThanMs?: number;
+  /** How long a session's frame journal is kept (default 30 days). */
+  journalRetentionDays?: number;
+  /** Ceiling on every journal together (default 2 GiB). */
+  journalMaxTotalBytes?: number;
   /** How long terminal sessions stay in `sessions.json` (default one week). */
   sessionRetentionMs?: number;
   /** Hard ceiling on rows in `sessions.json` (default 500). */
@@ -239,6 +249,16 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   // Assigned once the dispatcher exists; the session store is built first and may fire before.
   let syncKeepAwake = (): void => {};
   const sessions = new SessionStore(paths.sessionsFile, now, () => syncKeepAwake());
+  // Transcript frames, on this Mac, in full. The cloud only ever sees sealed, capped copies.
+  const journal = new JournalStore({
+    dir: paths.journalDir,
+    now,
+    logger: logger.child({ mod: 'journal' }),
+  });
+  const outbox = new OutboxCursors({
+    file: paths.outboxFile,
+    logger: logger.child({ mod: 'journal' }),
+  });
   const replay = new ReplayCache({ file: paths.replayFile, now: () => now().getTime() });
   const commands = new CommandTracker();
   let serverKeys: Record<string, string> = { ...config.serverKeys };
@@ -261,6 +281,23 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     void Promise.resolve(daemonRef?.stop())
       .catch(() => {})
       .finally(() => exitProcess(DAEMON_EXIT.unrecoverable));
+  };
+
+  /**
+   * Age and size retention for the journals, on the same hourly tick as everything else. A
+   * session whose journal has gone also loses its cursors: keeping a `{sent, acked}` row for a
+   * transcript that no longer exists would leave a resume asking for frames nobody has.
+   */
+  const pruneJournal = (): void => {
+    try {
+      const result = journal.prune({
+        days: o.journalRetentionDays ?? JOURNAL_RETENTION_DAYS,
+        maxTotalBytes: o.journalMaxTotalBytes ?? JOURNAL_MAX_TOTAL_BYTES,
+      });
+      for (const sessionId of result.removed) outbox.forget(sessionId);
+    } catch (err) {
+      logger.warn('could not prune the session journals', { error: String(err) });
+    }
   };
 
   let transport: GatewayClient | null = null;
@@ -286,6 +323,15 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     // The live set, not a snapshot: the transport repins it from `auth.result` / `keys.updated`,
     // and it is built after the dispatcher, so this reads through to whatever is current.
     recipientKeyIds: () => transport?.recipientKeyIds() ?? Object.keys(recipientKeys).sort(),
+    frames: {
+      journal,
+      cursors: outbox,
+      // Read through to the live set, like `recipientKeyIds` above: a phone paired mid-session
+      // must be able to read the rest of that session.
+      recipientKeys: () => transport?.recipientKeys ?? recipientKeys,
+      protocolVersion: () => transport?.negotiatedVersion ?? 1,
+      imessageLinked: () => transport?.features?.imessage ?? false,
+    },
     onApprovalsChange: () => syncKeepAwake(),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
@@ -399,6 +445,17 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       },
       ...(o.env ? { env: o.env } : {}),
       activeSessions: () => dispatcher.activeSessionCount(),
+      // The gateway learns what this Mac is before it is handed any transcript, and the frames it
+      // never acked go out before the events buffered while the socket was down.
+      onReady: async () => {
+        const hello = await dispatcher.probe();
+        emit(makeEvent(deviceId, 'device.hello', hello, { now }));
+      },
+      resume: {
+        pending: () => dispatcher.pendingFrames(),
+        noteSent: (sessionId, seq) => dispatcher.noteFrameSent(sessionId, seq),
+        ack: (cursors) => outbox.ack(cursors),
+      },
       logger: logger.child({ mod: 'transport' }),
       now,
       ...(o.WebSocketCtor ? { WebSocketCtor: o.WebSocketCtor } : {}),
@@ -407,12 +464,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       ...(o.authTimeoutMs ? { authTimeoutMs: o.authTimeoutMs } : {}),
       ...(o.backoff ? { backoff: o.backoff } : {}),
     });
-    transport.on('connected', () => {
-      logger.info('gateway connected');
-      void dispatcher
-        .probe()
-        .then((hello) => emit(makeEvent(deviceId, 'device.hello', hello, { now })));
-    });
+    transport.on('connected', () => logger.info('gateway connected'));
     transport.on('disconnected', (reason) => logger.info('gateway disconnected', { reason }));
     // A refusal of this identity is not a network problem: say which it is, in words, once. The
     // transport has already stopped reconnecting for the fatal kind and keeps retrying the
@@ -811,6 +863,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
         maxEntries: o.maxSessionRecords ?? DEFAULT_MAX_SESSION_RECORDS,
         adoptedRetentionMs: o.adoptedRetentionMs ?? DEFAULT_ADOPTED_RETENTION_MS,
       });
+      pruneJournal();
       // No process outlived the daemon, so nothing in the store may still claim to be working.
       await daemon.reconcile();
       cleanupTimer = setInterval(() => {
@@ -823,6 +876,7 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
           maxEntries: o.maxSessionRecords ?? DEFAULT_MAX_SESSION_RECORDS,
           adoptedRetentionMs: o.adoptedRetentionMs ?? DEFAULT_ADOPTED_RETENTION_MS,
         });
+        pruneJournal();
       }, 3600_000);
       cleanupTimer.unref();
       if (transport) transport.start();
@@ -838,6 +892,10 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       // Before the dispatcher, so the assertion goes even if an adapter shutdown hangs or throws.
       keepAwake.dispose();
       await dispatcher.shutdown();
+      // What is on disk is the transcript, and the cursors describe it: both settled before the
+      // socket goes, so a restart resumes from the truth rather than from a half-written file.
+      journal.closeAll();
+      outbox.flush();
       await transport?.stop();
       await ipc.close(); // unlinks the socket only if this instance bound it
       lock?.release(); // unlinks the lock only if it still records our pid

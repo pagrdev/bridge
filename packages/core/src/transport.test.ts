@@ -1105,4 +1105,138 @@ describe('recipient keys over the wire', () => {
       { command: secret, exitCode: 0 },
     );
   });
+
+  // ---------- frame resume (MOB-032) ----------
+
+  describe('frame resume', () => {
+    const frameEvent = (sessionId: string, seq: number): DeviceEvent =>
+      makeEvent(deviceId, 'session.frame', {
+        sessionId,
+        projectId: ids.proj(),
+        provider: 'claude',
+        seq,
+        kind: 'assistant',
+        at: new Date().toISOString(),
+        sealed: {
+          v: 1 as const,
+          epk: 'A'.repeat(43),
+          recipients: [{ kid: '0000:1111:2222:3333', nonce: 'B'.repeat(16), wrap: 'C'.repeat(64) }],
+          nonce: 'D'.repeat(16),
+          ct: 'E'.repeat(40),
+          aad: { sessionId, seq, kind: 'assistant' as const },
+        },
+        meta: { bytes: 12, truncated: false, source: 'stdio' as const },
+      });
+
+    const sentFrames = () =>
+      gw.frames
+        .filter((f) => f.kind === 'event' && f.event.type === 'session.frame')
+        .map((f) => (f.kind === 'event' ? (f.event.payload as { seq: number }).seq : -1));
+
+    it('re-sends unacked frames in seq order, after the hello and before the buffered ring', async () => {
+      gw.protocolVersion = 2;
+      const sessionId = ids.ses();
+      const noted: Array<[string, number]> = [];
+      const pending = [1, 2, 3].map((seq) => ({
+        sessionId,
+        seq,
+        event: frameEvent(sessionId, seq),
+      }));
+      client = make({
+        onReady: () => {
+          client.sendEvent(
+            makeEvent(deviceId, 'device.hello', {
+              bridgeVersion: '0.1.0',
+              protocolVersion: 1,
+              platform: 'darwin',
+              osVersion: '25.0.0',
+              agents: [],
+              projects: [],
+              sessions: [],
+            }),
+          );
+        },
+        resume: {
+          pending: () => pending,
+          noteSent: (s, q) => noted.push([s, q]),
+          ack: () => {},
+        },
+      });
+      // Queued while offline: it must land AFTER the transcript, not in the middle of it.
+      client.sendEvent(makeEvent(deviceId, 'device.heartbeat', { activeSessions: 0 }));
+      client.start();
+      await until(() => sentFrames().length === 3);
+
+      const order = gw.frames
+        .filter((f) => f.kind === 'event')
+        .map((f) => (f.kind === 'event' ? f.event.type : ''));
+      expect(order.slice(0, 5)).toEqual([
+        'device.hello',
+        'session.frame',
+        'session.frame',
+        'session.frame',
+        'device.heartbeat',
+      ]);
+      expect(sentFrames()).toEqual([1, 2, 3]);
+      expect(noted).toEqual([
+        [sessionId, 1],
+        [sessionId, 2],
+        [sessionId, 3],
+      ]);
+    });
+
+    it('sends nothing when the gateway is already caught up', async () => {
+      gw.protocolVersion = 2;
+      client = make({ resume: { pending: () => [], noteSent: () => {}, ack: () => {} } });
+      client.start();
+      await until(() => client.state === 'connected');
+      await wait(50);
+      expect(sentFrames()).toEqual([]);
+    });
+
+    it('does not resume onto a gateway that only speaks v1', async () => {
+      gw.refuseVersion2 = true;
+      const sessionId = ids.ses();
+      client = make({
+        resume: {
+          pending: () => [{ sessionId, seq: 1, event: frameEvent(sessionId, 1) }],
+          noteSent: () => {},
+          ack: () => {},
+        },
+      });
+      client.start();
+      await until(() => client.state === 'connected');
+      await wait(50);
+      expect(client.negotiatedVersion).toBe(1);
+      expect(sentFrames()).toEqual([]);
+    });
+
+    it('advances the cursor from a gateway ack frame', async () => {
+      gw.protocolVersion = 2;
+      const acked: Array<Record<string, number>> = [];
+      client = make({
+        resume: { pending: () => [], noteSent: () => {}, ack: (c) => acked.push(c) },
+      });
+      client.start();
+      await until(() => client.state === 'connected');
+      gw.sendRaw({ kind: 'ack', cursors: { ses_one: 12, ses_two: 4 } });
+      await until(() => acked.length === 1);
+      expect(acked[0]).toEqual({ ses_one: 12, ses_two: 4 });
+    });
+
+    it('still flushes the ring when the connect hook throws', async () => {
+      gw.protocolVersion = 2;
+      client = make({
+        onReady: () => {
+          throw new Error('probe blew up');
+        },
+        logger: silentLogger,
+      });
+      client.sendEvent(makeEvent(deviceId, 'device.heartbeat', { activeSessions: 3 }));
+      client.start();
+      await until(() =>
+        gw.frames.some((f) => f.kind === 'event' && f.event.type === 'device.heartbeat'),
+      );
+    });
+  });
 });

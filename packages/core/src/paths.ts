@@ -24,6 +24,8 @@ import { isAbsolute, join } from 'node:path';
  *   run/daemon.sock local IPC socket (0600). If that path would exceed the 104-byte
  *                   `sun_path` limit (long PAGR_HOME), the socket lives in a short per-user
  *                   runtime dir instead and its location is written to run/daemon.sock.path.
+ *   journal/        per-session transcript journals (`<sessionId>.log` NDJSON + `.idx`, 0600)
+ *                   and `outbox.json`, the per-session {sent, acked} frame cursors
  *   tmp/            downloaded attachments (0600, deleted after use)
  *   logs/           daemon.log
  */
@@ -43,6 +45,10 @@ export interface PagrPaths {
   /** Text file holding the socket path actually in use (for hooks / CLI / adapters). */
   socketPathFile: string;
   tmpDir: string;
+  /** Per-session frame journals and the outbox cursors. Plaintext, on this Mac only. */
+  journalDir: string;
+  /** `{sessionId: {sent, acked}}` — how far the gateway has confirmed each session's frames. */
+  outboxFile: string;
   logsDir: string;
   logFile: string;
   hooksDir: string;
@@ -167,6 +173,8 @@ export function getPaths(home: string = resolvePagrHome()): PagrPaths {
     socketPath: chooseSocketPath(home),
     socketPathFile: join(home, 'run', 'daemon.sock.path'),
     tmpDir: join(home, 'tmp'),
+    journalDir: join(home, 'journal'),
+    outboxFile: join(home, 'journal', 'outbox.json'),
     logsDir: join(home, 'logs'),
     logFile: join(home, 'logs', 'daemon.log'),
     hooksDir: join(home, 'hooks'),
@@ -180,7 +188,7 @@ export function getPaths(home: string = resolvePagrHome()): PagrPaths {
 export function ensurePaths(home: string = resolvePagrHome()): PagrPaths {
   const p = getPaths(home);
   const socketDir = join(p.socketPath, '..');
-  for (const dir of [p.home, p.runDir, p.tmpDir, p.logsDir, p.hooksDir, socketDir]) {
+  for (const dir of [p.home, p.runDir, p.tmpDir, p.journalDir, p.logsDir, p.hooksDir, socketDir]) {
     try {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     } catch (err) {
@@ -277,7 +285,14 @@ export function auditPermissions(paths: PagrPaths): PermissionIssue[] {
         kind,
       });
   };
-  for (const d of [paths.home, paths.runDir, paths.tmpDir, paths.logsDir, paths.hooksDir])
+  for (const d of [
+    paths.home,
+    paths.runDir,
+    paths.tmpDir,
+    paths.journalDir,
+    paths.logsDir,
+    paths.hooksDir,
+  ])
     check(d, 'dir', EXPECTED_DIR_MODE);
   for (const f of [
     paths.configFile,
@@ -287,6 +302,7 @@ export function auditPermissions(paths: PagrPaths): PermissionIssue[] {
     paths.policyFile,
     paths.devicePolicyFile,
     paths.socketPathFile,
+    paths.outboxFile,
     join(paths.home, 'secrets.json'),
   ])
     check(f, 'file', EXPECTED_FILE_MODE);
