@@ -47,4 +47,5 @@ export * from './repoScan.js';
 export * from './scan.js';
 export * from './seal.js';
 export * from './sessions.js';
+export * from './sms.js';
 export * from './transport.js';

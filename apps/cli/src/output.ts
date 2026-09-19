@@ -1,5 +1,6 @@
 import pc from 'picocolors';
 import type { CliContext } from './context.js';
+import { encodeQr, type QrEcc } from './qr.js';
 
 export const ok = (s: string) => `${pc.green('✓')} ${s}`;
 export const bad = (s: string) => `${pc.red('✗')} ${s}`;
@@ -106,4 +107,45 @@ export function duration(ms: number): string {
   const m = Math.floor(total / 60);
   const s = total % 60;
   return m > 0 ? `${m}m ${String(s).padStart(2, '0')}s` : `${s}s`;
+}
+
+// ---------------------------------------------------------------------------
+// QR
+// ---------------------------------------------------------------------------
+
+/** Two modules per character cell, so a QR is half as tall as it is wide on screen. */
+const QR_GLYPHS = ['█', '▀', '▄', ' '] as const;
+/** The standard four-module margin. A QR printed flush against text does not scan. */
+const QR_QUIET = 4;
+
+export interface QrOptions {
+  /** Widest line the terminal can show without wrapping. */
+  maxWidth?: number;
+  ecc?: QrEcc;
+}
+
+/**
+ * A QR code as terminal lines, or `null` when it cannot be shown legibly — too much data, or a
+ * terminal too narrow for the module grid plus its quiet zone. Callers print the URL instead.
+ *
+ * Colours are written literally rather than through picocolors: a QR is not decoration, and a
+ * code stripped of its colours by a NO_COLOR-style rule would be a light-on-dark rectangle that
+ * no camera can read. The foreground is the *light* module (paper) and the background the dark
+ * one, which is what makes the half-block glyphs come out the right way round on any theme.
+ */
+export function qr(text: string, opts: QrOptions = {}): string[] | null {
+  const code = encodeQr(text, opts.ecc ?? 'M');
+  if (!code) return null;
+  const width = code.size + QR_QUIET * 2;
+  if (opts.maxWidth !== undefined && width > opts.maxWidth) return null;
+  const dark = (x: number, y: number): boolean =>
+    code.modules[y - QR_QUIET]?.[x - QR_QUIET] ?? false;
+  const lines: string[] = [];
+  for (let y = 0; y < width; y += 2) {
+    let line = '';
+    for (let x = 0; x < width; x++)
+      line += QR_GLYPHS[(dark(x, y) ? 2 : 0) + (dark(x, y + 1) ? 1 : 0)] ?? ' ';
+    lines.push(`\x1b[97;40m${line}\x1b[0m`);
+  }
+  return lines;
 }

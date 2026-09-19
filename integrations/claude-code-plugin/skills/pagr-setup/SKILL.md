@@ -27,8 +27,8 @@ single most common misunderstanding.
 
 | Command | What it does |
 | --- | --- |
-| `pagr connect` | Pairs this Mac. Creates a device key in the Keychain and opens a browser page to confirm the device. Needs a human — never attempt to complete it. |
-| `pagr status` | Pairing, daemon, gateway, agents and project summary. The first thing to run for any "is it working?" question. |
+| `pagr connect` | Pairs this Mac. Creates a device key in the Keychain and opens a browser page to confirm the device — the same page offers "Create an account" to someone who has none. It then prints a QR code for linking a phone and, if there is no trial yet, the URL that starts one. Needs a human — never attempt to complete it. |
+| `pagr status` | Pairing, daemon, gateway, agents, projects, and the account (`phoneLinked`, `entitled`, `productNumber` in `--json`). The first thing to run for any "is it working?" question. A `null` account field means it could not be read — `accountUnknown` says why — never that the step is unfinished. |
 | `pagr doctor` | Diagnoses install, pairing, daemon, gateway and agent problems, and prints the fix. |
 | `pagr projects` | Lists the projects this Mac can reach. |
 | `pagr project use [path]` | Makes a folder reachable now, registering it if needed (repo or not). Defaults to the current directory. **Ask the user before running this** — it grants access to that directory. |
@@ -49,6 +49,8 @@ Each of these makes the next one meaningless, so stop at the first failure:
 4. Gateway reachable
 5. A coding agent signed in on this Mac
 6. The project registered
+7. A phone linked (`phoneLinked`) — without it no agent can reach the user
+8. A trial or subscription (`entitled`) — without it agents refuse to run
 
 ## The remote connector
 

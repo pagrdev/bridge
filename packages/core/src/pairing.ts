@@ -77,6 +77,24 @@ export const PairStartResponse = z.object({
 });
 export type PairStartResponse = z.infer<typeof PairStartResponse>;
 
+/**
+ * The account-side facts the API attaches to a completed pairing. Every field is read
+ * leniently — `.default(false).catch(false)` — because this CLI is installed once and then
+ * talks to an API that keeps moving: a field the server has not shipped yet, or has renamed,
+ * must degrade to "not done" and never to a crashed `pagr connect`. Unknown fields are dropped
+ * by zod, so the server may add more at any time.
+ */
+export const OnboardingFacts = z.object({
+  /** A card-backed trial or subscription exists. Agents refuse to work without it. */
+  entitled: z.boolean().default(false).catch(false),
+  /** A phone is attached to the account, so agents can text the person. */
+  messagingLinked: z.boolean().default(false).catch(false),
+  hasProject: z.boolean().default(false).catch(false),
+  claudeConnected: z.boolean().default(false).catch(false),
+  codexConnected: z.boolean().default(false).catch(false),
+});
+export type OnboardingFacts = z.infer<typeof OnboardingFacts>;
+
 export const PairStatusResponse = z.discriminatedUnion('status', [
   z.object({ status: z.literal('pending') }),
   z.object({ status: z.literal('expired') }),
@@ -88,6 +106,10 @@ export const PairStatusResponse = z.discriminatedUnion('status', [
     userId: z.string().regex(/^usr_[0-9a-f]{32}$/),
     gatewayUrl: z.string().url(),
     serverKeys: z.record(z.string()),
+    /** Added by the API alongside onboarding; absent on an older server. */
+    onboarding: OnboardingFacts.optional(),
+    /** The number to text, or null on a provider with no published line. */
+    productNumber: z.string().nullable().optional(),
   }),
 ]);
 export type PairStatusResponse = z.infer<typeof PairStatusResponse>;
@@ -608,7 +630,14 @@ function unexpectedStatus(json: unknown, issue: string | undefined): PairingErro
 export function persistPairing(
   configFile: string,
   result: PairingCompleted,
-  extra: { apiUrl: string; deviceName: string; now?: () => Date; gatewayUrl?: string },
+  extra: {
+    apiUrl: string;
+    deviceName: string;
+    now?: () => Date;
+    gatewayUrl?: string;
+    /** Recorded so `status` and `doctor` can read the account facts later (see BridgeConfig). */
+    pairingId?: string;
+  },
 ): void {
   updateConfig(configFile, {
     deviceId: result.deviceId,
@@ -618,6 +647,7 @@ export function persistPairing(
     apiUrl: extra.apiUrl,
     deviceName: extra.deviceName,
     pairedAt: (extra.now ?? (() => new Date()))().toISOString(),
+    ...(extra.pairingId ? { pairingId: extra.pairingId } : {}),
   });
 }
 
@@ -637,6 +667,178 @@ export async function pair(
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
     ...opts.poll,
   });
-  persistPairing(opts.configFile, done, { apiUrl: opts.apiUrl, deviceName: opts.deviceName });
+  persistPairing(opts.configFile, done, {
+    apiUrl: opts.apiUrl,
+    deviceName: opts.deviceName,
+    pairingId: started.pairingId,
+  });
   return done;
+}
+
+// ---------------------------------------------------------------------------
+// onboarding
+// ---------------------------------------------------------------------------
+
+/**
+ * What the account still needs, read back through the pairing this Mac already holds.
+ *
+ * The api has no device-signed HTTP auth, so there is no credential the CLI could present to
+ * ask "is a phone linked yet?". What it does have is the pairing id — a random id only this Mac
+ * holds — on a route that already answers with the user id, and which keeps answering after the
+ * code has been spent. That is the whole mechanism: no session, no token, no new protocol.
+ *
+ * `onboarding: null` means the server did not send the block at all (an api older than this
+ * CLI). Callers must treat that as "unknown" and skip their step, never as "nothing is done".
+ */
+export interface OnboardingStatus {
+  onboarding: OnboardingFacts | null;
+  productNumber: string | null;
+}
+
+export interface OnboardingReadOptions {
+  apiUrl: string;
+  pairingId: string;
+  fetch?: FetchFn;
+  requestTimeoutMs?: number;
+}
+
+const statusUrl = (apiUrl: string, pairingId: string) =>
+  `${apiUrl.replace(/\/$/, '')}/v1/devices/pair/status/${encodeURIComponent(pairingId)}`;
+
+/**
+ * One read of the enriched pair status. Throws `PairingError` like the rest of this module;
+ * callers that only want to decorate a report (`status`, `doctor`) catch and print "unknown".
+ */
+export async function readOnboarding(opts: OnboardingReadOptions): Promise<OnboardingStatus> {
+  const fetchFn = opts.fetch ?? ((u, i) => fetch(u, i));
+  const { json } = await requestJson(fetchFn, statusUrl(opts.apiUrl, opts.pairingId), {
+    method: 'GET',
+    ...(opts.requestTimeoutMs === undefined ? {} : { timeoutMs: opts.requestTimeoutMs }),
+  });
+  return toOnboardingStatus(json);
+}
+
+function toOnboardingStatus(json: unknown): OnboardingStatus {
+  const parsed = PairStatusResponse.safeParse(json);
+  if (!parsed.success || parsed.data.status !== 'completed')
+    return { onboarding: null, productNumber: null };
+  return {
+    onboarding: parsed.data.onboarding ?? null,
+    productNumber: parsed.data.productNumber ?? null,
+  };
+}
+
+const ProductLineResponse = z.object({ productNumber: z.string().nullable().default(null) });
+
+/**
+ * `GET /v1/messaging/line` — the number to text, for the steps that need it before anybody is
+ * signed in. Public and rate-limited; `null` on a provider with no published line, where the
+ * conversation has to be started by us instead.
+ */
+export async function readProductNumber(opts: {
+  apiUrl: string;
+  fetch?: FetchFn;
+  requestTimeoutMs?: number;
+}): Promise<string | null> {
+  const fetchFn = opts.fetch ?? ((u, i) => fetch(u, i));
+  const { json } = await requestJson(
+    fetchFn,
+    `${opts.apiUrl.replace(/\/$/, '')}/v1/messaging/line`,
+    {
+      method: 'GET',
+      ...(opts.requestTimeoutMs === undefined ? {} : { timeoutMs: opts.requestTimeoutMs }),
+    },
+  );
+  const parsed = ProductLineResponse.safeParse(json);
+  return parsed.success ? parsed.data.productNumber : null;
+}
+
+/** Why `pollOnboarding` stopped. None of them is an error: setup continues either way. */
+export type OnboardingOutcome =
+  /** `until` came true. */
+  | 'satisfied'
+  /** The server never sent an `onboarding` block — an api older than this CLI. */
+  | 'unsupported'
+  /** We stopped waiting. The Mac is finished and working; the account step is not. */
+  | 'timeout'
+  /** Ctrl-C. */
+  | 'canceled'
+  /** The api could not be reached often enough to keep asking. */
+  | 'error';
+
+export interface OnboardingPollResult extends OnboardingStatus {
+  outcome: OnboardingOutcome;
+  /** Set when `outcome` is `error`; the last thing that went wrong. */
+  error?: PairingError;
+}
+
+export interface PollOnboardingOptions extends OnboardingReadOptions {
+  /** Stop as soon as this is true of the facts. */
+  until: (facts: OnboardingFacts) => boolean;
+  intervalMs?: number;
+  timeoutMs?: number;
+  maxTransientFailures?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  onProgress?: (p: PollProgress & { status: OnboardingStatus }) => void;
+  signal?: AbortSignal;
+}
+
+export const DEFAULT_ONBOARDING_POLL_INTERVAL_MS = 3000;
+
+/**
+ * Poll the enriched pair status until `until` holds, or we run out of patience.
+ *
+ * Unlike `pollPairing` this NEVER throws: every way it can end is a reportable outcome. A person
+ * whose Mac is paired, whose daemon is connected and whose agents are signed in has a working
+ * install; whether they have got round to texting Pagr yet is not something `pagr connect` may
+ * fail over, and a network wobble at that point certainly is not.
+ */
+export async function pollOnboarding(opts: PollOnboardingOptions): Promise<OnboardingPollResult> {
+  const sleep = opts.sleep ?? defaultSleep;
+  const now = opts.now ?? (() => Date.now());
+  const intervalMs = opts.intervalMs ?? DEFAULT_ONBOARDING_POLL_INTERVAL_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+  const maxTransient = opts.maxTransientFailures ?? 5;
+  const startedAt = now();
+  const deadline = startedAt + timeoutMs;
+  let last: OnboardingStatus = { onboarding: null, productNumber: null };
+  let transientRun = 0;
+
+  for (let attempt = 1; ; attempt++) {
+    if (opts.signal?.aborted) return { ...last, outcome: 'canceled' };
+    try {
+      last = await readOnboarding(opts);
+      transientRun = 0;
+    } catch (err) {
+      if (!(err instanceof PairingError) || !err.retryable || ++transientRun > maxTransient)
+        return {
+          ...last,
+          outcome: 'error',
+          ...(err instanceof PairingError ? { error: err } : {}),
+        };
+      opts.onProgress?.({
+        attempt,
+        elapsedMs: now() - startedAt,
+        remainingMs: Math.max(0, deadline - now()),
+        transientError: err,
+        status: last,
+      });
+      if (now() >= deadline) return { ...last, outcome: 'timeout' };
+      await sleep(intervalMs);
+      continue;
+    }
+    // An api that answers the route but carries no onboarding block will never carry one:
+    // asking again for ten minutes would be a lie dressed as patience.
+    if (!last.onboarding) return { ...last, outcome: 'unsupported' };
+    if (opts.until(last.onboarding)) return { ...last, outcome: 'satisfied' };
+    opts.onProgress?.({
+      attempt,
+      elapsedMs: now() - startedAt,
+      remainingMs: Math.max(0, deadline - now()),
+      status: last,
+    });
+    if (now() >= deadline) return { ...last, outcome: 'timeout' };
+    await sleep(intervalMs);
+  }
 }

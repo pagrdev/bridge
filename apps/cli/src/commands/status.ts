@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { describeKeepAwake, inspectConfig, ProjectRegistry } from '@pagr/bridge-core';
 import type { Command } from 'commander';
+import { readAccount } from '../account.js';
 import type { CliContext } from '../context.js';
 import { daemonStatus } from '../ipc.js';
 import { bad, bold, dim, kv, ok, printJson, shortId, warn } from '../output.js';
@@ -37,6 +38,10 @@ export async function runStatus(ctx: CliContext): Promise<void> {
   const { config, problem } = inspectConfig(ctx.paths.configFile);
   const status = await daemonStatus(ctx);
   const agents = probeAgentsLocally(ctx);
+  // The two facts that are not on this Mac. Short timeout and no retries: `pagr status` is the
+  // command people run when something is wrong, and it must stay fast on a bad network. When it
+  // cannot be read, every field below is null — "not known", never "not done".
+  const account = await readAccount(ctx, config, { requestTimeoutMs: 4000 });
   const projects =
     status?.projects ??
     (existsSync(ctx.paths.projectsFile)
@@ -64,6 +69,11 @@ export async function runStatus(ctx: CliContext): Promise<void> {
     agents,
     projects,
     sessions: status?.sessions ?? null,
+    // Account state, read back through the pairing id (see `readAccount`).
+    phoneLinked: account.onboarding?.messagingLinked ?? null,
+    entitled: account.onboarding?.entitled ?? null,
+    productNumber: account.productNumber,
+    accountUnknown: account.unavailable,
     // Older daemons do not report these; `null` says "not known", never "none".
     adoptedSessions: status?.adoptedSessions ?? null,
     unregisteredSessions: status?.unregisteredSessions ?? null,
@@ -128,6 +138,25 @@ export async function runStatus(ctx: CliContext): Promise<void> {
         `${data.unregisteredSessions} of your own session(s) run outside every registered project, so their prompts stay in the terminal — see \`pagr sessions\``,
       ),
     );
+  if (account.onboarding) {
+    ctx.out('');
+    ctx.out(bold('Account'));
+    ctx.out(
+      kv([
+        [
+          'phone',
+          account.onboarding.messagingLinked
+            ? ok('linked')
+            : warn(
+                account.productNumber
+                  ? `not linked — text Hi Pagr to ${account.productNumber}`
+                  : 'not linked',
+              ),
+        ],
+        ['trial', account.onboarding.entitled ? ok('active') : warn('not started')],
+      ]),
+    );
+  }
   if (status) {
     ctx.out('');
     ctx.out(bold('Phone link'));

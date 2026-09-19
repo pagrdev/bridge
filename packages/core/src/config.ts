@@ -5,6 +5,14 @@ import { inspectJson, type JsonFileProblem, readJson, writeJson } from './jsonFi
 export const BridgeConfig = z.object({
   deviceId: z.string().optional(),
   userId: z.string().optional(),
+  /**
+   * The id of the pairing that produced this device. Kept so `status`, `doctor` and a re-run of
+   * `connect` can read the account-side onboarding facts (phone linked, trial started) from the
+   * public pair-status route: the API has no device-signed HTTP auth, and this id is the only
+   * credential-free handle the Mac holds. Absent on any Mac paired before it was persisted —
+   * those print "skip", never a wrong answer.
+   */
+  pairingId: z.string().optional(),
   gatewayUrl: z.string().url().optional(),
   apiUrl: z.string().url().optional(),
   deviceName: z.string().optional(),

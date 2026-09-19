@@ -10,7 +10,7 @@ something you can do without leaving Claude Code.
 
 | Path | What it is |
 | --- | --- |
-| `commands/setup.md` | `/pagr:setup` — install the CLI, pair this Mac, register the current project, in order, stopping at the first failure |
+| `commands/setup.md` | `/pagr:setup` — install the CLI, pair this Mac, register the current project, link a phone, start a trial, in order, stopping at the first failure |
 | `commands/doctor.md` | `/pagr:doctor` — run `pagr doctor` and explain the one thing that is actually wrong |
 | `skills/pagr-setup/SKILL.md` | Background knowledge: the CLI surface, what Pagr can and cannot see, the diagnosis order, and the things not to do |
 

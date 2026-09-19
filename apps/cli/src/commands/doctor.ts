@@ -35,6 +35,7 @@ import {
   usesShortSocketFallback,
 } from '@pagr/bridge-core';
 import type { Command } from 'commander';
+import { linkPhoneFix, readAccount } from '../account.js';
 import { hookState } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { CliError, EXIT } from '../errors.js';
@@ -47,7 +48,7 @@ import {
   launchAgentPlan,
 } from '../launchd.js';
 import { bad, bold, dim, ok, printJson, warn } from '../output.js';
-import { configuredApiUrl } from '../urls.js';
+import { configuredApiUrl, tryResolveWebUrl } from '../urls.js';
 import { LAUNCH_COMMAND, MCP_CONFIG_FILE, MCP_SERVER_KEY } from './claude.js';
 import {
   CLAUDE_VERSION_FLOOR,
@@ -244,6 +245,50 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
       ? `${config.deviceId} (${config.deviceName ?? ''})`
       : 'not paired yet — run `pagr connect`',
     ...(paired ? {} : { fix: 'run `pagr connect`' }),
+  });
+
+  // ---- the account this Mac belongs to ------------------------------------
+  // Two facts that live in the cloud, not here: is a phone linked, and is there a trial. Both
+  // are `warn` at worst — `doctor` exits 0 on a correct but unfinished machine, and an install
+  // whose owner has not texted Pagr yet is exactly that. `--offline` skips the round-trip, and
+  // a Mac paired before `connect` recorded the pairing id has nothing to ask with, so it says
+  // so rather than reporting "not linked".
+  const account = await readAccount(ctx, config, {
+    ...(opts.offline ? { offline: true } : {}),
+  });
+  const welcome = tryResolveWebUrl(ctx.env, config);
+  const welcomeUrl = welcome ? `${welcome}/welcome` : null;
+  const accountFix =
+    account.unavailable && !config.pairingId && paired
+      ? 're-run `pagr connect --force` to enable this check'
+      : undefined;
+  add({
+    name: 'phone',
+    status: account.onboarding ? (account.onboarding.messagingLinked ? 'ok' : 'warn') : 'skip',
+    detail: account.onboarding
+      ? account.onboarding.messagingLinked
+        ? 'linked'
+        : 'not linked yet — agents cannot text you'
+      : (account.unavailable ?? 'unknown'),
+    ...(account.onboarding && !account.onboarding.messagingLinked
+      ? { fix: linkPhoneFix(account.productNumber, welcome) }
+      : accountFix
+        ? { fix: accountFix }
+        : {}),
+  });
+  add({
+    name: 'trial',
+    status: account.onboarding ? (account.onboarding.entitled ? 'ok' : 'warn') : 'skip',
+    detail: account.onboarding
+      ? account.onboarding.entitled
+        ? 'active'
+        : 'not started — agents refuse to run without one'
+      : (account.unavailable ?? 'unknown'),
+    ...(account.onboarding && !account.onboarding.entitled
+      ? { fix: `open ${welcomeUrl ?? 'your Pagr dashboard'}` }
+      : accountFix
+        ? { fix: accountFix }
+        : {}),
   });
 
   // ---- recipient keys -----------------------------------------------------
