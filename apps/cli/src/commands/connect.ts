@@ -7,12 +7,19 @@ import {
   ensurePaths,
   getPaths,
   inspectConfig,
+  LINK_PHONE_BODY,
+  linkPhoneSms,
   loadOrCreateIdentity,
   MAX_TOLERABLE_CLOCK_SKEW_MS,
+  type OnboardingFacts,
+  type PairingCompleted,
   type PairStartResponse,
   ProjectRegistry,
   persistPairing,
+  pollOnboarding,
   pollPairing,
+  readConfig,
+  readProductNumber,
   repairPermissions,
   type StagedIdentity,
   stageNewIdentity,
@@ -31,8 +38,20 @@ import {
   installAgent,
   launchAgentPlan,
 } from '../launchd.js';
-import { bold, cyan, dim, duration, ok, printJson, say, spinner, step, warn } from '../output.js';
-import { resolveApiUrl } from '../urls.js';
+import {
+  bold,
+  cyan,
+  dim,
+  duration,
+  ok,
+  printJson,
+  qr,
+  say,
+  spinner,
+  step,
+  warn,
+} from '../output.js';
+import { resolveApiUrl, tryResolveWebUrl } from '../urls.js';
 import { installChannelRegistration, LAUNCH_COMMAND } from './claudeChannel.js';
 
 export interface ConnectOptions {
@@ -48,6 +67,10 @@ export interface ConnectOptions {
   timeout?: string;
   /** Seconds to wait for the daemon's gateway handshake after install. */
   wait?: string;
+  /** `--no-qr`: print the `sms:` link as text instead of drawing a QR code. */
+  qr?: boolean;
+  /** Open Messages on this Mac for the phone step. Off by default — see `PHONE_OPEN_CAVEAT`. */
+  openMessages?: boolean;
 }
 
 const STEPS = 6;
@@ -98,6 +121,10 @@ interface ConnectResult {
   gateway: VerifyOutcome;
   warnings: string[];
   projects: number;
+  /** Null when the api is older than this CLI and says nothing about the account. */
+  onboarding: OnboardingFacts | null;
+  productNumber: string | null;
+  welcomeUrl: string | null;
 }
 
 export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise<void> {
@@ -256,6 +283,8 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
         apiUrl,
         deviceName,
         now: ctx.now,
+        // Kept so `status` and `doctor` can ask the same public route about the account later.
+        pairingId: started.pairingId,
         ...(opts.gatewayUrl ? { gatewayUrl: opts.gatewayUrl } : {}),
       });
     } catch (err) {
@@ -324,6 +353,23 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
       ? await verifyOrReport(ctx, opts, note)
       : ({ kind: 'skipped', reason: 'the daemon was not installed' } as const);
 
+    // --- 7/8. the account, not the Mac -------------------------------------
+    // Everything above is finished and saved: whatever happens here, this Mac works. These two
+    // steps are about the account it belongs to, and either can be walked away from.
+    //
+    // Not when the daemon never came up, though: that is a real failure with a fix, and making
+    // somebody sit through two account steps before they are told about it would be perverse.
+    const account =
+      gateway.kind === 'daemon_down'
+        ? { facts: null, productNumber: null, welcomeUrl: null }
+        : await accountSteps(ctx, opts, {
+            apiUrl,
+            pairingId: started.pairingId,
+            done,
+            note,
+            ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
+          });
+
     const result: ConnectResult = {
       claudeHook: hook.action,
       claudeChannel: channel.action,
@@ -336,6 +382,9 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
       gateway,
       warnings,
       projects: countProjects(ctx),
+      onboarding: account.facts,
+      productNumber: account.productNumber,
+      welcomeUrl: account.welcomeUrl,
     };
     // A paired Mac whose daemon never came up is a failed install, but the pairing IS saved —
     // say so, and never send the user back to `connect`.
@@ -363,6 +412,198 @@ export async function runConnect(ctx: CliContext, opts: ConnectOptions): Promise
     if (fatal) throw fatal;
   } finally {
     releaseInterrupt();
+  }
+}
+
+/**
+ * What `open "sms:…"` actually does, and why it is not the default.
+ *
+ * It opens Messages with the recipient and body filled in — but the message is sent from *this
+ * Mac's* Messages identity, which is usually an Apple ID email rather than the phone number on
+ * the account. A text from an email handle links nothing: the number it arrives from is the only
+ * thing that identifies the person. The CLI cannot see which identity Messages will use, so the
+ * QR — scanned by the phone itself — stays the primary path and this is opt-in.
+ */
+export const PHONE_OPEN_CAVEAT =
+  "Messages will send this from this Mac's identity. If that is an Apple ID email rather than the phone number on your Pagr account, the text will not link — check Messages → Settings → \u201cStart new conversations from\u201d.";
+
+interface AccountSteps {
+  /** Null when the api said nothing about the account: unknown, not "nothing done". */
+  facts: OnboardingFacts | null;
+  productNumber: string | null;
+  welcomeUrl: string | null;
+}
+
+interface AccountContext {
+  apiUrl: string;
+  pairingId: string;
+  done: PairingCompleted;
+  note: (line: string) => void;
+  requestTimeoutMs?: number;
+}
+
+/**
+ * Steps 7 and 8: link a phone, start a trial. Both are account state, not machine state, so
+ * neither can fail `pagr connect` and both are skipped the moment the server says they are
+ * already done — a person who came in through the web door and linked their phone there never
+ * sees the phone step here (§1, "never re-do a step done elsewhere").
+ *
+ * The facts come from the pairing response this command already has in hand, so an api that
+ * does not send them costs nothing: no extra request, no extra output, and the summary falls
+ * back to pointing at the dashboard.
+ *
+ * In `--json` mode nothing waits. A scripted run gets the facts as they are and exits.
+ */
+async function accountSteps(
+  ctx: CliContext,
+  opts: ConnectOptions,
+  o: AccountContext,
+): Promise<AccountSteps> {
+  const welcomeUrl = tryResolveWebUrl(ctx.env, readConfig(ctx.paths.configFile));
+  const welcome = welcomeUrl ? `${welcomeUrl}/welcome` : null;
+  let facts = o.done.onboarding ?? null;
+  let productNumber = o.done.productNumber ?? null;
+  if (!facts) return { facts: null, productNumber, welcomeUrl: welcome };
+
+  const phoneNeeded = !facts.messagingLinked;
+  const trialNeeded = !facts.entitled;
+  if (!phoneNeeded) say(ctx, ok('phone already linked'));
+  if (!trialNeeded) say(ctx, ok('trial already active'));
+  const total = STEPS + (phoneNeeded ? 1 : 0) + (trialNeeded ? 1 : 0);
+  const timeoutMs = minutesOption(opts.timeout, 10) * 60_000;
+  // `--json` is a scripted run: report what is true, open nothing, wait for nobody.
+  let interactive = !ctx.json;
+  let n = STEPS;
+
+  if (phoneNeeded) {
+    say(ctx, step(++n, total, 'Link your phone'));
+    if (!productNumber) productNumber = await productNumberOrNull(ctx, o);
+    say(ctx, '');
+    if (productNumber) {
+      const link = linkPhoneSms(productNumber);
+      say(
+        ctx,
+        `  Scan this with your iPhone, or text  ${bold(cyan(LINK_PHONE_BODY))}  to  ${bold(cyan(productNumber))}`,
+      );
+      say(ctx, '');
+      // A QR needs a real terminal and room for its quiet zone; anything else gets the link,
+      // which is just as usable and does not turn into confetti when it wraps.
+      const art = opts.qr === false || !ctx.isTTY ? null : qr(link, { maxWidth: ctx.columns });
+      for (const line of art ?? []) say(ctx, `  ${line}`);
+      if (!art) say(ctx, `  ${dim(link)}`);
+      say(ctx, '');
+      if (opts.openMessages && interactive) {
+        say(ctx, warn(PHONE_OPEN_CAVEAT));
+        if (!(await ctx.openBrowser(link)))
+          say(ctx, dim('  could not open Messages here — scan the code above instead'));
+      }
+    } else {
+      // No published line: there is nothing to text or encode, and the conversation has to be
+      // started by Pagr instead. The dashboard does that.
+      say(ctx, '  This Pagr deployment has no number to text yet.');
+      if (welcome) say(ctx, `  Link your phone here instead: ${bold(welcome)}`);
+    }
+    say(
+      ctx,
+      dim(
+        '  any text from the number on your account links it — Ctrl-C to skip, this Mac works either way',
+      ),
+    );
+    if (interactive) {
+      const got = await waitFor(
+        ctx,
+        o,
+        'waiting for your text…',
+        timeoutMs,
+        (f) => f.messagingLinked,
+      );
+      facts = got.onboarding ?? facts;
+      if (got.outcome === 'satisfied') say(ctx, ok('phone linked — Pagr texted you a welcome'));
+      else if (got.outcome === 'error')
+        o.note(`could not check whether your phone linked: ${got.error?.message ?? 'unknown'}`);
+      else say(ctx, dim('  not linked yet — the text still works whenever you send it'));
+      // One Ctrl-C ends the waiting, not just this wait: somebody who wants out is not asked to
+      // ask again. The step below still prints what would finish it.
+      if (got.outcome === 'canceled') interactive = false;
+    }
+  }
+
+  if (trialNeeded) {
+    say(ctx, step(++n, total, 'Start your trial'));
+    say(ctx, '');
+    say(ctx, '  Pagr runs agents only on an account with a trial or subscription.');
+    if (welcome) {
+      say(ctx, `  Open  ${bold(welcome)}`);
+      say(ctx, '');
+      if (!interactive) say(ctx, dim('  not waiting — open it whenever you are ready'));
+      else if (!opts.open) say(ctx, dim('  (--no-open) open that URL yourself'));
+      else if (isRemoteSession(ctx.env))
+        say(ctx, dim('  this looks like an SSH session — open the URL on your own computer'));
+      else if (!(await ctx.openBrowser(welcome)))
+        say(ctx, dim('  could not open a browser here — open the URL above yourself'));
+      if (interactive) {
+        const got = await waitFor(
+          ctx,
+          o,
+          'waiting for the trial to start…',
+          timeoutMs,
+          (f) => f.entitled,
+        );
+        facts = got.onboarding ?? facts;
+        if (got.outcome === 'satisfied') say(ctx, ok('trial started'));
+        else if (got.outcome === 'error')
+          o.note(`could not check whether the trial started: ${got.error?.message ?? 'unknown'}`);
+        else say(ctx, dim(`  not started yet — you can start it any time at ${welcome}`));
+      }
+    } else {
+      say(ctx, dim('  start it from your Pagr dashboard when you are ready'));
+    }
+  }
+
+  return { facts, productNumber, welcomeUrl: welcome };
+}
+
+/** The number to text, asked for separately only when the pairing response did not carry it. */
+async function productNumberOrNull(ctx: CliContext, o: AccountContext): Promise<string | null> {
+  try {
+    return await readProductNumber({
+      apiUrl: o.apiUrl,
+      ...(ctx.fetch ? { fetch: ctx.fetch } : {}),
+      ...(o.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: o.requestTimeoutMs }),
+    });
+  } catch {
+    // An api without the route is an api with no number to give; the branch below says so.
+    return null;
+  }
+}
+
+/** Wait for one account fact, with its own Ctrl-C so skipping the step does not kill `connect`. */
+async function waitFor(
+  ctx: CliContext,
+  o: AccountContext,
+  label: string,
+  timeoutMs: number,
+  until: (f: OnboardingFacts) => boolean,
+): Promise<Awaited<ReturnType<typeof pollOnboarding>>> {
+  const abort = new AbortController();
+  const release = ctx.onInterrupt(() => abort.abort());
+  const spin = spinner(ctx, label);
+  try {
+    return await pollOnboarding({
+      apiUrl: o.apiUrl,
+      pairingId: o.pairingId,
+      until,
+      timeoutMs,
+      signal: abort.signal,
+      sleep: ctx.sleep,
+      now: () => ctx.now().getTime(),
+      onProgress: (p) => spin.update(`${label} ${dim(`${duration(p.remainingMs)} left`)}`),
+      ...(ctx.fetch ? { fetch: ctx.fetch } : {}),
+      ...(o.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: o.requestTimeoutMs }),
+    });
+  } finally {
+    spin.stop();
+    release();
   }
 }
 
@@ -407,6 +648,28 @@ function printSummary(ctx: CliContext, r: ConnectResult): void {
     }`,
   );
   ctx.out(`  daemon    ${r.plist ? dim(r.plist) : dim('not installed')}`);
+  // The account half, read from the same booleans the steps above waited on. Absent entirely on
+  // an api that does not report them, because a confident "not linked" would be a guess.
+  if (r.onboarding) {
+    ctx.out(
+      `  phone     ${
+        r.onboarding.messagingLinked
+          ? ok('linked')
+          : warn(
+              r.productNumber
+                ? `not linked — text ${LINK_PHONE_BODY} to ${r.productNumber}`
+                : 'not linked',
+            )
+      }`,
+    );
+    ctx.out(
+      `  trial     ${
+        r.onboarding.entitled
+          ? ok('active')
+          : warn(`not started${r.welcomeUrl ? ` — ${r.welcomeUrl}` : ''}`)
+      }`,
+    );
+  }
   if (r.warnings.length > 0) {
     ctx.out('');
     ctx.out(bold(`${r.warnings.length} thing(s) to know`));
@@ -414,20 +677,29 @@ function printSummary(ctx: CliContext, r: ConnectResult): void {
   }
   ctx.out('');
   ctx.out(bold('Next steps'));
-  if (r.projects === 0)
-    ctx.out(
-      `  1. ${cyan(`pagr project add ${exampleProjectPath(ctx)} --name MyApp`)}\n     ${dim('register a repo — only its id and name ever leave this Mac')}`,
-    );
-  else
-    ctx.out(
-      `  1. ${cyan('pagr projects')}   ${dim(`${r.projects} project(s) already registered`)}`,
-    );
-  ctx.out(`  2. ${dim('link iMessage from the dashboard (Settings → Messaging)')}`);
-  ctx.out(`  3. ${cyan('pagr status')}    ${dim('confirm the gateway stays connected')}`);
+  // Only what is actually left: a step finished during this run never reappears as a chore.
+  const next: string[] = [
+    r.projects === 0
+      ? `${cyan(`pagr project add ${exampleProjectPath(ctx)} --name MyApp`)}\n     ${dim('register a repo — only its id and name ever leave this Mac')}`
+      : `${cyan('pagr projects')}   ${dim(`${r.projects} project(s) already registered`)}`,
+  ];
+  if (!r.onboarding) next.push(dim('link iMessage from the dashboard (Settings → Messaging)'));
+  else {
+    if (!r.onboarding.messagingLinked)
+      next.push(
+        r.productNumber
+          ? `${cyan(`text ${LINK_PHONE_BODY} to ${r.productNumber}`)}   ${dim('links your phone')}`
+          : dim('link your phone from the dashboard'),
+      );
+    if (!r.onboarding.entitled && r.welcomeUrl)
+      next.push(`${cyan(r.welcomeUrl)}   ${dim('start your trial')}`);
+  }
+  next.push(`${cyan('pagr status')}    ${dim('confirm the gateway stays connected')}`);
   if (r.claudeChannel === 'installed' || r.claudeChannel === 'already-installed')
-    ctx.out(
-      `  4. ${cyan(LAUNCH_COMMAND)}    ${dim('start Claude Code so your phone can take a turn in it')}`,
+    next.push(
+      `${cyan(LAUNCH_COMMAND)}    ${dim('start Claude Code so your phone can take a turn in it')}`,
     );
+  for (const [i, line] of next.entries()) ctx.out(`  ${i + 1}. ${line}`);
   ctx.out(dim('\nSomething off? `pagr doctor` explains and fixes almost everything.'));
 }
 
@@ -520,7 +792,16 @@ export function registerConnect(program: Command, getCtx: () => CliContext): voi
     .option('--no-daemon', 'do not install the launchd agent')
     .option('--no-channel', 'do not register the Claude Code channel server')
     .option('--no-open', 'print the pairing URL without opening a browser')
-    .option('--timeout <minutes>', 'how long to wait for browser approval', '10')
+    .option(
+      '--timeout <minutes>',
+      'how long to wait for browser approval, and for each account step',
+      '10',
+    )
+    .option('--no-qr', 'print the phone-linking sms: link as text instead of a QR code')
+    .option(
+      '--open-messages',
+      "open Messages on this Mac for the phone step (only correct if Messages sends from your account's phone number)",
+    )
     .option('--wait <seconds>', 'how long to wait for the gateway handshake (0 to skip)', '20')
     .option('-f, --force', 're-pair even if this Mac is already paired')
     .action((opts: ConnectOptions) => runConnect(getCtx(), opts));

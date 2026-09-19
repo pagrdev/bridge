@@ -31,6 +31,8 @@ export interface CliContext {
   env: NodeJS.ProcessEnv;
   json: boolean;
   isTTY: boolean;
+  /** Terminal width, for output that cannot wrap and stay useful (the pairing QR). */
+  columns: number;
   /** Absolute path to the built `dist/bin.js`; used for the launch agent ProgramArguments. */
   binPath: string;
   bridgeVersion: string;
@@ -158,6 +160,7 @@ export function createContext(overrides: ContextOverrides = {}): CliContext {
     env,
     json: false,
     isTTY: Boolean(process.stderr.isTTY),
+    columns: process.stdout.columns ?? 80,
     binPath: defaultBinPath(),
     bridgeVersion: CLI_VERSION,
     out: (l) => process.stdout.write(`${l}\n`),

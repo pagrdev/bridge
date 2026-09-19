@@ -31,7 +31,29 @@ export interface FakeApiOptions {
   status?: Reply[];
   /** Reply for GET /v1/health. */
   health?: Reply;
+  /** Replies for GET /v1/messaging/line; the last one repeats. */
+  line?: Reply[];
 }
+
+/** The account-side facts the enriched pair status carries. Defaults to "nothing done yet". */
+export interface OnboardingOver {
+  entitled?: boolean;
+  messagingLinked?: boolean;
+  hasProject?: boolean;
+  claudeConnected?: boolean;
+  codexConnected?: boolean;
+}
+
+export const PRODUCT_NUMBER = '+15550101234';
+
+export const onboarding = (over: OnboardingOver = {}) => ({
+  entitled: false,
+  messagingLinked: false,
+  hasProject: false,
+  claudeConnected: false,
+  codexConnected: false,
+  ...over,
+});
 
 export const DEV_ID = `dev_${'a'.repeat(32)}`;
 export const USER_ID = `usr_${'b'.repeat(32)}`;
@@ -60,6 +82,19 @@ export const statusCompleted = (over: Record<string, unknown> = {}): Reply => ({
 });
 
 /**
+ * A completed pairing from an api that also reports the account state (build-list ticket 6).
+ * `productNumber: null` is the shared-pool case, where there is no number to print or encode.
+ */
+export const statusCompletedWithOnboarding = (
+  over: OnboardingOver = {},
+  productNumber: string | null = PRODUCT_NUMBER,
+): Reply => statusCompleted({ onboarding: onboarding(over), productNumber });
+
+export const lineOk = (productNumber: string | null = PRODUCT_NUMBER): Reply => ({
+  json: { productNumber },
+});
+
+/**
  * A real `node:http` server on an ephemeral port, so `pagr connect` is exercised over actual
  * HTTP — sockets, headers, chunked bodies and all — instead of a hand-written fetch stub.
  */
@@ -67,6 +102,7 @@ export class FakeApi {
   readonly requests: RecordedRequest[] = [];
   private startIdx = 0;
   private statusIdx = 0;
+  private lineIdx = 0;
   private constructor(
     private readonly server: Server,
     readonly port: number,
@@ -116,6 +152,11 @@ export class FakeApi {
       reply = this.next(this.opts.start, this.startIdx++, startOk());
     } else if (path.includes('/v1/devices/pair/status/')) {
       reply = this.next(this.opts.status, this.statusIdx++, statusCompleted());
+    } else if (path.endsWith('/v1/messaging/line')) {
+      reply = this.next(this.opts.line, this.lineIdx++, {
+        status: 404,
+        json: { error: 'no_line' },
+      });
     } else if (path.endsWith('/v1/health')) {
       reply = this.opts.health ?? { json: { ok: true } };
     } else {
