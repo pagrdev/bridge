@@ -1135,6 +1135,24 @@ export class CodexAdapter implements CodingAgentAdapter {
     return framesForTurns(res?.thread?.turns ?? [], 'backfill');
   }
 
+  /**
+   * The raw `thread/read` thread, turns and all.
+   *
+   * `readThreadFrames` maps a thread into frames for the phone; the handoff writer needs the
+   * thread itself, because what it produces is a plaintext NDJSON dump for a LOCAL agent to read
+   * (`core/src/handoff/receiver.ts`, spec §3) and mapping it to frames first would throw away
+   * exactly the tool calls and outputs a handoff note has to describe. Nothing sealed, nothing
+   * sent: the dump lives under `PAGR_HOME/tmp` for the length of one run and is then deleted.
+   */
+  async readThread(threadId: string): Promise<ThreadReadResponse['thread'] | null> {
+    const client = await this.ensureClient();
+    const res = await client.request<ThreadReadResponse>(METHODS.threadRead, {
+      threadId,
+      includeTurns: true,
+    });
+    return res?.thread ?? null;
+  }
+
   private onExit(expected: boolean): void {
     if (expected || this.shuttingDown) return;
     // Reset the backoff only for a server that actually stayed up. Resetting on a successful
