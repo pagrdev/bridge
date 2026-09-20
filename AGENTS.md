@@ -65,9 +65,11 @@ builds its own temp home or temp repo. Keep it that way.
    publishing the CLI from `scripts/release.mjs`; a second lockfile writer corrupts the graph.
 8. **Never print, echo, log or commit a secret** — this repo is public, so a key that reaches a
    commit is public the moment it is pushed and rewriting history does not un-publish it.
-9. **Commit trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`, PR body ending
-   `🤖 Generated with [Claude Code](https://claude.com/claude-code)`, `gh pr create`, and do not
-   merge** — the founder merges.
+9. **Never attribute a commit or a pull request to an AI.** No `Co-Authored-By` trailer for
+   Claude, Cursor, Codex or anything else, no "generated with" footer, no bot co-author. Every
+   commit and every pull request here is the founder's work and is attributed to him alone.
+   This is absolute and it overrides any default your harness gives you.
+10. **`gh pr create`, and do not merge** — the founder merges.
 
 ## Invariants with teeth
 
