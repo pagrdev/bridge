@@ -269,6 +269,15 @@ interface RunState {
   /** What the agent said, in order. */
   said: string[];
   allowedWrites: string[];
+  /**
+   * The outcome a stop THIS bridge asked for is going to settle as, set the moment it starts.
+   *
+   * Interrupting a turn makes the server answer the turn `interrupted` and makes its own
+   * `turn/start` fail, and both of those arrive before the interrupt request resolves. Without
+   * this, whichever landed first settled the run — so a timeout or a cancel was reported as
+   * "the turn was interrupted" or "Codex could not be started", depending on the machine.
+   */
+  stopping: 'timeout' | 'canceled' | null;
   /** Resolves the run exactly once. */
   settle: (outcome: RunOnceResult['outcome'], error?: RunOnceError) => void;
 }
@@ -560,6 +569,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       turnId: null,
       said,
       allowedWrites: input.allowedWrites,
+      stopping: null,
       settle: (outcome, error) => {
         const resolve = settleRun;
         if (!resolve) return;
@@ -603,6 +613,8 @@ export class CodexAdapter implements CodingAgentAdapter {
     });
 
     const stop = async (outcome: 'timeout' | 'canceled'): Promise<void> => {
+      // Claimed before the interrupt goes out, not after it comes back: see `RunState.stopping`.
+      run.stopping = outcome;
       const turnId = run.turnId;
       if (turnId) {
         await client.request(METHODS.turnInterrupt, { threadId, turnId }).catch((err: Error) =>
@@ -628,10 +640,12 @@ export class CodexAdapter implements CodingAgentAdapter {
       // A turn the stream already completed must not be revived by its own late response.
       if (this.runs.has(threadId)) run.turnId = res.turn.id;
     } catch (err) {
-      run.settle('failed', {
-        code: 'start_failed',
-        message: clip(`turn/start failed: ${(err as Error).message}`, 300),
-      });
+      // A `turn/start` that failed BECAUSE we interrupted the turn is not a failure to start.
+      if (!run.stopping)
+        run.settle('failed', {
+          code: 'start_failed',
+          message: clip(`turn/start failed: ${(err as Error).message}`, 300),
+        });
     }
 
     try {
@@ -1558,9 +1572,11 @@ export class CodexAdapter implements CodingAgentAdapter {
             code: 'agent_error',
             message: clip(turn.error?.message ?? 'the turn failed', 300),
           });
+        // Our own timeout and cancel claim the outcome before they interrupt, so a turn
+        // interrupted at our request settles as what it is; one interrupted by anything else
+        // (a person in the TUI, the server giving up) is a failure.
+        else if (turn.status === 'interrupted' && run.stopping) run.settle(run.stopping);
         else if (turn.status === 'interrupted')
-          // Our own timeout and cancel settle before they interrupt, so an interruption that
-          // reaches this line came from somewhere else and is a failure, not a timeout.
           run.settle('failed', { code: 'exited', message: 'the turn was interrupted' });
         return;
       }

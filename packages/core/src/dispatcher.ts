@@ -5,6 +5,7 @@ import {
   type ApprovalOptionKind,
   type CommandBody,
   type CommandPayload,
+  type ControlLevel,
   canonicalize,
   type DeviceEvent,
   type EventPayload,
@@ -55,6 +56,11 @@ import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFl
 import { type EventPayloadInput, makeEvent } from './events.js';
 import { chunkFrame, type FrameBody, type FrameQuestion } from './frames.js';
 import type { GitOptions } from './git.js';
+import {
+  type HandoffCaptureAck,
+  type HandoffFailure,
+  runHandoffCapture,
+} from './handoff/switch.js';
 import { clip } from './heuristics.js';
 import { type ChannelBridge, getChannelBridge } from './ipc.js';
 import type { JournalEntry, JournalMeta, JournalStore, OutboxCursors } from './journal.js';
@@ -337,17 +343,18 @@ export interface DispatcherOptions {
    */
   backfill?: BackfillChannel;
   /**
+   * How `git.ts` — the one module allowed to spawn git — runs it, for both the handoff commands
+   * and `review.start`. Absent in production, which is the point: the real runner is
+   * `child_process.execFile` and nothing may replace it at run time. Tests substitute their own
+   * so a switch or a review can be exercised without a repository on disk.
+   */
+  git?: GitOptions;
+  /**
    * Claude Code channel bindings. Defaults to the process-wide bridge the daemon registers
    * `channel.*` on; injected in tests. Read for exactly one decision: whether an adopted session
    * can be given a turn (see `assertOurSession`).
    */
   channelBridge?: ChannelBridge;
-  /**
-   * Options for the one module allowed to spawn git (`git.ts`). Production leaves this unset and
-   * gets `child_process.execFile`; tests substitute a runner so no test ever touches a real
-   * repository.
-   */
-  git?: GitOptions;
   /** Bounds for `review.start`. Absent means the module's own defaults and the environment. */
   review?: ReviewChannel;
 }
@@ -836,6 +843,9 @@ export class Dispatcher {
       case 'review.apply':
         this.assertV2(body.version, 'review.apply');
         return this.applyReview(body.payload);
+      case 'session.handoff.capture':
+        this.assertV2(body.version, 'session.handoff.capture');
+        return this.handoffCapture(body.payload);
       case 'repo.scan':
         return this.scanRepositories();
       case 'project.register_handle':
@@ -989,11 +999,7 @@ export class Dispatcher {
     const adopted = rec ? isAdopted(rec) : false;
     const out: SessionSummaryV2 = { ...s };
     if (out.controlLevel === undefined)
-      out.controlLevel = !adopted
-        ? 'full'
-        : this.channelBoundTo(s.sessionId)
-          ? 'full'
-          : 'approvals_only';
+      out.controlLevel = this.derivedControlLevel(s.sessionId, adopted);
     if (out.origin === undefined) out.origin = adopted ? 'terminal' : 'pagr';
     if (out.projectStatus === undefined)
       out.projectStatus = s.projectId === UNREGISTERED_PROJECT ? 'unregistered' : 'registered';
@@ -1002,6 +1008,19 @@ export class Dispatcher {
       if (handle) out.repoHandle = handle;
     }
     return this.withLastSeq(out);
+  }
+
+  /**
+   * How much of a session Pagr may drive, worked out from what this Mac knows about it.
+   *
+   * A session the bridge started is `full`. One it merely adopted is `approvals_only` — unless a
+   * Pagr channel is bound to it (`pagr claude`), which is a documented way in and makes it `full`
+   * again. An adapter that says otherwise about its own live session always wins; this is the
+   * answer for the ones that do not (see `controlLevelFor`).
+   */
+  private derivedControlLevel(sessionId: string, adopted: boolean): ControlLevel {
+    if (!adopted) return 'full';
+    return this.channelBoundTo(sessionId) ? 'full' : 'approvals_only';
   }
 
   /**
@@ -1593,6 +1612,132 @@ export class Dispatcher {
         `option ${optionId} does not agree with decision ${p.decision}`,
       );
     return kind;
+  }
+
+  // ---------- handoff (v2, `handoff.v1`) ----------
+
+  /**
+   * `session.handoff.capture`: write the handoff, commit the work, stop the sender, seal the file.
+   *
+   * The sequence itself lives in `handoff/switch.ts`, which is where it can be read and tested
+   * against fakes; this method is the wiring — which session, which repository, which adapter,
+   * where the events go, and what the phone is told when a step fails.
+   *
+   * Two things it deliberately does NOT do. It does not call `assertOurSession`: handing off a
+   * session the person started in their own terminal is the case the feature exists for (spec
+   * §3), and the parts of it Pagr cannot do — steering a session it does not own, stopping one
+   * it did not start — are refused further down, individually, and reported rather than guessed
+   * at. And it does not start the receiving agent: that is `agent.start_session`, a separate
+   * signed command the cloud sends next (ADR 0019 decision 5).
+   */
+  private async handoffCapture(
+    p: CommandPayload<'session.handoff.capture'>,
+  ): Promise<HandoffCaptureAck> {
+    const { rec, adapter } = this.sessionAdapter(p.sessionId);
+    const run = await runHandoffCapture({
+      handoffId: p.handoffId,
+      sessionId: p.sessionId,
+      from: rec.provider,
+      to: p.to,
+      repo: this.handoffRepo(rec),
+      controlLevel: await this.controlLevelFor(rec, adapter),
+      readOnly: rec.readOnly === true,
+      adopted: isAdopted(rec),
+      sender: adapter,
+      stop: async () => {
+        await adapter.stopSession(p.sessionId);
+        this.o.sessions.setStatus(p.sessionId, 'stopped');
+      },
+      // Every state the bridge enters, as it enters it: the phone's running commentary is a
+      // report of what happened, never an optimistic guess about what is about to.
+      onUpdate: (u) => this.send('handoff.updated', { handoffId: p.handoffId, ...u }),
+      // TODO(HND-012): pass `captureFromReceiver` here once the receiver-writes path lands. Until
+      // then a session that cannot be steered refuses with `receiver_not_available`, which is the
+      // truth about this bridge rather than a silent failure to hand anything over.
+      ...(p.note !== undefined ? { note: p.note } : {}),
+      ...(this.o.env ? { env: this.o.env } : {}),
+      ...(this.o.git ? { git: this.o.git } : {}),
+    });
+
+    if (run.outcome === 'failed') {
+      this.logger.warn('handoff capture failed', {
+        handoffId: p.handoffId,
+        sessionId: p.sessionId,
+        reason: run.reason,
+        ...(run.wipCommit ? { wipCommit: run.wipCommit } : {}),
+      });
+      throw new DispatchError(HANDOFF_ACK_CODE[run.reason], run.message);
+    }
+    if (!run.stop.stopped)
+      this.logger.info('the sending session was left running', {
+        handoffId: p.handoffId,
+        sessionId: p.sessionId,
+        reason: run.stop.reason,
+      });
+
+    // The sealed copy, last: the phone gets the file only once it is final — stamped with the
+    // commit it belongs to — so a `handoff` frame never shows a version of the note that
+    // disagrees with the repository. A session outside every registered project cannot produce
+    // one at all (a frame names a `proj_…`), and the file on disk is the whole handoff anyway.
+    if (isReportable(rec))
+      this.emitFrame(
+        p.sessionId,
+        {
+          kind: 'handoff',
+          handoffId: p.handoffId,
+          path: run.relativePath,
+          text: run.text,
+        },
+        {
+          projectId: rec.projectId,
+          provider: rec.provider,
+          // Read off a file on this Mac that an agent wrote, which is what `transcript` means
+          // here — not the live stdio stream, and not the app server.
+          meta: { source: 'transcript' },
+        },
+      );
+    else
+      this.logger.info('handoff file kept local: the session is outside every project', {
+        handoffId: p.handoffId,
+        sessionId: p.sessionId,
+      });
+
+    return run.result;
+  }
+
+  /**
+   * The working tree a handoff is written into.
+   *
+   * The session's own directory first: a registered project can contain more than one repository
+   * (and a session can be running in a subdirectory of one), and `git.ts` resolves the work tree
+   * root from wherever it is pointed. The project path is the fallback for a session the bridge
+   * started, and the registry is the last word when neither was recorded.
+   */
+  private handoffRepo(rec: SessionRecord): string {
+    if (rec.cwd) return rec.cwd;
+    if (rec.projectPath) return rec.projectPath;
+    return this.o.registry.resolve(rec.projectId).path;
+  }
+
+  /**
+   * How much of this session Pagr may drive, asked of the adapter first.
+   *
+   * A session that is running right now knows its own control level — a mirrored Codex TUI
+   * thread reports `mirror_only`, and nothing in `sessions.json` could work that out — so the
+   * adapter's answer wins and the local derivation is the fallback.
+   */
+  private async controlLevelFor(
+    rec: SessionRecord,
+    adapter: CodingAgentAdapter,
+  ): Promise<ControlLevel> {
+    try {
+      const live = await adapter.getStatus(rec.sessionId);
+      if (live?.controlLevel) return live.controlLevel;
+    } catch {
+      // An adapter that has never heard of this session is not an error here: it is exactly the
+      // ended-session case, and the local record is what describes it.
+    }
+    return this.derivedControlLevel(rec.sessionId, isAdopted(rec));
   }
 
   // ---------- remote project pick ----------
@@ -2444,3 +2589,22 @@ export class Dispatcher {
     }
   }
 }
+
+/**
+ * What a failed switch acks as.
+ *
+ * `provider_error` for everything that went wrong while doing the work, which is what it is —
+ * the cloud shows `message`, and for a rejected commit that message is the user's own hook's
+ * first line (spec §9). A directory that is not a git work tree is the one case that is not a
+ * failure to try: this Mac will not hand off a tree it cannot commit, and saying so as
+ * `capability_unsupported` is what stops the cloud from retrying it.
+ */
+const HANDOFF_ACK_CODE: Record<HandoffFailure, AckErrorCode> = {
+  not_a_repo: 'capability_unsupported',
+  not_excluded: 'provider_error',
+  no_handoff: 'provider_error',
+  hook_failed: 'provider_error',
+  commit_failed: 'provider_error',
+  write_failed: 'provider_error',
+  stop_failed: 'provider_error',
+};

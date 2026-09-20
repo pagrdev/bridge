@@ -75,8 +75,16 @@ export type CaptureRefusal =
   /** Receiver path: the caller's `AbortSignal` fired and the run was killed. */
   | 'run_canceled'
   /** Receiver path: the run finished, said it was done, and left no file at the path. */
-  | 'no_file';
-
+  | 'no_file'
+  /**
+   * The receiver-writes path was asked for and this bridge has not been wired to one.
+   *
+   * `captureFromReceiver` exists (HND-012), but the dispatcher still passes `switch.ts`'s
+   * `receiverNotAvailable` stub — see HND-012a. It stays in the union after that wiring for the
+   * honest case: an adapter with no `runOnce` (spec §3 needs one to spawn the receiving agent
+   * headless) genuinely cannot reconstruct a handoff.
+   */
+  | 'receiver_not_available';
 /**
  * The end of a capture, whichever path ran it.
  *
