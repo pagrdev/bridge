@@ -132,6 +132,24 @@ export const FrameBody = z.discriminatedUnion('kind', [
     suggestions: z.array(z.string()).optional(),
   }),
   z.object({ kind: z.literal('system'), subtype: z.string(), text: z.string() }),
+  /**
+   * v2, `handoff.v1`. A finished review report, sealed, so the phone can read the findings the
+   * verdict line only summarises.
+   *
+   * The whole of `review.md` travels here and nowhere else: `review.completed` carries one line
+   * in the clear so the cloud can text it, and everything the reviewer actually wrote — file
+   * names, line numbers, quoted code — is inside the seal. `verdict` and `summary` are repeated
+   * in the body so a phone reading its journal offline does not have to pair the frame with an
+   * event it may never have received.
+   */
+  z.object({
+    kind: z.literal('review'),
+    reviewId: z.string(),
+    verdict: z.enum(['approve', 'comment', 'block']),
+    summary: z.string(),
+    /** The report exactly as the reviewer wrote it, first line included. */
+    text: z.string(),
+  }),
 ]);
 export type FrameBody = z.infer<typeof FrameBody>;
 
@@ -323,6 +341,11 @@ function largestTextSlot(body: FrameBody): TextSlot | null {
       break;
     case 'approval_preview':
       add(body.preview, (preview) => ({ ...body, preview }));
+      break;
+    case 'review':
+      // The report, not the verdict line: `summary` is what the phone shows when the findings
+      // are too long to send live, so clipping it would leave the frame saying nothing.
+      add(body.text, (text) => ({ ...body, text }));
       break;
     case 'question':
       // Question text is short by construction and is the whole point of the frame; clipping it

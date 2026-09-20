@@ -491,6 +491,23 @@ export const ReviewStartResult = z.object({ reviewId: ReviewId });
 export type ReviewStartResult = z.infer<typeof ReviewStartResult>;
 
 /**
+ * What `review.apply` answers with: which agent the findings were handed to, and how.
+ *
+ * `instructed` means the session that wrote the code is still live and took the turn;
+ * `started` means it could not, and a fresh session was started on the same tree with the same
+ * instruction. Either way a person asked for this — nothing here happens on a verdict alone.
+ */
+export const ReviewApplyResult = z.object({
+  reviewId: ReviewId,
+  /** The session now holding the instruction: the live builder, or the one just started. */
+  sessionId: SessionId,
+  applied: z.enum(['instructed', 'started']),
+  /** How the instruction reached a live session. Absent when a new one was started. */
+  delivered: InstructionDelivery.optional(),
+});
+export type ReviewApplyResult = z.infer<typeof ReviewApplyResult>;
+
+/**
  * What `rules.migrate` answers with. The line count and the file names are composed on the Mac so
  * the cloud can write "Write AGENTS.md from CLAUDE.md (142 lines)?" without ever holding the body.
  */
@@ -1020,6 +1037,16 @@ export const EventPayloads = {
     reviewId: ReviewId,
     verdict: ReviewVerdict,
     summary: z.string().max(500),
+    /**
+     * Why the verdict needed interpreting, when it did — including the first line the reviewer
+     * actually wrote.
+     *
+     * A report whose first line is not `verdict: …` is read as `comment` (see `parseVerdict`),
+     * and without this field that is indistinguishable from a reviewer that looked hard and had
+     * something mild to say. The person is owed the difference: one is a reviewer that
+     * misformatted its answer, the other is a reviewer that judged the change.
+     */
+    note: z.string().max(500).optional(),
   }),
 } as const;
 
