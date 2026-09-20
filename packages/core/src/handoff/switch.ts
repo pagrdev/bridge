@@ -84,21 +84,28 @@ export interface ReceiverCaptureInput {
 /**
  * The receiver-writes path of spec §3, as a seam.
  *
- * TODO(HND-012): the real implementation lands in `capture.ts` as `captureFromReceiver` —
- * resolve the sender's transcript (Claude JSONL via `transcript/paths.ts`, Codex via
- * `thread/read` dumped under `PAGR_HOME/tmp`), `runOnce` the RECEIVING adapter over it with
- * `handoffWritePrompt({transcriptPath})`, and delete the dump afterwards. It is being written in
- * parallel with this module, so the switch calls it through this type and defaults to
- * {@link receiverNotAvailable}. Wiring it up is one argument at the dispatcher's call site.
+ * Wired (HND-012a): the dispatcher passes an adapter over `handoff/receiver.ts`'s
+ * `captureFromReceiver`, which resolves the sender's transcript (Claude's JSONL under
+ * `~/.claude/projects`, Codex's `thread/read` dumped to `PAGR_HOME/tmp` and deleted after),
+ * `runOnce`s the RECEIVING adapter over it with `handoffWritePrompt({transcriptPath})`, and
+ * answers with the same {@link CaptureOutcome} the sender path does.
+ *
+ * The seam stays, and is not an artefact of the two halves having been built in parallel. What
+ * this module decides is WHO writes and what happens afterwards; what the receiver module needs
+ * — an adapter to spawn, the agent's own session id, a home directory to search — are facts
+ * about the daemon's wiring, and a switch that reached for them could not be run against fakes.
+ * Keeping the types apart is also what lets the missing-piece cases below be refusals rather
+ * than exceptions.
  */
 export type ReceiverCapture = (input: ReceiverCaptureInput) => Promise<CaptureOutcome>;
 
 /**
- * The default receiver path: there isn't one yet.
+ * The default when a caller supplies no receiver path at all: a one-shot CLI dispatcher, a test
+ * that only cares about the sender, a bridge built without the wiring.
  *
- * It refuses rather than throwing, and it refuses in the same shape a real capture does, so the
- * switch's fall-through is exercised by every test on this branch exactly as it will be when
- * HND-012 replaces it — the only thing that changes is which outcome comes back.
+ * It refuses rather than throwing, and in the same shape a real capture does, so the switch's
+ * fall-through behaves identically whether or not a receiver is attached — only the outcome
+ * differs.
  */
 export const receiverNotAvailable: ReceiverCapture = (input) =>
   Promise.resolve({
@@ -250,7 +257,7 @@ export interface HandoffCaptureRunInput {
   /** The live sending session, for the sender-writes path. */
   sender: InstructionSender;
   stop: StopSender;
-  /** Defaults to {@link receiverNotAvailable} until HND-012 lands. */
+  /** The receiver-writes path. Absent means {@link receiverNotAvailable}: an honest refusal. */
   captureFromReceiver?: ReceiverCapture | undefined;
   /** Defaults to {@link rulesMigrationDeferred} until HND-041 lands. */
   migrateRules?: RulesMigrateHook | undefined;
