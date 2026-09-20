@@ -343,9 +343,10 @@ export interface DispatcherOptions {
    */
   backfill?: BackfillChannel;
   /**
-   * How `git.ts` runs git for the handoff commands. Absent in production, which is the point:
-   * the real runner is `child_process.execFile` and nothing may replace it at run time. Tests
-   * substitute their own so a switch can be exercised without a repository on disk.
+   * How `git.ts` — the one module allowed to spawn git — runs it, for both the handoff commands
+   * and `review.start`. Absent in production, which is the point: the real runner is
+   * `child_process.execFile` and nothing may replace it at run time. Tests substitute their own
+   * so a switch or a review can be exercised without a repository on disk.
    */
   git?: GitOptions;
   /**
@@ -354,12 +355,6 @@ export interface DispatcherOptions {
    * can be given a turn (see `assertOurSession`).
    */
   channelBridge?: ChannelBridge;
-  /**
-   * Options for the one module allowed to spawn git (`git.ts`). Production leaves this unset and
-   * gets `child_process.execFile`; tests substitute a runner so no test ever touches a real
-   * repository.
-   */
-  git?: GitOptions;
   /** Bounds for `review.start`. Absent means the module's own defaults and the environment. */
   review?: ReviewChannel;
 }
