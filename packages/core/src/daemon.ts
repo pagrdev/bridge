@@ -8,6 +8,7 @@ import {
   canonicalize,
   type DeviceEvent,
   type EventPayload,
+  GitRange,
   type HandoffCaptureResult,
   type Provider,
   type SessionStatus,
@@ -38,9 +39,11 @@ import {
   Dispatcher,
   type HelloChannelStatus,
   type RemoteProjectPickStatus,
+  type ReviewChannel,
+  type ReviewEnd,
 } from './dispatcher.js';
 import { makeEvent } from './events.js';
-import { repoRoot } from './git.js';
+import { type GitOptions, repoRoot } from './git.js';
 import { handoffFilePath } from './handoff/capture.js';
 import { HANDOFF_DIR, HANDOFF_ID_RE } from './handoff/format.js';
 import { handoffStartInstruction } from './handoff/prompt.js';
@@ -75,6 +78,10 @@ import { nearestGitRoot, ProjectError, ProjectRegistry, projectIdFor } from './p
 import { ASK_USER_QUESTION, askUserQuestionUpdatedInput, questionBodyFor } from './questions.js';
 import { type ReconciledSession, reconcileSessions } from './reconcile.js';
 import { ReplayCache } from './replay.js';
+import { REVIEW_DIR, REVIEW_INTENT_MAX_CHARS } from './review/packet.js';
+import { verdictLine } from './review/prompt.js';
+import { type ResolvedReviewRange, ReviewRangeError, resolveReviewRange } from './review/range.js';
+import { reviewApplyInstruction, reviewFilePath } from './review/run.js';
 import {
   DEFAULT_ADOPTED_RETENTION_MS,
   DEFAULT_MAX_SESSION_RECORDS,
@@ -153,6 +160,14 @@ export interface CreateDaemonOptions {
    * project and cannot tell two apart.
    */
   claudeSessionForPid?: (pid: number) => string | null;
+  /**
+   * How `git.ts` runs git, for the handoff and review commands. Absent in production, which is
+   * the point: the real runner is `child_process.execFile` and nothing may replace it at run
+   * time. Tests substitute their own so `pagr review` can be exercised without a repository.
+   */
+  git?: GitOptions;
+  /** Bounds for a review run. Absent means the module's defaults and the environment. */
+  review?: ReviewChannel;
 }
 
 /** What the daemon is handed about reading history; the rest of the channel it wires itself. */
@@ -521,6 +536,8 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     onApprovalsChange: () => syncKeepAwake(),
     onQuestionsChange: () => syncKeepAwake(),
     ...(o.fetch ? { fetch: o.fetch } : {}),
+    ...(o.git ? { git: o.git } : {}),
+    ...(o.review ? { review: o.review } : {}),
   });
   /**
    * Restate both derived reasons from the truth. Idempotent, so it is safe to call from every
@@ -1015,6 +1032,124 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     });
     if (ack.status !== 'completed') throw ackFailed(ack, `${p.provider} could not be started`);
     return ack.result as SessionSummary;
+  });
+
+  // ---------- review, from this Mac (`pagr review`) ----------
+
+  /** Which project a local review command is about, refused by name when there is none. */
+  const reviewProject = (projectId: string) => {
+    if (projectId === UNREGISTERED_PROJECT || !registry.has(projectId))
+      throw new IpcMethodError(
+        'unknown_project',
+        'that directory is in no registered project, so there is nothing to review',
+      );
+    return registry.resolve(projectId);
+  };
+
+  /** A range that could not be chosen, as the IPC error the CLI maps to an exit code. */
+  const rangeFailed = (e: ReviewRangeError): IpcMethodError =>
+    new IpcMethodError(e.reason, e.message);
+
+  /**
+   * `pagr review`, step one: which commits, and why those.
+   *
+   * Its own call rather than a tail of the run, because the whole reason it exists is to be
+   * answered BEFORE a ten-minute agent starts. A person who is about to spend that has to be
+   * able to read "the last commit, abc1234 fix the retry" and stop the command if it is the
+   * wrong one; a sentence printed afterwards is an apology, not a check.
+   */
+  ipc.registerMethod('review.range', async (params) => {
+    const p = z
+      .object({
+        projectId: z.string().min(1),
+        /** `--range`, as the person typed it. Normalised and checked here, never trusted. */
+        range: z.string().min(1).max(200).optional(),
+      })
+      .parse(params);
+    const project = reviewProject(p.projectId);
+    let resolved: ResolvedReviewRange;
+    try {
+      resolved = await resolveReviewRange({
+        dir: project.path,
+        ...(p.range !== undefined ? { explicit: p.range } : {}),
+        ...(o.git ? { git: o.git } : {}),
+      });
+    } catch (err) {
+      if (err instanceof ReviewRangeError) throw rangeFailed(err);
+      throw err;
+    }
+    return resolved;
+  });
+
+  /**
+   * `pagr review`, step two: run the review and wait for the verdict.
+   *
+   * The same `review.start` a phone sends, on the same dispatcher, with one difference that is
+   * about the door and not about the feature: the cloud's ack is "this review is under way" and
+   * the verdict reaches it minutes later as `review.completed`, because a phone cannot hold a
+   * connection open that long. A terminal can, and a command that printed a review id and exited
+   * would be useless — so this registers as a waiter on the dispatcher first, issues the command,
+   * and answers with what the reviewer actually wrote.
+   *
+   * The waiter is registered BEFORE the command: a review that fails in its first second would
+   * otherwise end before anything was listening, and the wait would never finish.
+   */
+  ipc.registerMethod('review.run', async (params) => {
+    const p = z
+      .object({
+        projectId: z.string().min(1),
+        reviewer: z.enum(['claude', 'codex']),
+        range: GitRange,
+        intent: z.string().min(1).max(REVIEW_INTENT_MAX_CHARS),
+      })
+      .parse(params);
+    const project = reviewProject(p.projectId);
+    const reviewId = `rev_${randomBytes(16).toString('hex')}`;
+
+    let settle: ((end: ReviewEnd) => void) | null = null;
+    const ended = new Promise<ReviewEnd>((resolve) => {
+      settle = resolve;
+    });
+    const off = dispatcher.onReviewEnd(reviewId, (end) => settle?.(end));
+    let end: ReviewEnd;
+    try {
+      const ack = await localCommand('review.start', {
+        reviewId,
+        projectId: p.projectId,
+        reviewer: p.reviewer,
+        range: p.range,
+        intent: p.intent,
+      });
+      if (ack.status !== 'completed') throw ackFailed(ack, 'the review could not be started');
+      end = await ended;
+    } finally {
+      off();
+    }
+
+    const repo = await repoRoot(project.path, o.git ?? {});
+    const where = {
+      reviewId,
+      reviewer: p.reviewer,
+      projectId: p.projectId,
+      repo,
+      range: p.range,
+      intent: p.intent,
+      path: reviewFilePath(repo, reviewId),
+      relativePath: `${REVIEW_DIR}/${reviewId}/review.md`,
+    };
+    // A review that ran and produced nothing is a failure, not a verdict. `no_report` is its own
+    // code so a script can tell "the reviewer never answered" from "the reviewer said block".
+    if (!end.ok) throw new IpcMethodError('no_report', end.message);
+    return {
+      ...where,
+      verdict: end.verdict,
+      summary: end.summary,
+      // The reviewer's own line, not a recomposition of the parsed halves. Absent only for a
+      // report with no readable line at all, which `note` then explains.
+      ...(verdictLine(end.text) !== undefined ? { verdictLine: verdictLine(end.text) } : {}),
+      ...(end.note !== undefined ? { note: end.note } : {}),
+      instruction: reviewApplyInstruction(reviewId),
+    };
   });
 
   ipc.registerMethod('approvals.list', () => dispatcher.approvals.list());

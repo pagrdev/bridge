@@ -7,6 +7,7 @@ import { registerDoctor } from './commands/doctor.js';
 import { registerHandoff } from './commands/handoff.js';
 import { registerLogout } from './commands/logout.js';
 import { registerProjects } from './commands/projects.js';
+import { registerReview } from './commands/review.js';
 import { registerSessions } from './commands/sessions.js';
 import { registerStatus } from './commands/status.js';
 import {
@@ -80,6 +81,7 @@ function build(overrides: ContextOverrides = {}): BuiltProgram {
   registerProjects(program, getCtx);
   registerSessions(program, getCtx);
   registerHandoff(program, getCtx);
+  registerReview(program, getCtx);
   registerDaemon(program, getCtx);
   registerBilling(program, getCtx);
   registerClaude(program, getCtx);

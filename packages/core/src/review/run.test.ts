@@ -291,6 +291,32 @@ describe('awaitReview', () => {
     expect(outcome.verdict).toBe('approve');
   });
 
+  it('reads a report from an agent that wrote it and exited in the same tick', async () => {
+    const prepared = await prepare(t.home, []);
+    // No timer, no waiting to be aborted: the report is on disk before `runOnce` returns, and
+    // the run has already settled by the time the wait is set up. A fast model, a cached answer
+    // or a warm local agent all look like this — and the verdict must survive it, because the
+    // alternative is telling somebody their review failed while the review sits next to them.
+    const reviewer: ReviewRunner = {
+      runOnce: async (input: RunOnceInput): Promise<RunOnceResult> => {
+        mkdirSync(dirname(prepared.reviewPath), { recursive: true });
+        writeFileSync(prepared.reviewPath, 'verdict: approve — the retry is bounded\n');
+        return {
+          runId: input.runId ?? 'run_fast',
+          sessionId: 'ses_fast',
+          outcome: 'completed',
+          output: '',
+          durationMs: 0,
+        };
+      },
+    };
+    const outcome = await run(prepared, reviewer);
+    expect(outcome.outcome).toBe('completed');
+    if (outcome.outcome !== 'completed') throw new Error('unreachable');
+    expect(outcome.verdict).toBe('approve');
+    expect(outcome.summary).toBe('the retry is bounded');
+  });
+
   it('says so, in one line, when the agent finishes its turn without writing anything', async () => {
     const prepared = await prepare(t.home, []);
     const outcome = await run(prepared, new FakeReviewer(prepared.reviewPath, { endsAfterMs: 5 }));

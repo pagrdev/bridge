@@ -37,6 +37,7 @@ pagr status           # pairing, daemon, gateway — and the phone link: protoco
 pagr sessions         # what is running, what Pagr may drive, and how much journal each has
 pagr handoff --to codex   # hand this directory's work to the other agent, mid-task
 pagr handoffs ls      # every handoff file this Mac has written
+pagr review --with codex  # have the other agent review this directory's work, read-only
 pagr claude           # start Claude Code with the Pagr channel (see below)
 ```
 
@@ -45,6 +46,13 @@ note (`.pagr/handoff/<id>.md`, excluded via `.git/info/exclude`, never committed
 `.gitignore`), WIP-commits the tree if it is dirty, stops the sender and starts the other agent on
 the note. Nothing leaves the Mac. `--no-start` stops after writing the file and prints its path
 plus the one line to paste — which is how you hand work to an agent Pagr has no adapter for.
+
+`pagr review --with <claude|codex>` builds a review packet — the diff, the commit list and one
+line of intent, never your transcript — and gives it to the OTHER agent read-only. It prints which
+commits it is about to read before the reviewer starts (your uncommitted work, or the last commit,
+or `--range <base>..<head>`), then the reviewer's own verdict line and the path to its report.
+Nothing is fixed for you: a `block` exits 5 so a script can stop, and the line to hand the findings
+back to the agent that wrote the code is printed for you to run.
 
 `pagr project scan [roots...]` walks a few conventional folders (never your whole home
 directory), stops at each `.git`, skips `node_modules`/caches/hidden folders, and offers what it

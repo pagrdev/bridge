@@ -54,6 +54,7 @@ export * from './replay.js';
 export * from './repoScan.js';
 export * from './review/packet.js';
 export * from './review/prompt.js';
+export * from './review/range.js';
 export * from './review/run.js';
 export * from './rules/convert.js';
 export * from './rules/migrate.js';
