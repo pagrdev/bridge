@@ -143,6 +143,15 @@ export const HELLO_CAPABILITIES = {
   keepAwake: 'keep_awake.v1',
   /** The Claude Code channel is registered, so a terminal session can be given a turn. */
   channel: 'channel.v1',
+  /**
+   * `session.handoff.capture` / `review.start` / `review.apply` / `rules.migrate`: this Mac has a
+   * handoff engine, so a switch or a cross-agent review will actually run.
+   *
+   * Declared here with the rest of the vocabulary; it is advertised once the engine exists, on
+   * the same terms as every other name in this object — a capability is a fact about the daemon
+   * as it is running, never a build-time constant.
+   */
+  handoff: 'handoff.v1',
 } as const;
 
 /**

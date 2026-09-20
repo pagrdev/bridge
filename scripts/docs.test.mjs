@@ -20,7 +20,7 @@ const ALL = [...DOCS, 'README.md'];
 /**
  * Phrases that were true of a v1 bridge and are not true of this one.
  *
- * `nine` is the count the command table used to carry; there are fifteen commands now and the
+ * `nine` is the count the command table used to carry; there are nineteen commands now and the
  * document says so without fixing a number in prose that nothing updates. The transcript claims
  * are the important ones: full transcripts DO leave this Mac now — sealed — and a document that
  * still says they do not is worse than one that says nothing.
@@ -75,6 +75,7 @@ describe('public docs · what v2 must actually document', () => {
       'repo_scan.v1',
       'keep_awake.v1',
       'channel.v1',
+      'handoff.v1',
     ])
       expect(p).toContain(cap);
   });
@@ -89,7 +90,7 @@ describe('public docs · what v2 must actually document', () => {
     // The boundary, both directions, and the trust limit stated rather than implied.
     expect(sec).toMatch(/phone → Mac direction is plaintext/i);
     expect(sec).toMatch(/signing key belongs to the Pagr API/i);
-    expect(sec).toMatch(/fifteen commands/i);
+    expect(sec).toMatch(/nineteen commands/i);
   });
 
   it('SECURITY.md lists every command the schema defines', () => {
@@ -103,10 +104,14 @@ describe('public docs · what v2 must actually document', () => {
     expect(end).toBeGreaterThan(start);
     const names = [
       ...new Set(
-        [...schema.slice(start, end).matchAll(/^ {2}'([a-z_]+\.[a-z_]+)':/gm)].map((m) => m[1]),
+        // `session.handoff.capture` has two dots; the old single-dot pattern would have skipped
+        // it silently, which is exactly the kind of quiet miss this test exists to prevent.
+        [...schema.slice(start, end).matchAll(/^ {2}'([a-z_]+(?:\.[a-z_]+)+)':/gm)].map(
+          (m) => m[1],
+        ),
       ),
     ];
-    expect(names.length).toBe(15);
+    expect(names.length).toBe(19);
     for (const name of names) expect(sec).toContain(`\`${name}\``);
   });
 
