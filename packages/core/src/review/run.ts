@@ -473,7 +473,18 @@ function waitForReview(opts: WaitOptions): Promise<ReviewWait> {
     let poll: ReturnType<typeof setInterval> | null = null;
     let deadline: ReturnType<typeof setTimeout> | null = null;
     let done = false;
-    let checking = false;
+    /**
+     * The check currently reading the file, so a second caller QUEUES behind it instead of
+     * being dropped.
+     *
+     * A dropped check was a real lost verdict, not a theoretical one. The last thing this wait
+     * does before giving up is `await check()` on the run having ended — and with a boolean
+     * "already checking" guard that call returned instantly while the read that was in flight
+     * had started before the file existed. A reviewer that wrote its report and exited in the
+     * same tick (a cheap model, a cached answer, a fake in a test) was then reported as "finished
+     * its turn without writing a review" with the review sitting on disk.
+     */
+    let inflight: Promise<void> | null = null;
     /** The first unreadable report, and when it was seen. Cleared by nothing: there is one. */
     let first: { text: string; parsed: ParsedVerdict; at: number } | null = null;
 
@@ -495,36 +506,38 @@ function waitForReview(opts: WaitOptions): Promise<ReviewWait> {
       else finish({ kind: 'timeout', waitedMs: Date.now() - startedAt });
     };
 
-    const check = async (): Promise<void> => {
-      if (done || checking) return;
-      checking = true;
+    const readOnce = async (): Promise<void> => {
+      if (done) return;
+      let text: string;
       try {
-        let text: string;
-        try {
-          text = await readFile(file, 'utf8');
-        } catch {
-          return; // not there yet, or not readable yet
-        }
-        if (done) return;
-        if (text.trim() === '') return; // created, not written yet
-        const parsed = parseVerdict(text);
-        if (parsed.note === undefined) {
-          finish({ kind: 'read', text, parsed, reRead: first !== null });
-          return;
-        }
-        if (first === null) {
-          first = { text, parsed, at: Date.now() };
-          return;
-        }
-        // The revision the grace exists for. Whatever it says, it is the reviewer's final word.
-        if (text !== first.text) {
-          finish({ kind: 'read', text, parsed, reRead: true });
-          return;
-        }
-        if (Date.now() - first.at >= reReadGraceMs) settle();
-      } finally {
-        checking = false;
+        text = await readFile(file, 'utf8');
+      } catch {
+        return; // not there yet, or not readable yet
       }
+      if (done) return;
+      if (text.trim() === '') return; // created, not written yet
+      const parsed = parseVerdict(text);
+      if (parsed.note === undefined) {
+        finish({ kind: 'read', text, parsed, reRead: first !== null });
+        return;
+      }
+      if (first === null) {
+        first = { text, parsed, at: Date.now() };
+        return;
+      }
+      // The revision the grace exists for. Whatever it says, it is the reviewer's final word.
+      if (text !== first.text) {
+        finish({ kind: 'read', text, parsed, reRead: true });
+        return;
+      }
+      if (Date.now() - first.at >= reReadGraceMs) settle();
+    };
+
+    /** One read, serialised behind whatever read is already running. */
+    const check = (): Promise<void> => {
+      const next = (inflight ?? Promise.resolve()).then(readOnce);
+      inflight = next.catch(() => undefined);
+      return next;
     };
 
     try {

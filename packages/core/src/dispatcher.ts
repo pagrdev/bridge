@@ -15,6 +15,7 @@ import {
   type RepoScanResult,
   type ReviewApplyResult,
   type ReviewStartResult,
+  type ReviewVerdict,
   type RulesMigrateResult,
   type SealAad,
   type SessionStatus,
@@ -377,6 +378,36 @@ export interface ReviewChannel {
   /** Defaults to `REVIEW_REREAD_GRACE_MS`. */
   reReadGraceMs?: number;
 }
+
+/**
+ * How a review ended, for a caller on this Mac that waited for it (`Dispatcher.onReviewEnd`).
+ *
+ * Deliberately not `ReviewOutcome`: a local caller needs one question answered — is there a
+ * report, and if not why not — and a shape it cannot mistake for the protocol's own result. The
+ * verdict here is the parsed one; the report's own first line travels in `text`, because the
+ * CLI prints the reviewer's words rather than a recomposition of them.
+ */
+export type ReviewEnd =
+  | {
+      reviewId: string;
+      ok: true;
+      verdict: ReviewVerdict;
+      summary: string;
+      /** Present when the first line was not the contract. Quotes what the reviewer wrote. */
+      note?: string;
+      /** `<repo>/.pagr/review/<id>/review.md`. */
+      path: string;
+      /** The report, exactly as written. */
+      text: string;
+    }
+  | {
+      reviewId: string;
+      ok: false;
+      /** Where the report would have been. It is not there. */
+      path: string;
+      /** One line: why there is no verdict. */
+      message: string;
+    };
 
 /** Everything `session.list_history` and `session.backfill` need that the dispatcher does not own. */
 export interface BackfillChannel {
@@ -2234,6 +2265,46 @@ export class Dispatcher {
   private readonly reviewProjects = new Map<string, { projectId: string; reviewer: Provider }>();
 
   /**
+   * Callers on this Mac waiting for a review to end — today, `pagr review` through the daemon's
+   * IPC (HND-034).
+   *
+   * The cloud never needs this: `review.start` acks in a second with the id and hears the answer
+   * minutes later as `review.completed`, because a phone cannot hold a connection open while an
+   * agent reads a diff. A terminal can, and a command that printed a review id and exited would
+   * be useless — so the local front door waits, and this is what it waits on.
+   *
+   * It is notification, not a second result path. Nothing here decides anything, the event and
+   * the sealed frame are emitted exactly as before, and a review with no waiter is unaffected.
+   */
+  private readonly reviewWaiters = new Map<string, Set<(end: ReviewEnd) => void>>();
+
+  /**
+   * Call `cb` once when `reviewId` ends, however it ends. Returns the unsubscribe.
+   *
+   * Register BEFORE issuing the command: a review that fails in its first second would otherwise
+   * finish before the caller had anything listening, and the wait would then never end.
+   */
+  onReviewEnd(reviewId: string, cb: (end: ReviewEnd) => void): () => void {
+    const set = this.reviewWaiters.get(reviewId) ?? new Set<(end: ReviewEnd) => void>();
+    set.add(cb);
+    this.reviewWaiters.set(reviewId, set);
+    return () => {
+      const live = this.reviewWaiters.get(reviewId);
+      if (!live) return;
+      live.delete(cb);
+      if (live.size === 0) this.reviewWaiters.delete(reviewId);
+    };
+  }
+
+  /** Tell whoever is waiting, exactly once, and forget them. */
+  private endReview(end: ReviewEnd): void {
+    const set = this.reviewWaiters.get(end.reviewId);
+    if (!set) return;
+    this.reviewWaiters.delete(end.reviewId);
+    for (const cb of set) cb(end);
+  }
+
+  /**
    * Start a review and answer immediately with the id.
    *
    * The verdict is minutes away and arrives as `review.completed`, so everything that can fail
@@ -2326,9 +2397,13 @@ export class Dispatcher {
     } catch (err) {
       // `awaitReview` does not throw for anything the design anticipates, so this is a bug or a
       // dying process. Either way the person is owed the sentence, not a swallowed promise.
-      this.logger.error('review failed', {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error('review failed', { reviewId: o.prepared.reviewId, error: message });
+      this.endReview({
         reviewId: o.prepared.reviewId,
-        error: err instanceof Error ? err.message : String(err),
+        ok: false,
+        path: o.prepared.reviewPath,
+        message: `the review of ${o.prepared.repo} broke down: ${message}`,
       });
       return;
     }
@@ -2346,6 +2421,12 @@ export class Dispatcher {
         kind: 'failed',
         summary: outcome.message,
         at: this.now().toISOString(),
+      });
+      this.endReview({
+        reviewId: outcome.reviewId,
+        ok: false,
+        path: outcome.path,
+        message: outcome.message,
       });
       return;
     }
@@ -2379,6 +2460,18 @@ export class Dispatcher {
         providerRecordId: `review:${outcome.reviewId}`,
       },
     );
+
+    // Last, and only once the phone has been told: a local waiter is an extra door onto the same
+    // answer, never the reason the answer exists.
+    this.endReview({
+      reviewId: outcome.reviewId,
+      ok: true,
+      verdict: outcome.verdict,
+      summary: outcome.summary,
+      ...(outcome.note === undefined ? {} : { note: outcome.note }),
+      path: outcome.path,
+      text: outcome.text,
+    });
   }
 
   /** Remember a review, bounded. Old entries fall off the front; `fix it` is minutes, not days. */

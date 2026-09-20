@@ -177,6 +177,28 @@ const cap = (s: string, max: number): string =>
   s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s;
 
 /**
+ * The line a verdict is read from, exactly as the reviewer wrote it.
+ *
+ * Separate from {@link parseVerdict} because two different things want it. The parser wants the
+ * verdict and the summary, normalised, for the protocol. A person at a terminal wants the line —
+ * their reviewer's own words, punctuation and all — and `pagr review` prints it verbatim rather
+ * than recomposing `verdict: <word> — <summary>` from the parsed halves, which would quietly
+ * rewrite a reviewer that said something slightly different from the contract.
+ *
+ * Leading blank lines and an opening code fence are skipped, which is what makes this the same
+ * line the parser reads. Undefined when the report is empty.
+ */
+export function verdictLine(text: string): string | undefined {
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue;
+    // A leading fence is the single most common wrapper; skip it and read the line inside.
+    if (FENCE_RE.test(line)) continue;
+    return line;
+  }
+  return undefined;
+}
+
+/**
  * Read the verdict line at the top of a review.
  *
  * Never throws. An unreadable first line comes back as `comment` with a `note`, because the
@@ -184,15 +206,7 @@ const cap = (s: string, max: number): string =>
  * neither ships an unreviewed change nor blocks a reviewed one.
  */
 export function parseVerdict(text: string): ParsedVerdict {
-  const lines = text.split('\n');
-  let first: string | undefined;
-  for (const line of lines) {
-    if (line.trim() === '') continue;
-    // A leading fence is the single most common wrapper; skip it and read the line inside.
-    if (FENCE_RE.test(line)) continue;
-    first = line;
-    break;
-  }
+  const first = verdictLine(text);
 
   if (first === undefined)
     return {

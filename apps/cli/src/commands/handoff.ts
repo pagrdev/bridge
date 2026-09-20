@@ -2,7 +2,6 @@ import { homedir } from 'node:os';
 import {
   type HandoffListResult,
   handoffCaptureTimeoutMs,
-  IpcClientError,
   isLiveStatus,
   listHandoffs,
   type ProjectRecord,
@@ -15,7 +14,7 @@ import type { SessionSummary } from '@pagr/protocol';
 import type { Command } from 'commander';
 import type { CliContext } from '../context.js';
 import { CliError, daemonDownError, EXIT } from '../errors.js';
-import { daemonStatus, ipc } from '../ipc.js';
+import { daemonStatus, fromIpc, ipc } from '../ipc.js';
 import { bold, dim, ok, printJson, say, shortId, table, warn } from '../output.js';
 import { tildify } from './projects.js';
 
@@ -68,36 +67,6 @@ const PROVIDERS = ['claude', 'codex'] as const;
 type ProviderName = (typeof PROVIDERS)[number];
 
 const isProvider = (s: string): s is ProviderName => (PROVIDERS as readonly string[]).includes(s);
-
-/**
- * IPC error code → exit code.
- *
- * The contract the acceptance criteria ask for: a switch that was REFUSED (this Mac will not do
- * that — the directory is not a repository, the receiver is not signed in, another agent already
- * holds the tree) exits 5, while a switch that was attempted and FAILED (the agent never wrote
- * the file, a pre-commit hook rejected the WIP commit, the sender would not stop) exits 1. They
- * are different problems with different fixes, and a script must be able to tell them apart
- * without reading English.
- */
-const EXIT_FOR_CODE: Record<string, number> = {
-  capability_unsupported: EXIT.precondition,
-  unknown_session: EXIT.precondition,
-  unknown_project: EXIT.precondition,
-  not_negotiated: EXIT.precondition,
-  rate_limited: EXIT.precondition,
-  invalid_payload: EXIT.usage,
-  provider_error: EXIT.error,
-};
-
-/** Any IPC failure, as the CliError the exit-code contract describes. */
-function fromIpc(err: unknown, hint?: string): CliError {
-  if (!(err instanceof IpcClientError)) return new CliError(String(err), EXIT.error);
-  if (err.code === 'connect') return daemonDownError();
-  return new CliError(err.message, EXIT_FOR_CODE[err.code] ?? EXIT.error, {
-    code: err.code,
-    ...(hint ? { hint } : {}),
-  });
-}
 
 /**
  * Which session is being handed off.

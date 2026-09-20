@@ -5,6 +5,7 @@ import {
   REVIEW_VERDICTS,
   reviewPrompt,
   VERDICT_LINE_EXAMPLE,
+  verdictLine,
 } from './prompt.js';
 
 const PACKET =
@@ -158,5 +159,19 @@ describe('parseVerdict', () => {
       expect(got.verdict).toBe('comment');
       expect(got.note).toContain('empty');
     }
+  });
+});
+
+describe('verdictLine', () => {
+  it('is the same line the parser reads, byte for byte', () => {
+    const report = '\n```\n**Verdict:** BLOCK – it drops the column first\n\nfindings\n';
+    // The parser normalises this into `block` + a summary; a person gets the line itself, which
+    // is what `pagr review` prints. Both must be reading the same line or they would disagree.
+    expect(verdictLine(report)).toBe('**Verdict:** BLOCK – it drops the column first');
+    expect(parseVerdict(report).verdict).toBe('block');
+  });
+
+  it('has nothing to return for an empty report', () => {
+    for (const empty of ['', '   \n\n', '```\n']) expect(verdictLine(empty)).toBeUndefined();
   });
 });
