@@ -14,6 +14,7 @@ export * from './deviceFloor.js';
 export * from './dispatcher.js';
 export * from './events.js';
 export * from './frames.js';
+export * from './git.js';
 export * from './heuristics.js';
 export * from './identity.js';
 export * from './ipc.js';
