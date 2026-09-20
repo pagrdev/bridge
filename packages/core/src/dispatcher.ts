@@ -11,12 +11,15 @@ import {
   type ProjectSummary,
   type Provider,
   type RepoScanResult,
+  type ReviewApplyResult,
+  type ReviewStartResult,
   type RulesMigrateResult,
   type SealAad,
   type SessionStatus,
   type SessionSummary,
   type SessionSummaryV2,
 } from '@pagr/protocol';
+import { runOnceFrameMeta } from './adapters/runOnce.js';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
 import {
   APPROVAL_OPTION_KINDS,
@@ -51,6 +54,7 @@ import { isLiveStatus, SessionGuard, type WorkspaceClaim } from './concurrency.j
 import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFloor.js';
 import { type EventPayloadInput, makeEvent } from './events.js';
 import { chunkFrame, type FrameBody, type FrameQuestion } from './frames.js';
+import type { GitOptions } from './git.js';
 import { clip } from './heuristics.js';
 import { type ChannelBridge, getChannelBridge } from './ipc.js';
 import type { JournalEntry, JournalMeta, JournalStore, OutboxCursors } from './journal.js';
@@ -70,9 +74,24 @@ import {
   questionBodyFor,
 } from './questions.js';
 import { handleFor, RepoHandleCache, scanRepos } from './repoScan.js';
+import {
+  awaitReview,
+  newAppliedSessionId,
+  type PreparedReview,
+  prepareReview,
+  type ReviewRunner,
+  ReviewStartError,
+  reviewApplyInstruction,
+} from './review/run.js';
 import { migrateRules, toRulesMigrateResult } from './rules/migrate.js';
 import { importRecipientKeys, type RecipientKeySet, sealFrame } from './seal.js';
-import { isAdopted, isReportable, type SessionStore, UNREGISTERED_PROJECT } from './sessions.js';
+import {
+  isAdopted,
+  isReportable,
+  type SessionRecord,
+  type SessionStore,
+  UNREGISTERED_PROJECT,
+} from './sessions.js';
 
 /**
  * How an adopted session is labelled for the person looking at their phone. It has to be
@@ -80,6 +99,19 @@ import { isAdopted, isReportable, type SessionStore, UNREGISTERED_PROJECT } from
  * them: this one's approvals can be answered, but it cannot be sent an instruction or stopped.
  */
 export const ADOPTED_SESSION_NAME = 'Your own session';
+
+/** How a session started by "fix it" is named on the phone, so it is not mistaken for the build. */
+export const REVIEW_FIX_SESSION_NAME = 'Fixing review findings';
+
+/**
+ * How many finished reviews this daemon remembers, for the "fix it" that follows one.
+ *
+ * `review.apply` carries a review id and maybe a session id, never a project, so a review that
+ * has fallen off this list and whose builder session is also gone cannot be acted on. Fifty is
+ * far past the point where a person is still going to reply to a verdict, and the map holds two
+ * short strings per entry.
+ */
+export const MAX_REMEMBERED_REVIEWS = 50;
 
 type AckPayload = EventPayload<'command.ack'>;
 
@@ -310,6 +342,24 @@ export interface DispatcherOptions {
    * can be given a turn (see `assertOurSession`).
    */
   channelBridge?: ChannelBridge;
+  /**
+   * Options for the one module allowed to spawn git (`git.ts`). Production leaves this unset and
+   * gets `child_process.execFile`; tests substitute a runner so no test ever touches a real
+   * repository.
+   */
+  git?: GitOptions;
+  /** Bounds for `review.start`. Absent means the module's own defaults and the environment. */
+  review?: ReviewChannel;
+}
+
+/** How long a review may take and how closely its report is watched for. Tests shorten all three. */
+export interface ReviewChannel {
+  /** Whole-review bound. Defaults to `reviewTimeoutMs(env)`. */
+  timeoutMs?: number;
+  /** Defaults to `REVIEW_POLL_INTERVAL_MS`. */
+  pollIntervalMs?: number;
+  /** Defaults to `REVIEW_REREAD_GRACE_MS`. */
+  reReadGraceMs?: number;
 }
 
 /** Everything `session.list_history` and `session.backfill` need that the dispatcher does not own. */
@@ -780,6 +830,12 @@ export class Dispatcher {
           maxBytes: body.payload.maxBytes,
           ...(body.payload.toSeq !== undefined ? { toSeq: body.payload.toSeq } : {}),
         });
+      case 'review.start':
+        this.assertV2(body.version, 'review.start');
+        return this.startReview(body.payload, body.commandId);
+      case 'review.apply':
+        this.assertV2(body.version, 'review.apply');
+        return this.applyReview(body.payload);
       case 'repo.scan':
         return this.scanRepositories();
       case 'project.register_handle':
@@ -1914,6 +1970,293 @@ export class Dispatcher {
     return record;
   }
 
+  // ---------- review (v2, `handoff.v1`) ----------
+
+  /**
+   * Reviews with a reviewer still running, and the reviews this daemon has run.
+   *
+   * Two maps because they answer different questions at different times. `reviewRuns` is what is
+   * happening right now — it holds the abort handle, so a shutting-down daemon does not leave a
+   * headless agent reading a repository nobody is waiting on. `reviewProjects` is memory: `fix
+   * it` arrives minutes after the verdict, and `review.apply` carries no project, so without it
+   * a review whose builder session has since ended could not be acted on at all.
+   */
+  private readonly reviewRuns = new Map<
+    string,
+    { controller: AbortController; task: Promise<void> }
+  >();
+  private readonly reviewProjects = new Map<string, { projectId: string; reviewer: Provider }>();
+
+  /**
+   * Start a review and answer immediately with the id.
+   *
+   * The verdict is minutes away and arrives as `review.completed`, so everything that can fail
+   * fast happens before the ack — the project resolves, the reviewer can actually be run
+   * headlessly, the tree commits, the packet builds — and everything that has to wait happens
+   * after it. A command that acked `completed` here means "this review is under way", which is
+   * the only honest thing a fast ack can mean.
+   */
+  private async startReview(
+    p: CommandPayload<'review.start'>,
+    commandId: string,
+  ): Promise<ReviewStartResult> {
+    const project = this.o.registry.resolve(p.projectId);
+    const adapter = this.adapterFor(p.reviewer);
+    const runOnce = adapter.runOnce?.bind(adapter);
+    if (!runOnce)
+      throw new DispatchError(
+        'capability_unsupported',
+        `${p.reviewer} on this Mac cannot be run headlessly, so it cannot review anything`,
+      );
+    if (this.reviewRuns.has(p.reviewId))
+      throw new DispatchError('rate_limited', `review ${p.reviewId} is already running`);
+
+    let prepared: PreparedReview;
+    try {
+      prepared = await prepareReview({
+        reviewId: p.reviewId,
+        repo: project.path,
+        range: p.range,
+        intent: p.intent,
+        reviewer: p.reviewer,
+        ...(this.o.env ? { env: this.o.env } : {}),
+        ...(this.o.git ? { git: this.o.git } : {}),
+      });
+    } catch (err) {
+      if (err instanceof ReviewStartError)
+        throw new DispatchError(
+          err.reason === 'not_a_repo' ? 'capability_unsupported' : 'provider_error',
+          err.message,
+        );
+      throw err;
+    }
+
+    this.rememberReview(p.reviewId, { projectId: p.projectId, reviewer: p.reviewer });
+    const controller = new AbortController();
+    const task = this.finishReview({
+      prepared,
+      reviewer: p.reviewer,
+      projectId: p.projectId,
+      runner: { runOnce },
+      signal: controller.signal,
+      commandId,
+    })
+      .finally(() => this.reviewRuns.delete(p.reviewId))
+      // Nothing awaits this task until `settleReviews`, so it owns its own failures: an
+      // unhandled rejection here would take the daemon down minutes after the ack said yes.
+      .catch((err: unknown) =>
+        this.logger.error('review task failed', {
+          reviewId: p.reviewId,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    this.reviewRuns.set(p.reviewId, { controller, task });
+    return { reviewId: p.reviewId };
+  }
+
+  /** Wait for the report, then tell the phone — and put the report itself inside the seal. */
+  private async finishReview(o: {
+    prepared: PreparedReview;
+    reviewer: Provider;
+    projectId: string;
+    runner: ReviewRunner;
+    signal: AbortSignal;
+    commandId: string;
+  }): Promise<void> {
+    const bounds = this.o.review ?? {};
+    let outcome: Awaited<ReturnType<typeof awaitReview>>;
+    try {
+      outcome = await awaitReview({
+        prepared: o.prepared,
+        reviewer: o.reviewer,
+        runner: o.runner,
+        projectId: o.projectId,
+        signal: o.signal,
+        ...(this.o.env ? { env: this.o.env } : {}),
+        ...(bounds.timeoutMs !== undefined ? { timeoutMs: bounds.timeoutMs } : {}),
+        ...(bounds.pollIntervalMs !== undefined ? { pollIntervalMs: bounds.pollIntervalMs } : {}),
+        ...(bounds.reReadGraceMs !== undefined ? { reReadGraceMs: bounds.reReadGraceMs } : {}),
+      });
+    } catch (err) {
+      // `awaitReview` does not throw for anything the design anticipates, so this is a bug or a
+      // dying process. Either way the person is owed the sentence, not a swallowed promise.
+      this.logger.error('review failed', {
+        reviewId: o.prepared.reviewId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    if (outcome.outcome === 'no_report') {
+      this.logger.warn('review produced no report', {
+        reviewId: outcome.reviewId,
+        reviewer: o.reviewer,
+        message: outcome.message,
+      });
+      this.send('session.event', {
+        sessionId: outcome.sessionId,
+        projectId: o.projectId,
+        provider: o.reviewer,
+        kind: 'failed',
+        summary: outcome.message,
+        at: this.now().toISOString(),
+      });
+      return;
+    }
+
+    this.send(
+      'review.completed',
+      {
+        reviewId: outcome.reviewId,
+        verdict: outcome.verdict,
+        summary: outcome.summary,
+        ...(outcome.note === undefined ? {} : { note: outcome.note }),
+      },
+      o.commandId,
+    );
+    // The findings themselves, sealed, under the run's own id. `transcript` is this enum's name
+    // for "the bridge read this off the disk"; the report is a file an agent wrote, and a source
+    // value a gateway has never heard of would fail its parse of the event.
+    this.emitFrame(
+      outcome.sessionId,
+      {
+        kind: 'review',
+        reviewId: outcome.reviewId,
+        verdict: outcome.verdict,
+        summary: outcome.summary,
+        text: outcome.text,
+      },
+      {
+        projectId: o.projectId,
+        provider: o.reviewer,
+        meta: runOnceFrameMeta(outcome.runId, 'transcript'),
+        providerRecordId: `review:${outcome.reviewId}`,
+      },
+    );
+  }
+
+  /** Remember a review, bounded. Old entries fall off the front; `fix it` is minutes, not days. */
+  private rememberReview(reviewId: string, r: { projectId: string; reviewer: Provider }): void {
+    this.reviewProjects.delete(reviewId);
+    this.reviewProjects.set(reviewId, r);
+    while (this.reviewProjects.size > MAX_REMEMBERED_REVIEWS) {
+      const oldest = this.reviewProjects.keys().next();
+      if (oldest.done) break;
+      this.reviewProjects.delete(oldest.value);
+    }
+  }
+
+  /**
+   * "fix it" — send a finished review's findings to an agent that can act on them.
+   *
+   * Pagr relays a person's decision here; it never makes one. Nothing in this path reads the
+   * report, summarises it, or decides which findings matter: the instruction names the file and
+   * the agent that wrote the code reads it. A reviewer that finds three things and a builder
+   * that quietly changes ten is a leak, not a loop (ADR 0019 decision 4, ADR 0017).
+   *
+   * Two branches, and the live one is preferred for a reason that is not performance: the
+   * session that wrote the code still holds why it wrote it that way, and a fresh session
+   * re-derives that from the diff — which is exactly the relitigation the handoff file exists to
+   * prevent. A session that cannot take a turn (ended, adopted with no channel, a mirrored TUI
+   * thread) gets a new one on the same tree instead of an instruction nobody will ever read —
+   * and if something else is still writing that tree, `SessionGuard` refuses the start and says
+   * so, because two agents in one checkout is the failure this whole feature exists to avoid.
+   */
+  private async applyReview(p: CommandPayload<'review.apply'>): Promise<ReviewApplyResult> {
+    const instruction = reviewApplyInstruction(p.reviewId);
+    const rec = p.sessionId ? this.o.sessions.get(p.sessionId) : null;
+
+    if (rec) {
+      const adapter = this.o.adapters.get(rec.provider);
+      const live = adapter ? await adapter.getStatus(rec.sessionId).catch(() => null) : null;
+      const status = live?.status ?? rec.status;
+      if (adapter && isLiveStatus(status) && this.isFullyControllable(rec, live)) {
+        const sent = await this.sendInstruction({
+          sessionId: rec.sessionId,
+          instruction,
+          mode: 'auto',
+          attachments: [],
+        });
+        return {
+          reviewId: p.reviewId,
+          sessionId: rec.sessionId,
+          applied: 'instructed',
+          delivered: sent.delivered,
+        };
+      }
+    }
+
+    const target = this.applyTarget(p.reviewId, rec);
+    const sessionId = newAppliedSessionId();
+    await this.startSession({
+      provider: target.provider,
+      projectId: target.projectId,
+      instruction,
+      sessionId,
+      attachments: [],
+      readOnly: false,
+      displayName: REVIEW_FIX_SESSION_NAME,
+      context: { reviewId: p.reviewId },
+    });
+    return { reviewId: p.reviewId, sessionId, applied: 'started' };
+  }
+
+  /**
+   * Is this session one Pagr may give a turn to?
+   *
+   * The adapter's own answer wins when it has one — a mirrored Codex TUI thread knows it is
+   * `mirror_only` and nothing here knows better. Otherwise it is the same rule `device.hello`
+   * reports: a session Pagr started is `full`, and an adopted one is `full` only while a `pagr
+   * claude` channel is bound to it.
+   */
+  private isFullyControllable(rec: SessionRecord, live: SessionSummaryV2 | null): boolean {
+    if (live?.controlLevel !== undefined) return live.controlLevel === 'full';
+    return !isAdopted(rec) || this.channelBoundTo(rec.sessionId);
+  }
+
+  /**
+   * Which agent, in which project, gets a review's findings when no live session can take them.
+   *
+   * The builder's own session record first, because it names both. Then the review's own
+   * project, with the agent chosen the way a person would: the last agent that worked in that
+   * tree, or failing that the one that did not write the review — a cross-vendor review is the
+   * normal case, and the reviewer marking its own homework is the one outcome to avoid.
+   */
+  private applyTarget(
+    reviewId: string,
+    rec: SessionRecord | null,
+  ): { provider: Provider; projectId: string } {
+    if (rec && rec.projectId !== UNREGISTERED_PROJECT)
+      return { provider: rec.provider, projectId: rec.projectId };
+    const review = this.reviewProjects.get(reviewId);
+    if (!review)
+      throw new DispatchError(
+        'unknown_session',
+        `this bridge does not know review ${reviewId}; send the session that wrote the code with it`,
+      );
+    return {
+      provider: rec?.provider ?? this.builderProviderFor(review.projectId, review.reviewer),
+      projectId: review.projectId,
+    };
+  }
+
+  /** The agent that most recently worked in this project, else anyone but the reviewer. */
+  private builderProviderFor(projectId: string, reviewer: Provider): Provider {
+    let best: SessionRecord | null = null;
+    for (const s of this.o.sessions.list()) {
+      if (s.projectId !== projectId || s.readOnly === true) continue;
+      if (!best || s.updatedAt > best.updatedAt) best = s;
+    }
+    if (best) return best.provider;
+    for (const provider of this.o.adapters.keys()) if (provider !== reviewer) return provider;
+    return reviewer;
+  }
+
+  /** Resolves when every running review has finished. For shutdown, and for tests. */
+  async settleReviews(): Promise<void> {
+    await Promise.allSettled([...this.reviewRuns.values()].map((r) => r.task));
+  }
+
   // ---------- adapter events ----------
 
   private async onAdapterEvent(provider: Provider, e: AdapterEvent): Promise<void> {
@@ -2084,6 +2427,10 @@ export class Dispatcher {
 
   async shutdown(): Promise<void> {
     for (const u of this.unsubscribes) u();
+    // A reviewer is a headless process reading the user's repository with nobody waiting on it;
+    // it does not outlive the daemon that started it.
+    for (const r of this.reviewRuns.values()) r.controller.abort();
+    await this.settleReviews();
     // Every session ends with the daemon, so no agent is going to read these files again.
     this.leases.releaseAll();
     await this.approvals.cancelAll();
