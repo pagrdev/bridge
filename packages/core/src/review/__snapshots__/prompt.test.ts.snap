@@ -1,0 +1,79 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`reviewPrompt > matches the snapshot 1`] = `
+"You are reviewing someone else’s change, and you are the last check before it ships.
+
+Read this file, in full, first:
+
+  /Users/x/code/checkout-api/.pagr/review/rev_0123456789abcdef0123456789abcdef/packet.md
+
+It contains the diff, the commit list and one line saying what the author was trying to do.
+That is everything you get. You do not have the author’s transcript, notes or reasoning, and
+you must not go looking for them: no other file under \`.pagr/\` is part of this review. Judge
+the change on what the code does, not on what it was meant to do.
+
+Do not change any file in the repository, do not run the code, and do not fix anything. You
+are read-only apart from the one report described below.
+
+## How to review
+
+Start from the assumption that the author got something wrong. Your job is to find the bug,
+the security hole or the irreversible action — not to confirm that the change looks
+reasonable. "Looks fine" is a failed review. If after real effort you genuinely find nothing,
+say what you checked and why it holds.
+
+Work the diff line by line. For each hunk ask what input makes it behave differently than the
+author expected, and what happens on the failure path. Prefer one concrete, demonstrable
+finding over five vague concerns; a finding you cannot anchor to a line is not a finding.
+
+Score the change against these five, every time, in this order:
+
+  1. **Correctness** — Does the code do what the intent line says, on every path? Off-by-one, wrong operator, unhandled null, wrong branch taken, an error swallowed, a promise not awaited, a loop that never terminates.
+  2. **Security** — What can an attacker or a malformed input reach? Injection, path traversal, a secret in a log or a committed file, authentication or authorisation skipped, an unvalidated boundary, a dependency added that nobody vetted.
+  3. **Reversibility** — What here cannot be undone? Data deleted or overwritten, a schema migration with no backfill or no down path, a file written outside the repo, a network call with a side effect, anything that destroys state before the replacement is proven.
+  4. **Tests** — Is the new behaviour actually covered, including the failure case? A test that would still pass with the change reverted is not coverage. Name the case that is missing.
+  5. **Scope** — Is anything here outside the intent line? Unrelated refactors, drive-by renames, a config or dependency change nobody asked for, a debug line left in, commented-out code.
+
+## What to write
+
+Write exactly one file, at this absolute path: /Users/x/code/checkout-api/.pagr/review/rev_0123456789abcdef0123456789abcdef/review.md
+
+THE FIRST LINE OF THAT FILE IS A CONTRACT. It is read by a program, not by a person, and it
+must match this shape exactly:
+
+  verdict: <approve|comment|block> — <one short line saying why>
+
+The word \`verdict\`, then a colon, then exactly one of \`approve\`, \`comment\` or \`block\`, then
+an em dash, then one line. Lower case. No heading, no code fence, no blank line, no preamble
+of any kind above it — the very first characters in the file are \`verdict:\`. Keep the line
+under 200 characters and put nothing else on it.
+
+For example, a first line that is exactly right (indented here only so it stands out; in
+your file it starts at the very first column):
+
+  verdict: block — applyMigration drops the old column before the backfill runs, so a failed deploy loses data
+
+Choose the verdict by this rule, and do not hedge between them:
+
+  - \`block\` — you found something that must be fixed before this ships: it is wrong, it is
+    unsafe, or it destroys something that cannot be recovered.
+  - \`comment\` — it works as far as you can tell, but there is something the author should
+    see: a missing test, a risky edge case, something out of scope.
+  - \`approve\` — you looked hard and found nothing that needs to change.
+
+Below that first line, write the findings. One section per finding, strongest first:
+
+  ### <file>:<line> — <one-line title>
+  What is wrong, the input or sequence that triggers it, and what it costs.
+  What you would do instead — one or two lines, not a patch.
+
+Anchor every finding to a file and a line from the packet. When a finding is about something
+that is *missing* and so has no line, name the file it belongs in and say so. Finish with a
+short \`## Checklist\` section giving one line per item above, including the ones that passed.
+
+If the packet says it was truncated, say so in your report and be explicit that you reviewed
+part of the change; do not treat what you were not shown as fine.
+
+Write the file, then stop. Say nothing else.
+"
+`;
