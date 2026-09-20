@@ -4,6 +4,7 @@ import { registerClaude } from './commands/claude.js';
 import { registerConnect } from './commands/connect.js';
 import { registerDaemon } from './commands/daemon.js';
 import { registerDoctor } from './commands/doctor.js';
+import { registerHandoff } from './commands/handoff.js';
 import { registerLogout } from './commands/logout.js';
 import { registerProjects } from './commands/projects.js';
 import { registerSessions } from './commands/sessions.js';
@@ -78,6 +79,7 @@ function build(overrides: ContextOverrides = {}): BuiltProgram {
   registerDoctor(program, getCtx);
   registerProjects(program, getCtx);
   registerSessions(program, getCtx);
+  registerHandoff(program, getCtx);
   registerDaemon(program, getCtx);
   registerBilling(program, getCtx);
   registerClaude(program, getCtx);

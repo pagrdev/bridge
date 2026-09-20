@@ -5,6 +5,7 @@ import type { ControlLevel } from '@pagr/protocol';
 import type { SendInstructionInput } from '../adapters/types.js';
 import { ensureExcluded, type GitOptions, repoRoot } from '../git.js';
 import {
+  HANDOFF_DIR,
   type HandoffDoc,
   type HandoffProblem,
   type HandoffProvider,
@@ -229,7 +230,7 @@ export function handoffCaptureTimeoutMs(env: NodeJS.ProcessEnv = process.env): n
 
 /** The file a handoff writes to, under the work tree root. */
 export function handoffFilePath(repoRootDir: string, handoffId: string): string {
-  return join(repoRootDir, '.pagr', 'handoff', `${handoffId}.md`);
+  return join(repoRootDir, HANDOFF_DIR, `${handoffId}.md`);
 }
 
 const errorMessage = (e: unknown): string =>
