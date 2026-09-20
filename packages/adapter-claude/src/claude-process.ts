@@ -23,18 +23,13 @@ export interface ClaudeProcessOptions {
   /** Opt-in sealed mode for untrusted checkouts; see `SEALED_SETTING_SOURCES`. */
   sealed?: boolean;
   /**
-   * `--allowedTools`: the permission rules this process may use WITHOUT raising a prompt.
+   * `--permission-mode`. `default` unless a caller says otherwise.
    *
-   * Only a headless one-shot run passes it (`run-once.ts`). A session started for a person
-   * passes nothing, because the person's own settings and their own answers decide what that
-   * session may do — narrowing a conversation to a fixed list would mean every ordinary tool
-   * call raised a prompt on their phone.
-   *
-   * It is an ALLOW list, not a restriction: a tool outside it still raises a `can_use_tool`
-   * prompt rather than being refused outright. What makes it a boundary for a one-shot run is
-   * that the run auto-denies every prompt it is asked.
+   * Only a headless one-shot run does (`run-once.ts`, `acceptEdits`), and that is about there
+   * being nobody to answer a prompt rather than about what the run may touch: a session gets
+   * `default` because a person is there, and a run would stall on the first `Write`.
    */
-  allowedTools?: string[];
+  permissionMode?: 'default' | 'acceptEdits';
   logger: FileLogger;
 }
 
@@ -110,7 +105,8 @@ export interface ClaudeProcessEvents {
  *
  * Flags re-verified 2026-09-14 against Claude Code 2.1.220 (`claude --help`, plus running each
  * one): -p/--print, --input-format stream-json, --output-format stream-json, --verbose,
- * --session-id <uuid>, --resume <id>, --permission-mode default, --permission-prompt-tool stdio,
+ * --session-id <uuid>, --resume <id>, --permission-mode default|acceptEdits,
+ * --permission-prompt-tool stdio,
  * --disallowedTools, --setting-sources <user,project,local>, --strict-mcp-config.
  *
  * Two of these are not in `--help` on 2.1.220 and were confirmed by invocation instead:
@@ -151,7 +147,7 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
       'stream-json',
       '--verbose',
       '--permission-mode',
-      'default',
+      this.opts.permissionMode ?? 'default',
       '--permission-prompt-tool',
       'stdio',
       // Their configuration, not ours — unless they asked for sealed mode, which drops the
@@ -164,9 +160,6 @@ export class ClaudeProcess extends EventEmitter<ClaudeProcessEvents> {
     if (sealed) args.push('--strict-mcp-config');
     if (this.opts.session.kind === 'new') args.push('--session-id', this.opts.session.id);
     else args.push('--resume', this.opts.session.id);
-    // Both tool flags are variadic. `--allowedTools` is safe here because the next argument is
-    // either `--disallowedTools` (a flag, which ends it) or nothing at all.
-    if (this.opts.allowedTools?.length) args.push('--allowedTools', ...this.opts.allowedTools);
     // `--disallowedTools` is variadic, so it stays last: anything after it would be swallowed.
     if (this.opts.readOnly) args.push('--disallowedTools', READ_ONLY_DISALLOWED_TOOLS);
 

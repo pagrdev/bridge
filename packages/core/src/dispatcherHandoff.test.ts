@@ -409,12 +409,10 @@ describe('session.handoff.capture — the receiver writes', () => {
     });
     // The sender was never asked for anything: it cannot be steered, so it was not steered.
     expect(claude.calls.filter((c) => c.method === 'sendInstruction')).toHaveLength(0);
-    // The RECEIVING agent ran, in the repository, over the SENDER's transcript, and may only
-    // write inside `.pagr/`.
+    // The RECEIVING agent ran, in the repository, over the SENDER's transcript.
     expect(runs).toHaveLength(1);
     expect(runs[0]?.cwd).toBe(repo.root);
     expect(runs[0]?.prompt).toContain(transcript);
-    expect(runs[0]?.allowedWrites).toEqual(['.pagr/**']);
     expect(runs[0]?.projectId).toBe(projectId);
     // The file exists, it was committed, and it says who really wrote it.
     expect(gitCalls(repo, 'commit')).toBe(1);

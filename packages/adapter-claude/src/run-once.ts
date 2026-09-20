@@ -14,66 +14,28 @@ import type { FileLogger } from './logger.js';
 /**
  * `claude -p`, once, with nobody watching — the handoff writer and the reviewer (spec §3, §5).
  *
- * It is the same `ClaudeProcess` every session uses, which is the point: one spawner, one set of
- * flags, one place where the argv of a `claude` child is decided. What a one-shot run adds is
- * three constraints a conversation does not want:
+ * It is the same `ClaudeProcess` every session uses, started the same way: the repository as its
+ * cwd, the user's own setting sources, the same flags. A run is the same agent in the same
+ * checkout under the same subscription as the session Pagr would have started there anyway, so
+ * nothing here narrows what it may touch — the prompt says which file to write, exactly as it
+ * does for any other run.
  *
- *   - `--allowedTools`, so reading, a handful of read-only git commands and a write under the
- *     caller's globs happen with no prompt at all;
- *   - every OTHER prompt auto-denied, instantly, because no human is attached to answer one and
- *     an unanswered prompt is a handoff that hangs until its timeout;
- *   - sealed settings (`PAGR_CLAUDE_SEALED`), because the rationale for honouring a repo's own
- *     `.claude/settings.json` — "a session the bridge starts should behave like the one they
- *     start themselves" — assumes a person is there to see what it does. Nobody is. A checked-out
- *     `permissions.allow: ["Bash(*)"]` would otherwise turn this run into a shell.
+ * What "nobody is watching" changes is two things, and both are about interactivity:
  *
- * The bridge does not check the tree afterwards to see what was written. A write that has
- * happened has happened; the refusal has to come from inside the agent, or it is not a refusal.
+ *   - `--permission-mode acceptEdits`, so the one file the run exists to write is written
+ *     without raising a prompt. A session gets `default` because a person is there to answer;
+ *     a run would just stall on the first `Write`.
+ *   - every prompt that IS raised — `Bash`, the network, anything outside the workspace — is
+ *     auto-denied on the spot, because there is no human to ask and `allow` is not ours to give.
+ *     A run's prompt carries text the cloud supplied (a review's one line of intent), so a run
+ *     that approved its own tool calls would hand a compromised cloud exactly the action
+ *     `core/src/deviceFloor.ts` exists to refuse. Denying costs the run a shell it does not need
+ *     and leaves it the same ceiling a session has.
  */
-
-/** Tools a run may use to LOOK at the repo. No `Bash`: see `RUN_ONCE_GIT_RULES`. */
-export const RUN_ONCE_READ_TOOLS = ['Read', 'Glob', 'Grep', 'NotebookRead'] as const;
-
-/**
- * The git a handoff or a review needs, and nothing else.
- *
- * Read-only commands only. The WIP commit is the bridge's own (`core/src/git.ts`, HND-003): it
- * has to fail loudly through a typed error when a pre-commit hook rejects it, which is not
- * something a model running `git commit` in a Bash tool can be relied on to report.
- *
- * Each rule is a prefix rule (`git log:*`), so `git log --oneline -20` is allowed and
- * `git log; rm -rf ~` is not — Claude Code refuses a prefix rule match on a command line that
- * chains, and anything it does not match raises a prompt that this run denies.
- */
-export const RUN_ONCE_GIT_RULES = [
-  'Bash(git status:*)',
-  'Bash(git log:*)',
-  'Bash(git diff:*)',
-  'Bash(git show:*)',
-  'Bash(git branch:*)',
-  'Bash(git rev-parse:*)',
-] as const;
-
-/**
- * The `--allowedTools` list for a run that may write under `allowedWrites`.
- *
- * `Write`, `Edit` and `MultiEdit` are each scoped to the same globs: a handoff file is usually
- * created once, but a re-ask (the file came back malformed) edits the one that is already there.
- * `MultiEdit` is not a tool name current Claude Code knows; a stale allow rule costs nothing and
- * an install that still has it would otherwise prompt.
- */
-export function runOnceAllowedTools(allowedWrites: string[]): string[] {
-  const writes = allowedWrites.flatMap((glob) => [
-    `Write(${glob})`,
-    `Edit(${glob})`,
-    `MultiEdit(${glob})`,
-  ]);
-  return [...RUN_ONCE_READ_TOOLS, ...RUN_ONCE_GIT_RULES, ...writes];
-}
 
 /** What a denied prompt tells the model, so it reports the refusal rather than retrying forever. */
 export const RUN_ONCE_DENY_MESSAGE =
-  'This is an automated one-shot run with no user attached. Only the writes it was started with are permitted; everything else is denied. Do not ask again — say what you could not do and stop.';
+  'This is an automated one-shot run with no user attached, so there is nobody who can approve this. Writing the file you were asked for needs no approval. Do not ask again — say what you could not do and stop.';
 
 /** SIGINT → SIGTERM grace for a run being killed. Short: nobody is waiting on its last words. */
 const KILL_GRACE_MS = 1000;
@@ -84,6 +46,10 @@ export interface ClaudeRunOnceOptions {
   command: string[];
   /** The child's environment, already built by the adapter. */
   env: NodeJS.ProcessEnv;
+  /** `PAGR_CLAUDE_SETTING_SOURCES`, as a session gets it. */
+  settingSources?: string | undefined;
+  /** `PAGR_CLAUDE_SEALED`, as a session gets it. A run is sealed when a session would be. */
+  sealed?: boolean | undefined;
   logger: FileLogger;
   /** One frame the run produced. The adapter decides what to do with it. */
   onFrame?: (f: { body: FrameBody; meta: JournalMeta; endsTurn?: boolean }) => void;
@@ -95,7 +61,6 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
   const sessionId = runOnceSessionId('claude', runId);
   const startedMs = Date.now();
   const meta = runOnceFrameMeta(runId, 'stdio');
-  const allowedTools = runOnceAllowedTools(input.allowedWrites);
   const said: string[] = [];
   let sawInit = false;
   let settled = false;
@@ -116,10 +81,12 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
     // Its own session id, always. A run never resumes anything: resuming would mean writing a
     // handoff into the transcript of a conversation somebody else owns.
     session: { kind: 'new', id: randomUUID() },
-    // Not `readOnly` — the whole point is one file. `--allowedTools` is what bounds it.
+    // Not `readOnly` — the whole point is one file.
     readOnly: false,
-    sealed: true,
-    allowedTools,
+    // The only flag a run does not share with a session: nobody is here to accept an edit.
+    permissionMode: 'acceptEdits',
+    ...(o.settingSources ? { settingSources: o.settingSources } : {}),
+    sealed: o.sealed ?? false,
     logger: o.logger,
   });
 
@@ -212,9 +179,7 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
           frame({
             kind: 'system',
             subtype: 'run_once_denied',
-            text: `Refused ${ev.toolName}: this run may only write ${
-              input.allowedWrites.join(', ') || 'nothing'
-            }.`,
+            text: `Refused ${ev.toolName}: this run is headless, so there is nobody to approve it.`,
           });
           return;
         }

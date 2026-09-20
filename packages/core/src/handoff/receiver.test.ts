@@ -250,14 +250,10 @@ describe('handoff capture · receiver writes · Claude', () => {
     // No live session was involved, so there is nothing to say about delivery.
     expect('delivery' in outcome).toBe(false);
 
-    // One headless run, about the repository, allowed to write only under `.pagr/`.
+    // One headless run, in the repository.
     expect(runner.runs).toHaveLength(1);
     const run = runner.runs[0];
     expect(run?.cwd).toBe(repo);
-    expect(run?.allowedWrites).toEqual(['.pagr/**']);
-    // HND-015: `cwd` says which repository, not where the process runs — a Codex run is started
-    // inside `<repo>/.pagr` — so the prompt names the tree and every path in it is absolute.
-    expect(run?.prompt).toContain(`The repository is at ${repo}.`);
     expect(run?.timeoutMs).toBe(5_000);
     // The prompt names the transcript, the spill directory, the file and the person's note.
     expect(run?.prompt).toContain(fixture.transcript);
@@ -706,7 +702,6 @@ describe('handoff capture · the receiver prompt', () => {
       path: '/repo/.pagr/handoff/x.md',
       to: 'codex',
       transcript: { path: '/home/.claude/projects/-repo/s.jsonl', temporary: false },
-      repo: '/repo',
     });
     expect(base).toContain('/home/.claude/projects/-repo/s.jsonl');
     expect(base).toContain('# Goal');
@@ -722,7 +717,6 @@ describe('handoff capture · the receiver prompt', () => {
         temporary: false,
         spillDir: '/home/.claude/projects/-repo/s/tool-results',
       },
-      repo: '/repo',
     });
     expect(withSpill).toContain('/home/.claude/projects/-repo/s/tool-results');
     expect(withSpill.trimEnd().endsWith('Write the file, then stop. Say nothing else.')).toBe(true);

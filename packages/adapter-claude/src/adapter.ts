@@ -523,20 +523,20 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     this.logger.log('info', 'starting a one-shot claude run', {
       runId,
       cwd: input.cwd,
-      allowedWrites: input.allowedWrites,
       timeoutMs: input.timeoutMs,
     });
+    const env = this.opts.env ?? process.env;
+    const settingSources =
+      this.opts.env?.PAGR_CLAUDE_SETTING_SOURCES ?? process.env.PAGR_CLAUDE_SETTING_SOURCES;
     return await runClaudeOnce({
       input: { ...input, runId },
       command: this.opts.claudeCommand ?? ['claude'],
-      // `PAGR_CLAUDE_SEALED` is set for the child, not read from the operator's environment: a
-      // run is sealed whatever the daemon's own mode is. `PAGR_DAEMON_SOCK` is dropped for the
-      // same reason every spawned session drops it.
-      env: this.env({
-        PAGR_SESSION_ID: sessionId,
-        PAGR_DAEMON_SOCK: undefined,
-        PAGR_CLAUDE_SEALED: '1',
-      }),
+      // The same environment a session gets, including whether sealed mode is on: a run is the
+      // same agent in the same checkout, so it loads the same settings. `PAGR_DAEMON_SOCK` is
+      // dropped for the same reason every spawned session drops it.
+      env: this.env({ PAGR_SESSION_ID: sessionId, PAGR_DAEMON_SOCK: undefined }),
+      ...(settingSources ? { settingSources } : {}),
+      sealed: sealedModeEnabled(env),
       logger: this.logger,
       onFrame: ({ body, meta, endsTurn }) => {
         // No project means no route: a frame the cloud cannot address is journaled by nobody and

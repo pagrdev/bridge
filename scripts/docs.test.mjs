@@ -43,8 +43,8 @@ const FORBIDDEN = [
     why: 'repo.scan + project.register_handle exist; the true claim is that it cannot CHOOSE one',
   },
   {
-    pattern: /HND-015 is the open ticket/i,
-    why: 'HND-015 shipped: the Codex one-shot starts in `<repo>/.pagr`, so say what is true now',
+    pattern: /confined to `?\.pagr/i,
+    why: 'a headless run is an ordinary run in the repository; it was never confined to `.pagr`',
   },
 ];
 
@@ -120,26 +120,45 @@ describe('public docs · what v2 must actually document', () => {
   });
 
   /**
-   * The one sentence in this document that a reader would act on: what a headless Codex run can
-   * reach. It is pinned to the code that decides it, because a doc that said "confined to
-   * `.pagr`" while the adapter started the thread at the repository root would be the most
-   * expensive wrong sentence in the repository.
+   * The sentences in this document a reader would act on: what a headless run can reach, and
+   * what the bridge's own `git` does. Both are pinned to the code that decides them — a doc
+   * that described a confinement the adapters do not implement would be the most expensive
+   * wrong sentence in the repository, and it has been wrong in both directions now.
    */
-  it('SECURITY.md describes the headless sandbox the adapter actually asks for', () => {
+  it('SECURITY.md describes the headless runs the adapters actually start', () => {
     const sec = read('docs/SECURITY.md');
-    const src = read('packages/adapter-codex/src/run-once.ts');
-    // The code: the thread's cwd is `<repo>/.pagr`, and that is what `thread/start` is handed.
-    expect(src).toMatch(/RUN_ONCE_SANDBOX_DIR = '\.pagr'/);
-    expect(src).toMatch(/resolve\(cwd, RUN_ONCE_SANDBOX_DIR\)/);
-    expect(src).toMatch(/cwd: sandboxCwd/);
-    // The document: the same fact, and the two limits that come with it.
-    expect(sec).toContain('### The sandbox asymmetry, stated rather than implied');
-    expect(sec).toMatch(/working directory is `<repo>\/\.pagr`, not the\nrepository root/);
-    expect(sec).toMatch(/cannot write a source file at all/i);
-    expect(sec).toMatch(/Reads are not narrowed with it/i);
-    // Claude is the weaker of the two now, and the document has to keep saying so.
-    expect(sec).toMatch(/No OS sandbox exists for it/i);
-    expect(sec).toMatch(/can write outside `\.pagr`, and a\nCodex one cannot/);
+    const codex = read('packages/adapter-codex/src/run-once.ts');
+    const claude = read('packages/adapter-claude/src/run-once.ts');
+    // The code: the repository is the thread's cwd, and no sandbox overrides are sent.
+    expect(codex).toMatch(/cwd: input\.cwd/);
+    expect(codex).not.toMatch(/writableRoots|sandbox_workspace_write|\.pagr/);
+    // The code: no tool allow-list, and the one flag that makes the run non-interactive.
+    expect(claude).not.toMatch(/allowedTools/);
+    expect(claude).toMatch(/permissionMode: 'acceptEdits'/);
+    // The document: an ordinary run, free to write the repository, with prompts denied because
+    // nobody is attached rather than to confine it.
+    expect(sec).toMatch(/free to write your repository/);
+    expect(sec).toMatch(/They are not fenced\ninto a corner of it/);
+    expect(sec).toMatch(/both auto-deny every permission prompt they\nraise/);
+    expect(sec).toMatch(/Writing a file does not raise one/);
+    // The claims that stopped being true when the confinement came out.
+    expect(sec).not.toMatch(/sandbox asymmetry/i);
+    expect(sec).not.toMatch(/cannot write a source file at all/i);
+    expect(sec).not.toMatch(/writable root/i);
+  });
+
+  /**
+   * The genuinely new power handoff added, and the one a reader has to be able to find: the
+   * bridge makes git commits on their machine.
+   */
+  it('SECURITY.md states what the WIP commit does, and that it never pushes', () => {
+    const sec = read('docs/SECURITY.md');
+    expect(sec).toContain('## Git commits the bridge makes (`git.ts`)');
+    expect(sec).toMatch(/It commits everything\*\*, exactly as your own `git add -A` would/);
+    expect(sec).toMatch(/respects your\n {2}`\.gitignore`/);
+    expect(sec).toMatch(/It never pushes/);
+    expect(sec).toMatch(/Repository hooks are not skipped/);
+    expect(sec).toMatch(/the switch fails loudly/);
   });
 
   it('PRIVACY.md describes the whole `~/.pagr` inventory, not just the v1 half', () => {

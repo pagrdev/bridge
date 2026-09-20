@@ -81,8 +81,9 @@ export interface Thread {
  * generated/v2/SandboxPolicy.ts — the sandbox spelled out, rather than named by mode.
  *
  * `thread/start` takes only a `SandboxMode` (a word); a turn can take the whole policy, which is
- * the only place `writableRoots` can be stated over the wire. A headless run states both: the
- * mode on the thread, the policy on the turn (`run-once.ts`).
+ * the only place `writableRoots` can be stated over the wire. Nothing in the bridge sends one:
+ * sessions and headless runs both name the mode and leave the rest to the user's own Codex
+ * configuration. It is mirrored here because `TurnStartParams` carries the field.
  */
 export type SandboxPolicy =
   | { type: 'dangerFullAccess' }
@@ -94,20 +95,6 @@ export type SandboxPolicy =
       excludeTmpdirEnvVar: boolean;
       excludeSlashTmp: boolean;
     };
-
-/**
- * generated/v2/SandboxWorkspaceWrite.ts — the same policy as a CONFIG override, snake_case.
- *
- * `ThreadStartParams.config` is a map of config-file keys, so it carries the config spelling of
- * the sandbox (`sandbox_workspace_write`), not the wire spelling above. Two shapes for one idea
- * is Codex's, not ours; both are stated so a run's roots survive a server that reads only one.
- */
-export interface SandboxWorkspaceWriteConfig {
-  writable_roots: string[];
-  network_access: boolean;
-  exclude_tmpdir_env_var: boolean;
-  exclude_slash_tmp: boolean;
-}
 
 export interface ThreadStartParams {
   cwd?: string | null;

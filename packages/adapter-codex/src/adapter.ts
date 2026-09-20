@@ -1,7 +1,6 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type {
@@ -77,7 +76,7 @@ import {
   type TurnSteerResponse,
   type UserInput,
 } from './protocol.js';
-import { RUN_ONCE_SANDBOX_DIR, runOnceThreadParams, runOnceTurnParams } from './run-once.js';
+import { runOnceThreadParams, runOnceTurnParams } from './run-once.js';
 import { type PersistedSession, SessionMap } from './session-map.js';
 
 export interface CodexAdapterOptions {
@@ -269,7 +268,6 @@ interface RunState {
   turnId: string | null;
   /** What the agent said, in order. */
   said: string[];
-  allowedWrites: string[];
   /**
    * The outcome a stop THIS bridge asked for is going to settle as, set the moment it starts.
    *
@@ -549,21 +547,10 @@ export class CodexAdapter implements CodingAgentAdapter {
       return failed((err as Error).message);
     }
 
-    const { params, sandboxCwd, writableRoots } = runOnceThreadParams(input);
-    // The thread is started in `<repo>/.pagr`, and `workspace-write` grants its cwd — so this
-    // directory IS the sandbox (`run-once.ts`). Codex cannot start a thread in a directory that
-    // does not exist, and both callers create something deeper inside it anyway; creating it
-    // here means the boundary does not depend on which caller got there first.
-    try {
-      await mkdir(sandboxCwd, { recursive: true });
-    } catch (err) {
-      return failed(`could not create ${sandboxCwd}: ${(err as Error).message}`);
-    }
+    const params = runOnceThreadParams(input);
     this.logger.log('info', 'starting a one-shot codex run', {
       runId,
       repo: input.cwd,
-      sandboxCwd,
-      writableRoots,
       timeoutMs: input.timeoutMs,
     });
     let threadId: string;
@@ -586,7 +573,6 @@ export class CodexAdapter implements CodingAgentAdapter {
       threadId,
       turnId: null,
       said,
-      allowedWrites: input.allowedWrites,
       stopping: null,
       settle: (outcome, error) => {
         const resolve = settleRun;
@@ -630,7 +616,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       body: {
         kind: 'system',
         subtype: 'run_once_started',
-        text: `Codex is running headless in ${input.cwd}, sandboxed to ${RUN_ONCE_SANDBOX_DIR}/.`,
+        text: `Codex is running headless in ${input.cwd}.`,
       },
       meta: runOnceFrameMeta(runId, 'app_server'),
     });
@@ -1635,7 +1621,10 @@ export class CodexAdapter implements CodingAgentAdapter {
    *
    * `approvalPolicy: 'never'` should mean this is never reached; it is reached anyway when a
    * server re-reads the policy, when an MCP tool asks on its own account, or when a future
-   * request type arrives. A prompt nobody answers is a run that hangs until its timeout.
+   * request type arrives. A prompt nobody answers is a run that hangs until its timeout, and
+   * `allow` is not ours to give: a run's prompt carries text the cloud supplied, so granting an
+   * approval here would hand a compromised cloud the action `deviceFloor.ts` refuses it.
+   * `workspace-write` needs no approval for the file the run was asked to write.
    */
   private declineForRun(run: RunState, r: RpcRequest): void {
     const client = this.client;
@@ -1665,9 +1654,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       body: {
         kind: 'system',
         subtype: 'run_once_denied',
-        text: `Refused ${r.method}: this run may only write ${
-          run.allowedWrites.join(', ') || 'nothing'
-        }.`,
+        text: `Refused ${r.method}: this run is headless, so there is nobody to approve it.`,
       },
       meta: runOnceFrameMeta(run.runId, 'app_server'),
     });

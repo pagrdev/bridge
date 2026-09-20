@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { isAbsolute, resolve, sep } from 'node:path';
 import type { Provider } from '@pagr/protocol';
 import type { JournalMeta } from '../journal.js';
 
@@ -15,21 +14,27 @@ import type { JournalMeta } from '../journal.js';
  *     be reached (`controlLevel !== 'full'`, or it already ended);
  *   - the reviewer reads a packet and writes a verdict.
  *
- * Four rules follow from "nobody is watching", and they are the whole contract:
+ * Otherwise a run is an ordinary agent run: the same binary, in the same repository, under the
+ * same subscription, with the user's own settings loaded. It is not confined to a corner of the
+ * tree, and there would be no point pretending otherwise — starting a full agent session in
+ * someone's repository is the product, and one of these is strictly less than that. The prompt
+ * says what to write and where, exactly as it does for any other run.
+ *
+ * Three rules follow from "nobody is watching", and they are the whole contract:
  *
  *   1. **Its own process, every time.** A run never borrows a live session — borrowing would
  *      inject a prompt into a conversation the person owns, and its output would land in their
  *      transcript as if they had asked for it.
- *   2. **No prompt ever reaches the phone.** There is no human attached to answer one, so an
- *      approval request from a run is auto-denied on the spot. A prompt that cannot be answered
- *      is a hang, and a hang inside a handoff is a switch that never happens.
- *   3. **The agent's own sandbox does the refusing.** `allowedWrites` is handed to the agent —
- *      Claude's permission rules, Codex's `workspace-write` roots — and the refusal happens
- *      inside the agent. The bridge does not diff the tree afterwards and undo things: by then
- *      the write has already happened. The two agents do not refuse equally well, and
- *      `docs/SECURITY.md` says so: Codex runs under an OS sandbox started inside `<cwd>/.pagr`
- *      (HND-015), Claude under a tool allow-list with every other prompt denied.
- *   4. **The timeout is an outcome, not an exception.** `timeoutMs` kills the process and the
+ *   2. **No prompt ever reaches the phone, and no prompt is auto-approved.** There is no human
+ *      attached, so an approval request is answered here: `deny`. Something has to answer it —
+ *      a prompt nobody answers is a hang, and a hang inside a handoff is a switch that never
+ *      happens — and `allow` is not available to us. Part of a run's prompt is text the cloud
+ *      supplied (a review's one line of intent), so a run that granted its own approvals would
+ *      hand a compromised cloud the tool call `deviceFloor.ts` exists to refuse. Writing files
+ *      is arranged so it never raises a prompt in the first place (`adapter-claude`'s
+ *      `acceptEdits`, Codex's `workspace-write`); what is left to deny is the network, a shell
+ *      and anything outside the workspace, which is the same ceiling a session has.
+ *   3. **The timeout is an outcome, not an exception.** `timeoutMs` kills the process and the
  *      call resolves `{ outcome: 'timeout' }`, because every caller has something to say to the
  *      person about it ("Claude didn't finish the handoff in 90 s…") and nothing to say about a
  *      stack trace.
@@ -93,28 +98,10 @@ export function isRunOnceFrame(meta: JournalMeta): boolean {
 // ---------- the call ----------
 
 export interface RunOnceInput {
-  /**
-   * The repository the run is about. Always a real directory.
-   *
-   * It is what `allowedWrites` is relative to and what the prompt's absolute paths are built
-   * from — **not necessarily the process's working directory.** The Codex adapter starts its
-   * thread in `<cwd>/.pagr` instead, because Codex's `workspace-write` sandbox always grants the
-   * thread's own cwd and a run started at the repository root could therefore write anywhere in
-   * the repository (`adapter-codex/src/run-once.ts`). So a prompt must name every file it wants
-   * read or written by ABSOLUTE path; a relative one is not guaranteed to resolve.
-   */
+  /** The repository the run is about, and the run's working directory. Always a real directory. */
   cwd: string;
   /** The whole instruction. One turn, no follow-ups. */
   prompt: string;
-  /**
-   * Where the run may write, as globs relative to `cwd` (`['.pagr/**']`).
-   *
-   * Handed to the agent, never enforced afterwards. An empty list is legal and means "this run
-   * writes nothing" — the reviewer's read-only pass is the caller that wants it. On the Codex
-   * side "nothing" is approximate: its sandbox cannot express an empty workspace, so a run is
-   * confined to `<cwd>/.pagr` whatever this says.
-   */
-  allowedWrites: string[];
   /** Kill the run after this long and resolve `timeout`. */
   timeoutMs: number;
   /** Cancels the run from outside (a switch that failed elsewhere, a shutting-down daemon). */
@@ -175,50 +162,4 @@ export interface RunOnceResult {
   /** The child's exit code, when there was a child and it exited. */
   exitCode?: number | null;
   durationMs: number;
-}
-
-// ---------- allowedWrites ----------
-
-/**
- * The literal directories behind a set of globs, absolute, for a sandbox that takes roots
- * rather than patterns (Codex `writable_roots`).
- *
- * `.pagr/**` → `<cwd>/.pagr`. A glob is cut at its first magic segment, because a directory is
- * the coarsest thing a root can be: `.pagr/handoff/*.md` grants `<cwd>/.pagr/handoff`, which is
- * wider than the glob says and is the honest translation — a sandbox that cannot express
- * "only .md files" must not be told that it did.
- *
- * Absolute globs are kept as they are; a relative one resolves against `cwd`. Duplicates and
- * roots contained by another root collapse.
- */
-export function writableRootsFor(cwd: string, allowedWrites: string[]): string[] {
-  const roots: string[] = [];
-  for (const glob of allowedWrites) {
-    const literal = literalPrefix(glob);
-    if (!literal) continue;
-    const abs = isAbsolute(literal) ? resolve(literal) : resolve(cwd, literal);
-    if (!roots.some((r) => abs === r || abs.startsWith(r + sep))) {
-      // Drop anything this new root now contains, so the list stays the smallest set that says
-      // the same thing.
-      for (let i = roots.length - 1; i >= 0; i--) {
-        const r = roots[i];
-        if (r?.startsWith(abs + sep)) roots.splice(i, 1);
-      }
-      roots.push(abs);
-    }
-  }
-  return roots;
-}
-
-/** Everything before the first segment carrying a glob character. */
-function literalPrefix(glob: string): string {
-  const parts = glob.split('/');
-  const kept: string[] = [];
-  for (const part of parts) {
-    if (/[*?[\]{}!]/.test(part)) break;
-    kept.push(part);
-  }
-  // A leading '/' survives the split as an empty first segment; keep it so the path stays absolute.
-  const joined = kept.join('/');
-  return joined === '' && glob.startsWith('/') ? '/' : joined;
 }
