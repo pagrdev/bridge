@@ -276,6 +276,13 @@ interface RunState {
    * `turn/start` fail, and both of those arrive before the interrupt request resolves. Without
    * this, whichever landed first settled the run — so a timeout or a cancel was reported as
    * "the turn was interrupted" or "Codex could not be started", depending on the machine.
+   *
+   * Why it is *claimed* rather than checked at those two sites: they are not the only messages
+   * the stop shakes loose. The turn can complete normally in the same instant the interrupt
+   * lands (`turn/completed {status:'completed'}`), the server can emit a non-retryable `error`,
+   * and the app-server can exit outright and take `failRuns` with it. Every one of those is a
+   * `settle` inside the window between the claim and `stop()` resuming, so `settle` — not each
+   * caller — is where the claim is enforced.
    */
   stopping: 'timeout' | 'canceled' | null;
   /** Resolves the run exactly once. */
@@ -574,17 +581,22 @@ export class CodexAdapter implements CodingAgentAdapter {
         const resolve = settleRun;
         if (!resolve) return;
         settleRun = null;
+        // A run we decided to stop reports that decision, never the noise the decision itself
+        // produced on the way down. See `RunState.stopping`.
+        const decided = run.stopping ?? outcome;
+        const reported = run.stopping ? undefined : error;
         this.runs.delete(threadId);
         this.logger.log('info', 'one-shot codex run finished', {
           runId,
-          outcome,
+          outcome: decided,
+          ...(decided === outcome ? {} : { instead: outcome }),
           durationMs: Date.now() - startedMs,
         });
         this.runFrame(run, {
           body: {
             kind: 'system',
-            subtype: `run_once_${outcome}`,
-            text: runOutcomeText(outcome, error),
+            subtype: `run_once_${decided}`,
+            text: runOutcomeText(decided, reported),
           },
           meta: runOnceFrameMeta(runId, 'app_server'),
           endsTurn: true,
@@ -592,9 +604,9 @@ export class CodexAdapter implements CodingAgentAdapter {
         resolve({
           runId,
           sessionId,
-          outcome,
+          outcome: decided,
           output: said.join('\n\n'),
-          ...(error ? { error } : {}),
+          ...(reported ? { error: reported } : {}),
           durationMs: Date.now() - startedMs,
         });
       },
@@ -613,8 +625,12 @@ export class CodexAdapter implements CodingAgentAdapter {
     });
 
     const stop = async (outcome: 'timeout' | 'canceled'): Promise<void> => {
+      // Already resolved on its own merits: there is no turn left to interrupt, and claiming an
+      // outcome for a run that finished before we decided anything would rewrite a real result.
+      if (!settleRun) return;
       // Claimed before the interrupt goes out, not after it comes back: see `RunState.stopping`.
-      run.stopping = outcome;
+      // `??=` so the first decision stands if a timeout and an abort land in the same window.
+      run.stopping ??= outcome;
       const turnId = run.turnId;
       if (turnId) {
         await client.request(METHODS.turnInterrupt, { threadId, turnId }).catch((err: Error) =>
@@ -1576,6 +1592,8 @@ export class CodexAdapter implements CodingAgentAdapter {
         // interrupted at our request settles as what it is; one interrupted by anything else
         // (a person in the TUI, the server giving up) is a failure.
         else if (turn.status === 'interrupted' && run.stopping) run.settle(run.stopping);
+        // (`settle` would rewrite this one too, now that the claim is enforced there; the
+        // branch above stays because this is where the confusion lived and it costs nothing.)
         else if (turn.status === 'interrupted')
           run.settle('failed', { code: 'exited', message: 'the turn was interrupted' });
         return;

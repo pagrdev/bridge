@@ -34,6 +34,12 @@
 //    unless the path is under the thread's cwd or one of its writable roots — which is what
 //    Codex's own `workspace-write` allows (the roots ADD to the workspace; they do not narrow
 //    it). A refusal writes nothing and reports itself as a failed command item.
+//  - FAKE_CODEX_INTERRUPT_RACE=1: `turn/interrupt` broadcasts its `turn/completed` BEFORE it
+//    answers the request. The real server writes the response first, but the two writes reach
+//    the adapter through one pipe: whenever they land in a single read chunk, readline hands
+//    both lines over in one synchronous tick and the notification is processed before the
+//    awaited response's microtask resumes. This flag makes that the only ordering, so the
+//    "a cancel beats a late completion" rule is a test rather than a coin flip under load.
 
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -55,6 +61,8 @@ if (process.argv.includes('--version')) {
 // together. That is the ordering a fast real turn produces under load, and it used to leave the
 // session stuck at "working" with a dead activeTurnId.
 const COALESCE = process.env.FAKE_CODEX_COALESCE === '1';
+/** See the header: put `turn/completed` on the wire before the `turn/interrupt` response. */
+const INTERRUPT_RACE = process.env.FAKE_CODEX_INTERRUPT_RACE ?? '';
 const SOCK = process.env.FAKE_CODEX_SOCK ?? '';
 /** Live WebSocket connections, in socket mode. */
 const conns = new Set();
@@ -793,8 +801,15 @@ function handleLine(line) {
     }
     case 'turn/interrupt': {
       const t = threads.get(params.threadId);
+      // `complete` clears `activeTurn`, so calling this twice is a no-op the second time.
+      const finish = (status) => {
+        if (t?.activeTurn === params.turnId) complete(params.threadId, params.turnId, status);
+      };
+      // 'completed' stands for the turn finishing on its own in the same instant we interrupt.
+      if (INTERRUPT_RACE === 'completed') finish('completed');
+      else if (INTERRUPT_RACE) finish('interrupted');
       out({ id, result: {} });
-      if (t?.activeTurn === params.turnId) complete(params.threadId, params.turnId, 'interrupted');
+      finish('interrupted');
       return;
     }
     default:
