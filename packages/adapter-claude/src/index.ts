@@ -68,6 +68,14 @@ export {
 } from './hooks/settings.js';
 export { MockClaudeAdapter, type MockClaudeOptions } from './mock.js';
 export {
+  type ClaudeRunOnceOptions,
+  RUN_ONCE_DENY_MESSAGE,
+  RUN_ONCE_GIT_RULES,
+  RUN_ONCE_READ_TOOLS,
+  runClaudeOnce,
+  runOnceAllowedTools,
+} from './run-once.js';
+export {
   type AssistantBlock,
   actionTypeForTool,
   controlResponseLine,

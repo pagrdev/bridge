@@ -30,13 +30,18 @@
 //         "elsewhere" → asks permission and then answers it ITSELF, as a terminal user would:
 //                     the tool_result arrives with no control_response, which is what
 //                     `answeredElsewhere` looks like on the wire
+//         "write file <path>" → a one-shot run's write. The fake honours `--allowedTools`
+//                     the way the real permission engine does: a path a `Write(<glob>)` rule
+//                     covers is written with NO prompt at all; anything else raises a
+//                     can_use_tool request, and a denial means the file is never written.
 //         "fail"   → result subtype error_during_execution
 //         "hang"   → no result until SIGINT (then result success "interrupted") / SIGTERM exits 143
 //         "crash"  → process.exit(7) mid-turn
 //         else     → assistant text + result success
 //       exits 0 when stdin closes.
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import nodePath from 'node:path';
 import readline from 'node:readline';
 
 const argv = process.argv.slice(2);
@@ -60,6 +65,39 @@ const flagValue = (name) => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
 };
+/** Every value of a variadic flag: everything after it until the next `--flag`. */
+const flagValues = (name) => {
+  const i = argv.indexOf(name);
+  if (i < 0) return [];
+  const out = [];
+  for (let j = i + 1; j < argv.length && !argv[j].startsWith('--'); j++) out.push(argv[j]);
+  return out;
+};
+const allowedToolRules = flagValues('--allowedTools');
+
+/** gitignore-ish: `**` crosses directories, `*` does not. Anchored at the working directory. */
+function globMatches(glob, relPath) {
+  const rx = glob
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*\//g, '(?:.*/)?')
+    .replace(/\*\*/g, '.*')
+    .replace(/(?<!\.)\*/g, '[^/]*');
+  return new RegExp(`^${rx}$`).test(relPath);
+}
+
+/**
+ * What the real `--allowedTools` does for a `Write`: a rule whose glob covers the path means the
+ * tool runs with no prompt. Everything else prompts — and a one-shot run denies every prompt.
+ */
+function writeAllowed(absPath) {
+  const rel = nodePath.relative(process.cwd(), absPath);
+  if (rel.startsWith('..') || nodePath.isAbsolute(rel)) return false;
+  return allowedToolRules.some((rule) => {
+    const m = /^Write\((.+)\)$/.exec(rule);
+    return m ? globMatches(m[1], rel) : false;
+  });
+}
+
 const sessionId = flagValue('--session-id') ?? flagValue('--resume') ?? 'fake-session';
 const resumed = argv.includes('--resume');
 const out = (o) => process.stdout.write(`${JSON.stringify({ ...o, session_id: sessionId })}\n`);
@@ -385,6 +423,34 @@ async function handleUser(text) {
     toolResult(toolUseId, 'File created successfully', undefined);
     assistant([{ type: 'text', text: 'Wrote hello.txt in the terminal. DONE' }]);
     result(true, 'Wrote hello.txt in the terminal. DONE');
+    return;
+  }
+  const wants = /write file (\S+)/i.exec(text);
+  if (wants) {
+    const target = nodePath.resolve(process.cwd(), wants[1]);
+    const toolUseId = `toolu_${n++}`;
+    const input = { file_path: target, content: 'written by fake-claude\n' };
+    assistant([{ type: 'tool_use', id: toolUseId, name: 'Write', input }]);
+    if (writeAllowed(target)) {
+      // Covered by a rule: the real CLI runs it without asking anybody.
+      writeFileSync(target, input.content);
+      toolResult(toolUseId, 'File created successfully', undefined);
+      assistant([{ type: 'text', text: `Wrote ${target}. DONE` }]);
+      result(true, `Wrote ${target}. DONE`);
+      return;
+    }
+    const res = await askPermission('Write', input, toolUseId);
+    if (res?.behavior === 'allow') {
+      writeFileSync(target, input.content);
+      toolResult(toolUseId, 'File created successfully', undefined);
+      assistant([{ type: 'text', text: `Wrote ${target}. DONE` }]);
+      result(true, `Wrote ${target}. DONE`);
+      return;
+    }
+    toolResult(toolUseId, `Permission denied: ${res?.message ?? ''}`, undefined, true);
+    const denied = `Could not write ${target}: permission denied. DONE`;
+    assistant([{ type: 'text', text: denied }]);
+    result(true, denied);
     return;
   }
   if (/write/i.test(text)) {

@@ -10,6 +10,8 @@ import type {
   CodingAgentAdapter,
   FrameBody,
   JournalMeta,
+  RunOnceInput,
+  RunOnceResult,
   SendInstructionInput,
   SessionSummary,
   StartSessionInput,
@@ -19,8 +21,10 @@ import {
   askUserQuestionUpdatedInput,
   claudeApprovalOptions,
   type FrameQuestion,
+  newRunId,
   type QuestionAnswer,
   questionBodyFor,
+  runOnceSessionId,
 } from '@pagr/bridge-core';
 import { ChannelMode, type ChannelTarget, channelStatus } from './channel-mode.js';
 import { ClaudeProcess, sealedModeEnabled } from './claude-process.js';
@@ -36,6 +40,7 @@ import {
 import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
 import { claudeHookState } from './hooks/install.js';
 import { FileLogger } from './logger.js';
+import { runClaudeOnce } from './run-once.js';
 import { type PersistedSession, SessionMap } from './session-map.js';
 import {
   actionTypeForTool,
@@ -488,6 +493,65 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       throw err;
     }
     return live.summary;
+  }
+
+  /**
+   * One bounded headless run (`runOnce.ts` in core): the handoff writer, the reviewer.
+   *
+   * Deliberately not a session. Nothing here writes to `this.sessions` or to the session map, so
+   * `listSessions` never returns it, `getStatus` has never heard of it, `sendInstruction` and
+   * `stopSession` cannot reach it, and no `session` event is emitted — which is the whole of
+   * "must not be offered by what's running?".
+   *
+   * It also does not take a slot in `maxLiveProcesses`. That budget exists to stop one `claude`
+   * per remembered session piling up forever; a run has a timeout, and making a handoff evict
+   * somebody's live conversation to write itself would be a strange trade.
+   */
+  async runOnce(input: RunOnceInput): Promise<RunOnceResult> {
+    const runId = input.runId ?? newRunId();
+    const sessionId = runOnceSessionId('claude', runId);
+    if (this.shuttingDown) {
+      return {
+        runId,
+        sessionId,
+        outcome: 'failed',
+        output: '',
+        error: { code: 'start_failed', message: 'adapter is shut down' },
+        durationMs: 0,
+      };
+    }
+    this.logger.log('info', 'starting a one-shot claude run', {
+      runId,
+      cwd: input.cwd,
+      allowedWrites: input.allowedWrites,
+      timeoutMs: input.timeoutMs,
+    });
+    return await runClaudeOnce({
+      input: { ...input, runId },
+      command: this.opts.claudeCommand ?? ['claude'],
+      // `PAGR_CLAUDE_SEALED` is set for the child, not read from the operator's environment: a
+      // run is sealed whatever the daemon's own mode is. `PAGR_DAEMON_SOCK` is dropped for the
+      // same reason every spawned session drops it.
+      env: this.env({
+        PAGR_SESSION_ID: sessionId,
+        PAGR_DAEMON_SOCK: undefined,
+        PAGR_CLAUDE_SEALED: '1',
+      }),
+      logger: this.logger,
+      onFrame: ({ body, meta, endsTurn }) => {
+        // No project means no route: a frame the cloud cannot address is journaled by nobody and
+        // sent to nobody, exactly as a mirrored thread in an unregistered directory is.
+        if (!input.projectId) return;
+        this.emit({
+          kind: 'frame',
+          sessionId,
+          projectId: input.projectId,
+          body,
+          meta,
+          ...(endsTurn ? { endsTurn: true } : {}),
+        });
+      },
+    });
   }
 
   async sendInstruction(

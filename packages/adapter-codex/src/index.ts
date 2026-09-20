@@ -58,6 +58,13 @@ export {
 } from './mirror.js';
 export { MockCodexAdapter, type MockCodexOptions } from './mock.js';
 export * as CodexProtocol from './protocol.js';
+export {
+  RUN_ONCE_APPROVAL_POLICY,
+  runOnceSandboxConfig,
+  runOnceSandboxPolicy,
+  runOnceThreadParams,
+  runOnceTurnParams,
+} from './run-once.js';
 
 export interface CreateCodexAdapterOptions extends Partial<Omit<CodexAdapterOptions, 'home'>> {
   /** PAGR_HOME. Defaults to `$PAGR_HOME` or `~/.pagr`. */
