@@ -14,6 +14,7 @@ import {
   GIT_MAX_BUFFER,
   GIT_TIMEOUT_MS,
   GitError,
+  gitEnv,
   head,
   isDirty,
   isRepo,
@@ -30,7 +31,22 @@ import { useTempHome } from './testUtil.js';
  * bottom, which enforces that). Everything under test goes through the module.
  */
 const raw = (cwd: string, args: string[]): string =>
-  String(execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  String(
+    execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // The fixtures spawn git the same way the module does, so a machine where the module
+      // works is a machine where the tests work. `gitEnv` carries the Xcode-licence fallback.
+      env: {
+        ...gitEnv(),
+        GIT_AUTHOR_NAME: 'Test',
+        GIT_AUTHOR_EMAIL: 'test@example.invalid',
+        GIT_COMMITTER_NAME: 'Test',
+        GIT_COMMITTER_EMAIL: 'test@example.invalid',
+      },
+    }),
+  );
 
 /**
  * A repository that does not depend on the machine's global git config.

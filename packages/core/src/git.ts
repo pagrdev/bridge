@@ -29,6 +29,13 @@ export type GitErrorCode =
   | 'not_found'
   /** No `git` on PATH. */
   | 'git_missing'
+  /**
+   * macOS only: `git` exists but refuses to run because the Xcode licence has not been accepted.
+   * Distinct from `git_missing` because the fix is one command, not an install, and the message
+   * has to say which one — a daemon started by launchd carries no `DEVELOPER_DIR`, so this is the
+   * default state on any Mac with Xcode installed and unlicensed.
+   */
+  | 'xcode_license'
   /** The repository has no commits yet, and the command needs one. */
   | 'no_commits'
   /** git ran longer than the timeout and was killed. */
@@ -125,11 +132,27 @@ const INHERITED = [
   'SSL_CERT_DIR',
 ] as const;
 
-function gitEnv(): NodeJS.ProcessEnv {
+/**
+ * macOS fallback for a Mac with Xcode installed but its licence unaccepted.
+ *
+ * `/usr/bin/git` is a shim that refuses every invocation in that state. Pointing it at the
+ * Command Line Tools toolchain sidesteps the shim entirely. This matters because the daemon is
+ * started by launchd, which carries none of the developer's shell environment, so an unaccepted
+ * licence is the *default* state for a real user rather than an edge case. Only used when the
+ * variable is unset and that toolchain actually exists; a developer who has chosen a toolchain
+ * keeps it.
+ */
+const CLT_DIR = '/Library/Developer/CommandLineTools';
+
+/** @internal Exported for the test fixtures, which must spawn git exactly as the module does. */
+export function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const k of INHERITED) {
     const v = process.env[k];
     if (v !== undefined) env[k] = v;
+  }
+  if (process.platform === 'darwin' && env.DEVELOPER_DIR === undefined && existsSync(CLT_DIR)) {
+    env.DEVELOPER_DIR = CLT_DIR;
   }
   // Never ask a human for a password: there is no terminal here and the phone cannot answer.
   env.GIT_TERMINAL_PROMPT = '0';
@@ -186,6 +209,16 @@ function classify(
 ): GitError {
   const detail = firstLine(stderr) ?? firstLine(stdout);
   const where = `git ${args.join(' ')}`;
+  // A Mac with Xcode installed but unlicensed: /usr/bin/git is a shim that exits non-zero with
+  // this on stderr for every invocation. Catch it before the generic failure so the phone can
+  // print the one command that fixes it.
+  if (/agreed to the Xcode license|xcodebuild -license/i.test(stderr)) {
+    throw new GitError(
+      'xcode_license',
+      'git cannot run until the Xcode licence is accepted. On the Mac, run: sudo xcodebuild -license accept',
+      { stderr },
+    );
+  }
   if (err.code === 'ENOENT')
     return new GitError('git_missing', 'git is not installed or not on PATH', { cause: err });
   if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
