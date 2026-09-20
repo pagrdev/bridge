@@ -236,7 +236,11 @@ describe('proposal — spec §6 table', () => {
     expect(readdirSync(repo)).toEqual(before);
   });
 
-  it('notes an ancestor CLAUDE.md, which suppresses native AGENTS.md reading', () => {
+  it('writes the shim rather than claiming a native read an ancestor CLAUDE.md would win', () => {
+    // Claude reads AGENTS.md only when no CLAUDE.md sits in this directory or above it. With one
+    // above — a monorepo root, ~/code/CLAUDE.md — a `native_read` answer would be silently wrong:
+    // Claude follows the ancestor and never opens the AGENTS.md we pointed at. The shim is correct
+    // on every version, so an ancestor forces the write.
     writeFileSync(join(t.home, CLAUDE_MD), '# monorepo rules\n');
     const repo = repoWith({ [AGENTS_MD]: '# agents\n' });
     const p = proposal({
@@ -245,8 +249,20 @@ describe('proposal — spec §6 table', () => {
       to: 'claude',
       claudeVersion: NATIVE_AGENTS_MD_VERSION,
     });
-    expect(p.action).toBe('native_read');
+    expect(p.action).toBe('write');
+    expect(p.targetFile).toBe(CLAUDE_MD);
     expect(p.notes?.join(' ')).toContain('above the repo root');
+  });
+
+  it('reports native_read only when nothing above the repo carries Claude rules', () => {
+    const repo = repoWith({ [AGENTS_MD]: '# agents\n' });
+    const p = proposal({
+      repo,
+      from: 'codex',
+      to: 'claude',
+      claudeVersion: NATIVE_AGENTS_MD_VERSION,
+    });
+    expect(p.action).toBe('native_read');
   });
 
   it('quotes a line count that matches the bytes convert would write', () => {
