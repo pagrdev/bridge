@@ -9,12 +9,21 @@ import type {
   CodingAgentAdapter,
   FrameQuestion,
   LocalActionDetail,
+  RunOnceError,
+  RunOnceInput,
+  RunOnceResult,
   SendInstructionInput,
   SessionSummary,
   SessionSummaryV2,
   StartSessionInput,
 } from '@pagr/bridge-core';
-import { syntheticSessionId, UNREGISTERED_PROJECT } from '@pagr/bridge-core';
+import {
+  newRunId,
+  runOnceFrameMeta,
+  runOnceSessionId,
+  syntheticSessionId,
+  UNREGISTERED_PROJECT,
+} from '@pagr/bridge-core';
 import type { ApprovalOption } from '@pagr/protocol';
 import { AppServerClient, type AppServerTransportSpec } from './app-server.js';
 import {
@@ -67,6 +76,7 @@ import {
   type TurnSteerResponse,
   type UserInput,
 } from './protocol.js';
+import { runOnceThreadParams, runOnceTurnParams } from './run-once.js';
 import { type PersistedSession, SessionMap } from './session-map.js';
 
 export interface CodexAdapterOptions {
@@ -242,6 +252,28 @@ const MISSING_CACHE_MS = 30_000;
 const IDLE_SHUTDOWN_MS = 5 * 60_000;
 
 /**
+ * One in-flight `runOnce`, keyed by its thread.
+ *
+ * Deliberately NOT a `LiveSession` and deliberately not in `this.sessions`: a run is not
+ * something anyone can steer, stop, resume or be offered (`core/src/adapters/runOnce.ts`). This
+ * is the whole of what the adapter remembers about one, and it is forgotten the moment the run
+ * resolves.
+ */
+interface RunState {
+  runId: string;
+  /** The `ses_…` its frames are mirrored under. Never announced, never listed. */
+  sessionId: string;
+  projectId: string | undefined;
+  threadId: string;
+  turnId: string | null;
+  /** What the agent said, in order. */
+  said: string[];
+  allowedWrites: string[];
+  /** Resolves the run exactly once. */
+  settle: (outcome: RunOnceResult['outcome'], error?: RunOnceError) => void;
+}
+
+/**
  * Codex adapter over the local `codex app-server` (stdio JSON-RPC). One app-server process is
  * shared by all sessions; each cloud session maps to one Codex thread.
  */
@@ -250,6 +282,8 @@ export class CodexAdapter implements CodingAgentAdapter {
   private readonly logger: FileLogger;
   private readonly sessions = new Map<string, LiveSession>();
   private readonly byThread = new Map<string, string>();
+  /** In-flight headless runs, by thread id. Never sessions; see `RunState`. */
+  private readonly runs = new Map<string, RunState>();
   private readonly pending = new Map<string, PendingApproval>();
   private readonly listeners = new Set<(e: AdapterEvent) => void>();
   private readonly map: SessionMap;
@@ -462,6 +496,156 @@ export class CodexAdapter implements CodingAgentAdapter {
     return live.summary;
   }
 
+  /**
+   * One bounded headless run: `thread/start`, one turn, wait for `turn/completed` (spec §3, §5).
+   *
+   * Its own thread, every time. Never a live session's — a handoff prompt injected into the
+   * thread somebody is talking to would land in their transcript as if they had asked for it,
+   * and Codex's writer lock means we would be fighting whoever owns it anyway.
+   *
+   * The thread is never registered: not in `this.sessions`, not in `this.byThread`, not in the
+   * session map. `listSessions` cannot see it, `sendInstruction` and `stopSession` cannot reach
+   * it, no `session` event is emitted for it, and `ownsThread` claims it only so the terminal
+   * mirror does not adopt it as somebody's TUI thread.
+   */
+  async runOnce(input: RunOnceInput): Promise<RunOnceResult> {
+    const runId = input.runId ?? newRunId();
+    const sessionId = runOnceSessionId('codex', runId);
+    const startedMs = Date.now();
+    const failed = (
+      message: string,
+      code: RunOnceError['code'] = 'start_failed',
+    ): RunOnceResult => ({
+      runId,
+      sessionId,
+      outcome: 'failed',
+      output: '',
+      error: { code, message: clip(message, 300) },
+      durationMs: Date.now() - startedMs,
+    });
+    if (this.shuttingDown) return failed('adapter is shut down');
+
+    let client: AppServerClient;
+    try {
+      client = await this.ensureClient();
+    } catch (err) {
+      return failed((err as Error).message);
+    }
+
+    const { params, writableRoots } = runOnceThreadParams(input);
+    this.logger.log('info', 'starting a one-shot codex run', {
+      runId,
+      cwd: input.cwd,
+      writableRoots,
+      timeoutMs: input.timeoutMs,
+    });
+    let threadId: string;
+    try {
+      const res = await client.request<ThreadStartResponse>(METHODS.threadStart, params);
+      threadId = res.thread.id;
+    } catch (err) {
+      return failed(`thread/start failed: ${(err as Error).message}`);
+    }
+
+    const said: string[] = [];
+    let settleRun: ((r: RunOnceResult) => void) | null = null;
+    const finished = new Promise<RunOnceResult>((resolve) => {
+      settleRun = resolve;
+    });
+    const run: RunState = {
+      runId,
+      sessionId,
+      projectId: input.projectId,
+      threadId,
+      turnId: null,
+      said,
+      allowedWrites: input.allowedWrites,
+      settle: (outcome, error) => {
+        const resolve = settleRun;
+        if (!resolve) return;
+        settleRun = null;
+        this.runs.delete(threadId);
+        this.logger.log('info', 'one-shot codex run finished', {
+          runId,
+          outcome,
+          durationMs: Date.now() - startedMs,
+        });
+        this.runFrame(run, {
+          body: {
+            kind: 'system',
+            subtype: `run_once_${outcome}`,
+            text: runOutcomeText(outcome, error),
+          },
+          meta: runOnceFrameMeta(runId, 'app_server'),
+          endsTurn: true,
+        });
+        resolve({
+          runId,
+          sessionId,
+          outcome,
+          output: said.join('\n\n'),
+          ...(error ? { error } : {}),
+          durationMs: Date.now() - startedMs,
+        });
+      },
+    };
+    // Registered BEFORE the turn starts: on a fast server `turn/started` and even the whole turn
+    // can arrive before `turn/start` returns, and a notification for a thread nothing remembers
+    // is a notification that gets dropped.
+    this.runs.set(threadId, run);
+    this.runFrame(run, {
+      body: {
+        kind: 'system',
+        subtype: 'run_once_started',
+        text: `Codex is running headless in ${input.cwd}.`,
+      },
+      meta: runOnceFrameMeta(runId, 'app_server'),
+    });
+
+    const stop = async (outcome: 'timeout' | 'canceled'): Promise<void> => {
+      const turnId = run.turnId;
+      if (turnId) {
+        await client.request(METHODS.turnInterrupt, { threadId, turnId }).catch((err: Error) =>
+          this.logger.log('warn', 'interrupting a one-shot codex run failed', {
+            runId,
+            message: err.message,
+          }),
+        );
+      }
+      run.settle(outcome);
+    };
+    const timer = setTimeout(() => void stop('timeout'), input.timeoutMs);
+    timer.unref();
+    const onAbort = () => void stop('canceled');
+    if (input.signal?.aborted) void stop('canceled');
+    else input.signal?.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      const res = await client.request<TurnStartResponse>(
+        METHODS.turnStart,
+        runOnceTurnParams(threadId, input),
+      );
+      // A turn the stream already completed must not be revived by its own late response.
+      if (this.runs.has(threadId)) run.turnId = res.turn.id;
+    } catch (err) {
+      run.settle('failed', {
+        code: 'start_failed',
+        message: clip(`turn/start failed: ${(err as Error).message}`, 300),
+      });
+    }
+
+    try {
+      return await finished;
+    } finally {
+      clearTimeout(timer);
+      input.signal?.removeEventListener('abort', onAbort);
+      this.runs.delete(threadId);
+      // Best effort: the thread is finished with, and leaving it subscribed on the user's own
+      // shared daemon means the bridge keeps receiving notifications nobody reads.
+      await this.client?.request(METHODS.threadUnsubscribe, { threadId }).catch(() => {});
+    }
+  }
+
   async sendInstruction(
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
@@ -538,6 +722,7 @@ export class CodexAdapter implements CodingAgentAdapter {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     this.clearIdleTimer();
+    this.failRuns('the bridge is shutting down');
     if (this.restartTimer) clearTimeout(this.restartTimer);
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
@@ -800,6 +985,9 @@ export class CodexAdapter implements CodingAgentAdapter {
 
   /** True for a thread this bridge started: its session is ours to drive. */
   private ownsThread(threadId: string): boolean {
+    // A run's thread is ours and is nobody's to adopt: without this the terminal mirror would
+    // find it, call it somebody's TUI session, and list the handoff writer as a session.
+    if (this.runs.has(threadId)) return true;
     const sid = this.byThread.get(threadId);
     const live = sid ? this.sessions.get(sid) : undefined;
     if (live) return live.mirror !== true;
@@ -968,6 +1156,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       this.byThread.delete(live.threadId);
     }
     this.failLiveSessions('Codex app-server exited unexpectedly');
+    this.failRuns('Codex app-server exited unexpectedly');
     for (const p of [...this.pending.values()]) {
       clearTimeout(p.timer);
       this.pending.delete(p.approvalId);
@@ -1097,6 +1286,13 @@ export class CodexAdapter implements CodingAgentAdapter {
 
   private onNotification(n: RpcNotification): void {
     const p = (n.params ?? {}) as Record<string, unknown>;
+    // A headless run's thread is handled on its own, and never falls through: its notifications
+    // must not touch session state, the mirror, or the coalescer that belongs to sessions.
+    const onThread = typeof p.threadId === 'string' ? this.runs.get(p.threadId) : undefined;
+    if (onThread) {
+      this.onRunNotification(onThread, n, p);
+      return;
+    }
     switch (n.method) {
       case NOTIFICATIONS.turnStarted: {
         const { threadId, turn } = p as unknown as TurnStartedNotification;
@@ -1292,13 +1488,138 @@ export class CodexAdapter implements CodingAgentAdapter {
     return sid ? this.sessions.get(sid) : undefined;
   }
 
+  // ---- headless runs ----
+
+  /** One frame from a run. Marked as a run's, mirrored under an id nobody can talk to. */
+  private runFrame(run: RunState, f: MappedFrame): void {
+    if (this.opts.frames === false) return;
+    // No project means no route: journaled by nobody, sent to nobody — as with a mirrored
+    // thread in an unregistered directory. The run itself is unaffected.
+    if (!run.projectId) return;
+    this.emit({
+      kind: 'frame',
+      sessionId: run.sessionId,
+      projectId: run.projectId,
+      body: f.body,
+      meta: { ...f.meta, ...runOnceFrameMeta(run.runId, 'app_server') },
+      ...(f.providerRecordId ? { providerRecordId: f.providerRecordId } : {}),
+      ...(f.endsTurn ? { endsTurn: true } : {}),
+    });
+  }
+
+  /**
+   * Everything the app-server says about a run's thread.
+   *
+   * The same item→frame mapping a session uses, so the phone sees the handoff being written in
+   * the shape it already knows how to draw; what differs is where it goes (`runFrame`) and that
+   * nothing here updates a session, a status, or the mirror.
+   */
+  private onRunNotification(run: RunState, n: RpcNotification, p: Record<string, unknown>): void {
+    switch (n.method) {
+      case NOTIFICATIONS.turnStarted: {
+        const { turn } = p as unknown as TurnStartedNotification;
+        run.turnId = turn.id;
+        return;
+      }
+      case NOTIFICATIONS.itemCompleted: {
+        const c = p as unknown as ItemCompletedNotification;
+        if (c.item.type === 'agentMessage') {
+          const text = (c.item as { text?: string }).text ?? '';
+          if (text.trim()) run.said.push(text);
+        }
+        for (const f of framesForItem(c.item, { turnId: c.turnId, source: 'app_server' })) {
+          this.runFrame(run, f);
+        }
+        return;
+      }
+      case NOTIFICATIONS.turnCompleted: {
+        const { turn } = p as unknown as TurnCompletedNotification;
+        if (turn.status === 'completed') run.settle('completed');
+        else if (turn.status === 'failed')
+          run.settle('failed', {
+            code: 'agent_error',
+            message: clip(turn.error?.message ?? 'the turn failed', 300),
+          });
+        else if (turn.status === 'interrupted')
+          // Our own timeout and cancel settle before they interrupt, so an interruption that
+          // reaches this line came from somewhere else and is a failure, not a timeout.
+          run.settle('failed', { code: 'exited', message: 'the turn was interrupted' });
+        return;
+      }
+      case NOTIFICATIONS.error: {
+        const e = p as unknown as ErrorNotification;
+        if (e.willRetry) return;
+        run.settle('failed', { code: 'agent_error', message: clip(e.error.message, 300) });
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  /** Every in-flight run gives up with the same typed failure. */
+  private failRuns(message: string): void {
+    for (const run of [...this.runs.values()]) {
+      run.settle('failed', { code: 'exited', message });
+    }
+  }
+
   // ---- server → client approval requests ----
+
+  /**
+   * A run asked for permission. Nobody is there to answer, so the answer is no — here, now,
+   * and never as an `approval_requested` event that something downstream could relay to a phone.
+   *
+   * `approvalPolicy: 'never'` should mean this is never reached; it is reached anyway when a
+   * server re-reads the policy, when an MCP tool asks on its own account, or when a future
+   * request type arrives. A prompt nobody answers is a run that hangs until its timeout.
+   */
+  private declineForRun(run: RunState, r: RpcRequest): void {
+    const client = this.client;
+    if (!client) return;
+    this.logger.log('info', 'one-shot run declined a server request', {
+      runId: run.runId,
+      method: r.method,
+    });
+    if (r.method === SERVER_REQUESTS.permissionsApproval) {
+      // An empty grant is a denial.
+      client.respond(r.id, {
+        permissions: {},
+        scope: 'turn',
+      } satisfies PermissionsRequestApprovalResponse);
+    } else if (r.method === SERVER_REQUESTS.requestUserInput) {
+      client.respond(r.id, { answers: {} } satisfies ToolRequestUserInputResponse);
+    } else if (
+      r.method === SERVER_REQUESTS.commandApproval ||
+      r.method === SERVER_REQUESTS.fileChangeApproval
+    ) {
+      client.respond(r.id, { decision: 'decline' });
+    } else {
+      client.respondError(r.id, -32601, 'unsupported request');
+      return;
+    }
+    this.runFrame(run, {
+      body: {
+        kind: 'system',
+        subtype: 'run_once_denied',
+        text: `Refused ${r.method}: this run may only write ${
+          run.allowedWrites.join(', ') || 'nothing'
+        }.`,
+      },
+      meta: runOnceFrameMeta(run.runId, 'app_server'),
+    });
+  }
 
   private onServerRequest(r: RpcRequest): void {
     const client = this.client;
     if (!client) return;
     const params = (r.params ?? {}) as Record<string, unknown>;
     const threadId = typeof params.threadId === 'string' ? params.threadId : '';
+    const run = this.runs.get(threadId);
+    if (run) {
+      this.declineForRun(run, r);
+      return;
+    }
     const live = this.liveByThread(threadId);
     if (r.method === SERVER_REQUESTS.requestUserInput) {
       this.onQuestionRequest(r, live);
@@ -1640,4 +1961,18 @@ export function buildInput(instruction: string, images: string[]): UserInput[] {
   const input: UserInput[] = [{ type: 'text', text: instruction, text_elements: [] }];
   for (const p of images) input.push({ type: 'localImage', path: p });
   return input;
+}
+
+/** What a run's closing `system` frame says. One line, for a phone. */
+function runOutcomeText(outcome: RunOnceResult['outcome'], error?: RunOnceError): string {
+  switch (outcome) {
+    case 'completed':
+      return 'Headless run finished.';
+    case 'timeout':
+      return 'Headless run timed out and was stopped.';
+    case 'canceled':
+      return 'Headless run was canceled.';
+    default:
+      return `Headless run failed: ${error?.message ?? 'unknown error'}`;
+  }
 }

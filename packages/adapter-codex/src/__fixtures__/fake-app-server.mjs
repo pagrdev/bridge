@@ -26,9 +26,18 @@
 //    refused by thread/resume with "already has an active writer", readable by thread/read.
 //  - FAKE_CODEX_QUESTION=1: a turn containing "ask" sends item/tool/requestUserInput.
 //  - outputDelta / reasoning textDelta / fileChange patchUpdated notifications.
+//
+// HND-010 (headless runs) additions:
+//  - thread/start remembers `sandbox` and `config.sandbox_workspace_write`; turn/start's
+//    `sandboxPolicy` overrides them for the turn.
+//  - a turn containing "write file <path>" tries to write it and is REFUSED by the sandbox
+//    unless the path is under the thread's cwd or one of its writable roots — which is what
+//    Codex's own `workspace-write` allows (the roots ADD to the workspace; they do not narrow
+//    it). A refusal writes nothing and reports itself as a failed command item.
 
-import { appendFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import nodePath from 'node:path';
 import readline from 'node:readline';
 
 // FAKE_CODEX_TRACE=<file> records every invocation (one line of argv per process), so a test can
@@ -248,6 +257,34 @@ function complete(threadId, turnId, status, error = null) {
   out({ method: 'thread/status/changed', params: { threadId, status: { type: 'idle' } } });
 }
 
+/**
+ * The sandbox, as Codex enforces it: under `workspace-write` a path is writable when it is inside
+ * the thread's cwd or inside one of its writable roots. Anything else is refused by the OS
+ * sandbox before the tool ever runs.
+ */
+function writeAllowed(t, absPath) {
+  if (t?.sandbox !== 'workspace-write') return false;
+  const roots = [t.cwd, ...(t.writableRoots ?? [])].filter(Boolean).map((r) => nodePath.resolve(r));
+  return roots.some((root) => absPath === root || absPath.startsWith(root + nodePath.sep));
+}
+
+/** A write the sandbox refused: nothing on disk, a failed item, and the agent says so. */
+function refusedWrite(threadId, turnId, absPath) {
+  const itemId = `item_${n++}`;
+  const item = {
+    type: 'commandExecution',
+    id: itemId,
+    command: `apply_patch ${absPath}`,
+    cwd: threads.get(threadId)?.cwd ?? '/',
+    status: 'failed',
+    aggregatedOutput: `sandbox: write to ${absPath} denied (not under a writable root)`,
+    exitCode: 1,
+  };
+  record(threadId, turnId, item);
+  out({ method: 'item/completed', params: { threadId, turnId, item } });
+  agentMessage(threadId, turnId, `Sandbox denied the write to ${absPath}. Nothing was changed.`);
+}
+
 async function runTurn(threadId, turnId, input) {
   const text = textOf(input);
   const images = imagesOf(input);
@@ -268,6 +305,20 @@ async function runTurn(threadId, turnId, input) {
     `Working on: ${text}${images.length ? ` (with ${images.length} image(s))` : ''}`,
   );
   if (/crash/i.test(text)) process.exit(3);
+  const wants = /write file (\S+)/i.exec(text);
+  if (wants) {
+    const t = threads.get(threadId);
+    const target = nodePath.resolve(t?.cwd ?? '/', wants[1]);
+    if (writeAllowed(t, target)) {
+      mkdirSync(nodePath.dirname(target), { recursive: true });
+      writeFileSync(target, 'written by fake-app-server\n');
+      agentMessage(threadId, turnId, `Wrote ${target}.`);
+    } else {
+      refusedWrite(threadId, turnId, target);
+    }
+    complete(threadId, turnId, 'completed');
+    return;
+  }
   if (/think/i.test(text)) reasoning(threadId, turnId, 'Considering the options carefully.');
   if (/run/i.test(text)) commandExecution(threadId, turnId, 'pnpm test', 'ok 1\nok 2\nall good\n');
   if (/patch/i.test(text)) fileChange(threadId, turnId);
@@ -582,6 +633,7 @@ function handleLine(line) {
         activeTurn: null,
         approvalPolicy: params.approvalPolicy,
         sandbox: params.sandbox,
+        writableRoots: params.config?.sandbox_workspace_write?.writable_roots ?? [],
         turns: [],
         loaded: true,
         foreign: false,
@@ -715,6 +767,11 @@ function handleLine(line) {
       }
       const turnId = `turn_${n++}`;
       t.activeTurn = turnId;
+      if (params.sandboxPolicy) {
+        t.sandbox =
+          params.sandboxPolicy.type === 'workspaceWrite' ? 'workspace-write' : 'read-only';
+        t.writableRoots = params.sandboxPolicy.writableRoots ?? [];
+      }
       out({
         id,
         result: {

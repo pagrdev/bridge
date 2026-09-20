@@ -10,6 +10,7 @@ import type {
 import type { LocalActionDetail } from '../deviceFloor.js';
 import type { FrameBody, FrameQuestion } from '../frames.js';
 import type { JournalMeta } from '../journal.js';
+import type { RunOnceInput, RunOnceResult } from './runOnce.js';
 
 export interface LocalProject {
   projectId: string;
@@ -224,6 +225,14 @@ export interface CodingAgentAdapter {
     providerRequestId: string;
     answers: Array<{ questionIndex: number; optionIndexes: number[]; freeText?: string }>;
   }): Promise<void>;
+  /**
+   * One bounded, headless run: a prompt in, a file on disk and whatever the agent printed out.
+   *
+   * Never a session — see `runOnce.ts`. Optional, because an adapter whose agent cannot be run
+   * headlessly is still a perfectly good adapter; the handoff engine falls back to the
+   * sender-writes path (spec §3) when the receiver has none.
+   */
+  runOnce?(input: RunOnceInput): Promise<RunOnceResult>;
   subscribe(emit: (e: AdapterEvent) => void): () => void;
   shutdown(): Promise<void>;
 }
