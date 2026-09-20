@@ -20,6 +20,7 @@ export * from './handoff/capture.js';
 export * from './handoff/format.js';
 export * from './handoff/prompt.js';
 export * from './handoff/receiver.js';
+export * from './handoff/switch.js';
 export * from './heuristics.js';
 export * from './identity.js';
 export * from './ipc.js';

@@ -150,14 +150,36 @@ export const FrameBody = z.discriminatedUnion('kind', [
     /** The report exactly as the reviewer wrote it, first line included. */
     text: z.string(),
   }),
+  /**
+   * v2, `handoff.v1`. The handoff file itself, sealed, so the phone can read what was handed
+   * over (spec §4). `text` is the whole markdown document as it sits on the Mac — already under
+   * the format's own 64 KiB cap — and `path` is REPO-RELATIVE on purpose: the frame is sealed,
+   * but an absolute path would put the user's home directory into a field nothing needs it in.
+   */
+  z.object({
+    kind: z.literal('handoff'),
+    handoffId: z.string().min(1),
+    /** `.pagr/handoff/<id>.md`, relative to the work tree root. */
+    path: z.string(),
+    text: z.string(),
+  }),
 ]);
 export type FrameBody = z.infer<typeof FrameBody>;
 
 /** Frame kinds this Mac can produce. `imessage` is injected by the cloud, never sealed here. */
 export type FrameBodyKind = FrameBody['kind'];
 
+/**
+ * Read off the union itself rather than written out, so a kind the protocol knows and this
+ * module has no body for (`review`, until HND-031 adds one) answers false instead of quietly
+ * claiming a shape that does not exist.
+ */
+const FRAME_BODY_KINDS: ReadonlySet<string> = new Set(
+  FrameBody.options.map((option) => option.shape.kind.value),
+);
+
 export function isFrameBodyKind(kind: FrameKind): kind is FrameBodyKind {
-  return kind !== 'imessage';
+  return FRAME_BODY_KINDS.has(kind);
 }
 
 // ---------- codec ----------
@@ -343,8 +365,9 @@ function largestTextSlot(body: FrameBody): TextSlot | null {
       add(body.preview, (preview) => ({ ...body, preview }));
       break;
     case 'review':
-      // The report, not the verdict line: `summary` is what the phone shows when the findings
-      // are too long to send live, so clipping it would leave the frame saying nothing.
+    // The report, not the verdict line: `summary` is what the phone shows when the findings
+    // are too long to send live, so clipping it would leave the frame saying nothing.
+    case 'handoff':
       add(body.text, (text) => ({ ...body, text }));
       break;
     case 'question':

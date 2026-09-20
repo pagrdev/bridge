@@ -13,6 +13,7 @@ export const ids = {
   att: () => `att_${hex32()}`,
   qst: () => `qst_${hex32()}`,
   rh: () => `rh_${hex32()}`,
+  hnd: () => `hnd_${hex32()}`,
 };
 
 /** A fake cloud signer: holds a server keypair and produces signed envelopes. */
