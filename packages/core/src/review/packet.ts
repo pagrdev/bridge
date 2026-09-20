@@ -11,6 +11,7 @@ import {
   logOneline,
   repoRoot,
 } from '../git.js';
+import { countLines } from '../text.js';
 
 /**
  * The review packet (spec §5).
@@ -183,14 +184,6 @@ export const reviewMaxPacketBytes = (env: NodeJS.ProcessEnv = process.env): numb
   positiveInt(env[REVIEW_MAX_PACKET_BYTES_ENV], DEFAULT_REVIEW_MAX_PACKET_BYTES);
 
 const bytesOf = (s: string): number => Buffer.byteLength(s, 'utf8');
-
-/** Lines in a body of text; a trailing newline does not count as a line of its own. */
-export function countLines(text: string): number {
-  if (text.length === 0) return 0;
-  let n = 0;
-  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) n++;
-  return text.endsWith('\n') ? n : n + 1;
-}
 
 /** True for `.pagr` itself and anything beneath it, on either path separator. */
 export const isPagrPath = (p: string): boolean => {

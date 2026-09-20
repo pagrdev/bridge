@@ -9,13 +9,13 @@ import {
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { useTempHome } from '../testUtil.js';
+import { countLines } from '../text.js';
 import {
   AGENTS_MD,
   CLAUDE_DIR_MD,
   CLAUDE_LOCAL_MD,
   CLAUDE_MD,
   convert,
-  countLines,
   detect,
   MAX_IMPORT_DEPTH,
   NATIVE_AGENTS_MD_VERSION,

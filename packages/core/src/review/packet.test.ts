@@ -3,9 +3,9 @@ import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { ExecFileLike } from '../git.js';
 import { useTempHome } from '../testUtil.js';
+import { countLines } from '../text.js';
 import {
   buildReviewPacket,
-  countLines,
   DEFAULT_REVIEW_MAX_FILE_LINES,
   intentLine,
   isPagrPath,
