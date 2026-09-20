@@ -11,6 +11,7 @@ import {
   type ProjectSummary,
   type Provider,
   type RepoScanResult,
+  type RulesMigrateResult,
   type SealAad,
   type SessionStatus,
   type SessionSummary,
@@ -69,6 +70,7 @@ import {
   questionBodyFor,
 } from './questions.js';
 import { handleFor, RepoHandleCache, scanRepos } from './repoScan.js';
+import { migrateRules, toRulesMigrateResult } from './rules/migrate.js';
 import { importRecipientKeys, type RecipientKeySet, sealFrame } from './seal.js';
 import { isAdopted, isReportable, type SessionStore, UNREGISTERED_PROJECT } from './sessions.js';
 
@@ -782,6 +784,9 @@ export class Dispatcher {
         return this.scanRepositories();
       case 'project.register_handle':
         return this.registerRepoHandle(body.payload);
+      case 'rules.migrate':
+        this.assertV2(body.version, 'rules.migrate');
+        return this.migrateRules(body.payload);
       case 'settings.sync_public_policy': {
         // Re-parsed rather than spread: a key the cloud sends that this bridge no longer honours
         // (`smartApprovalsTierA`) must not survive into `policy.json` looking like a live setting.
@@ -1619,6 +1624,57 @@ export class Dispatcher {
     };
     if (ensured.created) this.send('project.registered', summary);
     return summary;
+  }
+
+  // ---------- rules migration (v2) ----------
+
+  /**
+   * `rules.migrate` — decide, and only with an explicit yes, perform the one rules conversion a
+   * handoff may need (spec §6, ADR 0019 decision 6).
+   *
+   * Sent twice and signed twice. The first command carries `consent: false` and answers with the
+   * proposal: the action, the two file names and the real line count, which is the number the
+   * cloud quotes back to the person by text. The second carries `consent: true` and arrives only
+   * after they said yes. A no, and a silence, are both simply the absence of that second command
+   * — which is why nothing here has a timeout to get wrong, and why the ONLY code path that
+   * writes into somebody's repository begins with a separately-signed command that says so.
+   *
+   * The project id is resolved locally, as every cloud-facing surface does: the cloud names an
+   * id, never a directory, and an unknown one is `unknown_project`. The proposal and the write
+   * both run against the repository root that id resolves to, and the file bodies stay on the Mac
+   * — only the counts and the two known file names ride back on the ack.
+   */
+  private async migrateRules(
+    payload: CommandPayload<'rules.migrate'>,
+  ): Promise<RulesMigrateResult> {
+    const project = this.o.registry.resolve(payload.projectId);
+    const outcome = migrateRules({
+      dir: project.path,
+      from: payload.from,
+      to: payload.to,
+      consent: payload.consent,
+      home: this.o.registry.homeDirectory,
+      now: this.now,
+      logger: this.logger,
+      ...(payload.to === 'claude' ? { claudeVersion: await this.claudeVersion() } : {}),
+    });
+    return toRulesMigrateResult(outcome);
+  }
+
+  /**
+   * The receiving Claude's version, for the one §6 row that turns on it: a Claude at or above
+   * 2.1.277 reads `AGENTS.md` itself and needs no shim written for it.
+   *
+   * A probe that fails, or no Claude adapter at all, answers `undefined` — which the converter
+   * reads as "old", and an old Claude gets the one-line import that works on every version. The
+   * expensive mistake here is the other way round: guessing "new" would leave the receiver with
+   * no rules and nothing on screen to say so.
+   */
+  private async claudeVersion(): Promise<string | undefined> {
+    const adapter = this.o.adapters.get('claude');
+    if (!adapter) return undefined;
+    const caps = this.capabilities.get('claude') ?? (await this.probeOne(adapter));
+    return caps?.providerVersion;
   }
 
   // ---------- approvals ----------
