@@ -47,6 +47,7 @@ export * from './questions.js';
 export * from './reconcile.js';
 export * from './replay.js';
 export * from './repoScan.js';
+export * from './rules/convert.js';
 export * from './scan.js';
 export * from './seal.js';
 export * from './sessions.js';
