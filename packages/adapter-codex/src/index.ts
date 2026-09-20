@@ -60,10 +60,13 @@ export { MockCodexAdapter, type MockCodexOptions } from './mock.js';
 export * as CodexProtocol from './protocol.js';
 export {
   RUN_ONCE_APPROVAL_POLICY,
+  RUN_ONCE_SANDBOX_DIR,
   runOnceSandboxConfig,
+  runOnceSandboxCwd,
   runOnceSandboxPolicy,
   runOnceThreadParams,
   runOnceTurnParams,
+  runOnceWritableRoots,
 } from './run-once.js';
 
 export interface CreateCodexAdapterOptions extends Partial<Omit<CodexAdapterOptions, 'home'>> {

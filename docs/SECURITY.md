@@ -126,9 +126,10 @@ the above:
 - **Codex `read-only` vs Claude read-only.** Codex enforces read-only with a real sandbox. Claude
   Code has none, so read-only there is enforced by withholding tools (below). That is a deny-list
   against a tool set that can change between releases. The two headless runs handoff v1 added —
-  the handoff writer and the reviewer — are neither of those things, and their confinement is
-  weaker on the Codex side than on the Claude side: see "Headless runs" below, which states it in
-  full rather than implying parity.
+  the handoff writer and the reviewer — are neither of those things. The Codex ones now run in an
+  OS sandbox that cannot reach a source file at all; the Claude ones are still bounded by a tool
+  list and a run that denies every prompt, with no kernel behind it. The two are not equal and
+  "Headless runs" below says which way round, rather than implying parity.
 
 ## What changed for the iPhone app
 
@@ -219,7 +220,7 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | `session.backfill` | re-send part of a session's own transcript from `~/.pagr/journal/`, sealed, capped, one at a time. It reads the same files the mirror already reads and opens no new ones |
 | `keys.sync` | ask the gateway to re-send the phone key set. Carries nothing and changes nothing on this Mac by itself |
 | `session.handoff.capture` | write one handoff file under `<repo>/.pagr/handoff/` for a session you can already see, and — only if the tree is dirty — `git add -A && git commit` a WIP commit on the branch you are already on. It writes nowhere else, and the transcript it is written from never leaves this Mac |
-| `review.start` | build a review packet under `<repo>/.pagr/review/` from a commit range and run the reviewing agent headless over the work tree, allowed to write only its own report directory (see "Headless runs" — the Codex side of that is weaker than the Claude side, and this document says how). The packet is the diff and one line of intent; no transcript and no reasoning from the agent that wrote the code |
+| `review.start` | build a review packet under `<repo>/.pagr/review/` from a commit range and run the reviewing agent headless over the work tree, allowed to write only its own report directory — a Codex reviewer is confined to `<repo>/.pagr` by its sandbox, a Claude one by its tool list (see "Headless runs", which says what each actually enforces). The packet is the diff and one line of intent; no transcript and no reasoning from the agent that wrote the code |
 | `review.apply` | hand a finished review's findings back to the builder. It sends text; it never applies a change by itself |
 | `rules.migrate` | with `consent: true`, and only after you said yes by text, write ONE rules file (`AGENTS.md` or `CLAUDE.md`) that did not exist. An existing rules file is never modified, and with `consent: false` the command only reports what it would do |
 
@@ -470,41 +471,54 @@ section headings, the planted sentences. If any of it appears, the build fails.
 
 ### The sandbox asymmetry, stated rather than implied
 
-The two providers are **not** confined to the same degree, and no sentence in this document should
-be read as saying they are.
+The two providers are **not** confined the same way, and no sentence in this document should be
+read as saying they are. Since HND-015 the Codex side is the stronger of the two.
 
-**Claude.** The run is given an explicit tool list: `Read`, `Glob`, `Grep`, `NotebookRead`,
-read-only `git` invocations (`status`, `log`, `diff`, `show`, `branch`, `rev-parse`), and
-`Write` / `Edit` / `MultiEdit` narrowed to `.pagr/**` for the handoff writer and to
-`.pagr/review/<reviewId>/**` for the reviewer. It runs sealed (`--setting-sources user,local`,
-`--strict-mcp-config`). Two limits worth knowing: `--allowedTools` is an *allow* list rather than
-a restriction — a tool outside it raises a permission prompt instead of being refused outright,
-and what makes it a boundary here is that the run denies every prompt it is asked — and there is
-no OS sandbox behind it, so a `permissions.allow` you have already put in your own
+**Codex.** The run gets a real OS sandbox, and **its working directory is `<repo>/.pagr`, not the
+repository root**. That is the whole boundary, because of how `workspace-write` composes: Codex
+grants the thread's own `cwd` *in addition to* `writableRoots` (upstream, the writable set is
+"cwd, /tmp, `$TMPDIR`" plus the configured roots), so the cwd is the widest thing a run can
+reach. Starting the thread inside `.pagr` therefore means a Codex handoff writer or reviewer
+**cannot write a source file at all** — the refusal comes from the kernel, before the tool runs,
+whatever its prompt says and whatever it decides it would rather do. `writableRoots` is still
+sent, still relative to the repository (`<repo>/.pagr/review/<reviewId>`), and still says what
+Pagr asked for; it is no longer what stops anything.
+
+Two things this does not do, both worth knowing:
+
+- **Reads are not narrowed with it.** `workspace-write` grants full-disk read — upstream's
+  policy is unconditional about it, and the seatbelt profile the run gets contains a bare
+  `(allow file-read*)`. A reviewer whose cwd is `.pagr` still opens any file in the repository it
+  wants to look at, which is the point: it loses the ability to change one, not the ability to
+  review it. It does mean the sandbox is not a confidentiality boundary — a run can read
+  anything you can, including a `.env` sitting in the checkout.
+- **`.pagr` is granted whole.** Codex's sandbox cannot express "this one file", so a run allowed
+  `.pagr/review/<id>/**` could in fact write anywhere under `.pagr`: one review could overwrite
+  another's report, or an old handoff note. That is a directory Pagr created and git-excluded,
+  and nothing in it is read back as instructions; the repository, your home directory, a sibling
+  checkout, `$TMPDIR` and `/tmp` are all outside the sandbox, and network access is off for the
+  run.
+
+Because the working directory is no longer the repository root, everything a run is asked to read
+or write is named by **absolute** path — the transcript, the review packet, the file to write, and
+the repository root itself, which the prompt states so the agent can still reach the tree.
+
+**Claude.** No OS sandbox exists for it, so the run is bounded by what it is given and what it
+refuses. An explicit tool list: `Read`, `Glob`, `Grep`, `NotebookRead`, read-only `git`
+invocations (`status`, `log`, `diff`, `show`, `branch`, `rev-parse`), and `Write` / `Edit` /
+`MultiEdit` narrowed to `.pagr/**` for the handoff writer and to `.pagr/review/<reviewId>/**` for
+the reviewer. It runs sealed (`--setting-sources user,local`, `--strict-mcp-config`) and in the
+repository root. Two limits, stated plainly: `--allowedTools` is an *allow* list rather than a
+restriction — a tool outside it raises a permission prompt instead of being refused outright, and
+what makes it a boundary is that the run denies every prompt it is asked — and there is nothing
+behind that deny, so a `permissions.allow` you have already put in your own
 `~/.claude/settings.json`, or one in the checkout's `.claude/settings.local.json`, still applies.
+**A Claude one-shot that is granted a tool by your own settings can write outside `.pagr`, and a
+Codex one cannot.** That is the asymmetry now, the other way round from how it started.
 
-**Codex.** The run gets a real OS sandbox, and it is *not* narrowed to the same paths. Codex's
-sandbox has no way to express "read-only except this one directory": in the app-server protocol
-the `readOnly` policy carries only a network flag, `writableRoots` exists solely on
-`workspaceWrite`, and there is no permission-profile field on a turn. So `writable_roots` **widens
-an otherwise read-only sandbox rather than narrowing a writable one** — the roots add to the
-workspace, they do not replace it. Today the one-shot starts its thread with the repository root
-as its working directory, which means the sandbox grants the repository, and
-`writableRoots: ["<repo>/.pagr/…"]` adds nothing it did not already have. What actually keeps a
-Codex writer or reviewer inside `.pagr/` today is **its prompt**, not the sandbox.
-
-What the Codex sandbox does still enforce is the boundary at the edge of the repository: your home
-directory, a sibling checkout, `$TMPDIR` and `/tmp` are all outside it, and network access is off
-for the run.
-
-**HND-015 is the open ticket to close this structurally**, by starting the one-shot's thread with
-`<repo>/.pagr` as its working directory so a `workspace-write` sandbox cannot reach source files
-at all. Until it lands, a Codex handoff writer or reviewer is a process that could write anywhere
-in the repository it was pointed at, and is stopped from doing so by instructions rather than by
-the kernel. The path is reached in exactly two cases: Codex is the agent *receiving* a handoff the
+The Codex path is reached in exactly two cases: Codex is the agent *receiving* a handoff the
 sender could no longer write for itself, or Codex is the agent doing a review. A handoff the
-sending agent writes itself never starts a one-shot at all, and a run on the Claude side is
-bounded by the tool list above instead.
+sending agent writes itself never starts a one-shot at all.
 
 ## The Claude Code channel (`pagr claude`)
 

@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type {
@@ -76,7 +77,7 @@ import {
   type TurnSteerResponse,
   type UserInput,
 } from './protocol.js';
-import { runOnceThreadParams, runOnceTurnParams } from './run-once.js';
+import { RUN_ONCE_SANDBOX_DIR, runOnceThreadParams, runOnceTurnParams } from './run-once.js';
 import { type PersistedSession, SessionMap } from './session-map.js';
 
 export interface CodexAdapterOptions {
@@ -548,10 +549,20 @@ export class CodexAdapter implements CodingAgentAdapter {
       return failed((err as Error).message);
     }
 
-    const { params, writableRoots } = runOnceThreadParams(input);
+    const { params, sandboxCwd, writableRoots } = runOnceThreadParams(input);
+    // The thread is started in `<repo>/.pagr`, and `workspace-write` grants its cwd — so this
+    // directory IS the sandbox (`run-once.ts`). Codex cannot start a thread in a directory that
+    // does not exist, and both callers create something deeper inside it anyway; creating it
+    // here means the boundary does not depend on which caller got there first.
+    try {
+      await mkdir(sandboxCwd, { recursive: true });
+    } catch (err) {
+      return failed(`could not create ${sandboxCwd}: ${(err as Error).message}`);
+    }
     this.logger.log('info', 'starting a one-shot codex run', {
       runId,
-      cwd: input.cwd,
+      repo: input.cwd,
+      sandboxCwd,
       writableRoots,
       timeoutMs: input.timeoutMs,
     });
@@ -619,7 +630,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       body: {
         kind: 'system',
         subtype: 'run_once_started',
-        text: `Codex is running headless in ${input.cwd}.`,
+        text: `Codex is running headless in ${input.cwd}, sandboxed to ${RUN_ONCE_SANDBOX_DIR}/.`,
       },
       meta: runOnceFrameMeta(runId, 'app_server'),
     });

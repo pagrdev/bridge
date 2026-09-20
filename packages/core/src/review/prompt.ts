@@ -25,6 +25,16 @@ export interface ReviewPromptInput {
   packetPath: string;
   /** Absolute path the reviewer must write, `<repo>/.pagr/review/<reviewId>/review.md`. */
   outPath: string;
+  /**
+   * Absolute path to the work tree root the packet describes.
+   *
+   * Stated because a reviewer's working directory is NOT the repository on every provider: a
+   * Codex run is started inside `<repo>/.pagr`, so its sandbox cannot write source
+   * (`adapter-codex/src/run-once.ts`, HND-015). Reads are not narrowed with it — the reviewer
+   * may open anything it wants to look at — but it has to know where the tree is, because the
+   * packet's paths are repository-relative and a relative path is no longer the same file.
+   */
+  repo: string;
 }
 
 /** The five things every review scores, in the order the report states them. */
@@ -74,6 +84,14 @@ export function reviewPrompt(input: ReviewPromptInput): string {
     'That is everything you get. You do not have the author’s transcript, notes or reasoning, and',
     'you must not go looking for them: no other file under `.pagr/` is part of this review. Judge',
     'the change on what the code does, not on what it was meant to do.',
+    '',
+    'The repository under review is here:',
+    '',
+    `  ${input.repo}`,
+    '',
+    'You may read any file in it. Your working directory is not necessarily that root, so open',
+    'files by their absolute path — the packet lists paths relative to it — and pass that root to',
+    'any command you run over the tree.',
     '',
     'Do not change any file in the repository, do not run the code, and do not fix anything. You',
     'are read-only apart from the one report described below.',

@@ -12,6 +12,14 @@ That is everything you get. You do not have the author’s transcript, notes or 
 you must not go looking for them: no other file under \`.pagr/\` is part of this review. Judge
 the change on what the code does, not on what it was meant to do.
 
+The repository under review is here:
+
+  /Users/x/code/checkout-api
+
+You may read any file in it. Your working directory is not necessarily that root, so open
+files by their absolute path — the packet lists paths relative to it — and pass that root to
+any command you run over the tree.
+
 Do not change any file in the repository, do not run the code, and do not fix anything. You
 are read-only apart from the one report described below.
 

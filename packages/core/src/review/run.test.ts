@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { RunOnceInput, RunOnceOutcome, RunOnceResult } from '../adapters/runOnce.js';
 import type { ExecFileLike } from '../git.js';
@@ -214,6 +214,12 @@ describe('prepareReview', () => {
     expect(prepared.prompt).toContain(prepared.reviewPath);
     // The reviewer is never told how the author got there (ADR 0019 decision 4).
     expect(prepared.prompt).not.toContain('handoff');
+    // HND-015: on the Codex side the run's working directory is `<repo>/.pagr`, so the tree it
+    // is reviewing is named absolutely and every path it is given is absolute too.
+    expect(prepared.prompt).toContain(prepared.repo);
+    expect(prepared.prompt).toContain('working directory is not necessarily that root');
+    expect(isAbsolute(prepared.packet.packetPath)).toBe(true);
+    expect(isAbsolute(prepared.reviewPath)).toBe(true);
   });
 });
 
