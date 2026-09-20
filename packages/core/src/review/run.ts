@@ -305,6 +305,26 @@ export type ReviewOutcome =
       /** The run's own result, when it ended by itself. Null when it was aborted or threw. */
       run: RunOnceResult | null;
     }
+  /**
+   * Somebody stopped it. There is no verdict, and — deliberately — no attempt to salvage one.
+   *
+   * A reviewer writes `review.md` with the verdict on the FIRST line, so a report that is half
+   * written still parses: `verdict: approve — looks fine` with the three findings that were
+   * about to follow missing. Reading that would turn "I stopped the review" into "the review
+   * approved your change", which is the worst answer this module could give. A stop produces
+   * nothing, which is exactly what the person asked for.
+   */
+  | {
+      outcome: 'canceled';
+      reviewId: string;
+      runId: string;
+      sessionId: string;
+      path: string;
+      /** One line for the phone. */
+      message: string;
+      waitedMs: number;
+      run: RunOnceResult | null;
+    }
   /** The bound elapsed, or the agent finished and wrote nothing. There is no verdict. */
   | {
       outcome: 'no_report';
@@ -324,6 +344,9 @@ export type ReviewOutcome =
  * Never throws for anything the design anticipates. An agent that cannot be started, one that
  * dies, one that never writes and one that writes nonsense are all things a person gets told in
  * a text message, not stack traces.
+ *
+ * A person stopping it is the third outcome, and it does NOT read whatever is on disk — see the
+ * `canceled` variant of {@link ReviewOutcome}.
  */
 export async function awaitReview(input: AwaitReviewInput): Promise<ReviewOutcome> {
   const { prepared, reviewer } = input;
@@ -348,6 +371,7 @@ export async function awaitReview(input: AwaitReviewInput): Promise<ReviewOutcom
       state.run = await input.runner.runOnce({
         cwd: prepared.repo,
         prompt: prepared.prompt,
+        kind: 'review',
         timeoutMs,
         runId,
         signal: controller.signal,
@@ -358,12 +382,27 @@ export async function awaitReview(input: AwaitReviewInput): Promise<ReviewOutcom
     }
   })();
 
+  /**
+   * True once the run has reported that somebody stopped it.
+   *
+   * The caller's signal is checked FIRST, and that ordering is the whole guarantee: the
+   * dispatcher aborts it before it asks the adapter to kill anything, so the watcher knows the
+   * review was called off at the instant the person pressed stop — not a few milliseconds later
+   * when the dead process's outcome comes back, by which time the poll could already have read
+   * the half-flushed file the kill left behind. The run's own outcome is the backstop for a
+   * cancellation that reached the adapter by some other door. (Our OWN post-read abort uses
+   * `controller`, never `input.signal`, so reading a finished report can never look like this.)
+   */
+  const canceled = (): boolean =>
+    input.signal?.aborted === true || state.run?.outcome === 'canceled';
+
   const wait = await waitForReview({
     file: prepared.reviewPath,
     timeoutMs,
     pollIntervalMs,
     reReadGraceMs,
     stopWhen: running,
+    canceled,
   });
 
   // The report is the deliverable and it is in hand; the prompt already told the agent to stop.
@@ -384,6 +423,19 @@ export async function awaitReview(input: AwaitReviewInput): Promise<ReviewOutcom
       path: prepared.reviewPath,
       text: wait.text,
       reRead: wait.reRead,
+      run: state.run,
+    };
+  }
+
+  if (wait.kind === 'canceled') {
+    return {
+      outcome: 'canceled',
+      reviewId: prepared.reviewId,
+      runId,
+      sessionId,
+      path: prepared.reviewPath,
+      message: `the review was stopped before ${reviewer} answered`,
+      waitedMs: wait.waitedMs,
       run: state.run,
     };
   }
@@ -413,7 +465,6 @@ function noReportMessage(
   if (run?.outcome === 'timeout')
     return `${reviewer} ran out of time (${Math.round(waitedMs / 1000)}s) without writing a review`;
   if (run?.outcome === 'completed') return `${reviewer} finished its turn without writing a review`;
-  if (run?.outcome === 'canceled') return `the review was stopped before ${reviewer} answered`;
   return `no review after ${Math.round(waitedMs / 1000)}s`;
 }
 
@@ -421,6 +472,7 @@ function noReportMessage(
 
 type ReviewWait =
   | { kind: 'read'; text: string; parsed: ParsedVerdict; reRead: boolean }
+  | { kind: 'canceled'; waitedMs: number }
   | { kind: 'timeout'; waitedMs: number };
 
 interface WaitOptions {
@@ -430,6 +482,8 @@ interface WaitOptions {
   reReadGraceMs: number;
   /** The run. When it settles the file is checked once more and the wait ends either way. */
   stopWhen: Promise<void>;
+  /** True once the run reports it was stopped. A stopped review has no report to read. */
+  canceled: () => boolean;
 }
 
 /**
@@ -454,7 +508,7 @@ interface WaitOptions {
  *     what the reviewer wrote instead of a verdict.
  */
 function waitForReview(opts: WaitOptions): Promise<ReviewWait> {
-  const { file, timeoutMs, pollIntervalMs, reReadGraceMs, stopWhen } = opts;
+  const { file, timeoutMs, pollIntervalMs, reReadGraceMs, stopWhen, canceled } = opts;
   const dir = dirname(file);
   const name = basename(file);
   const startedAt = Date.now();
@@ -499,6 +553,12 @@ function waitForReview(opts: WaitOptions): Promise<ReviewWait> {
 
     const readOnce = async (): Promise<void> => {
       if (done) return;
+      // A stopped review has no report, including the one that may be sitting there half
+      // written. See the `canceled` outcome above for why this is not over-caution.
+      if (canceled()) {
+        finish({ kind: 'canceled', waitedMs: Date.now() - startedAt });
+        return;
+      }
       let text: string;
       try {
         text = await readFile(file, 'utf8');
@@ -551,6 +611,10 @@ function waitForReview(opts: WaitOptions): Promise<ReviewWait> {
     // review — and then stop waiting for something nothing is going to produce.
     void stopWhen.then(async () => {
       if (done) return;
+      if (canceled()) {
+        finish({ kind: 'canceled', waitedMs: Date.now() - startedAt });
+        return;
+      }
       await check();
       if (!done) settle();
     });

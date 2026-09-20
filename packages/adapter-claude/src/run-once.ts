@@ -2,13 +2,22 @@ import { randomUUID } from 'node:crypto';
 import type {
   FrameBody,
   JournalMeta,
+  LiveOneShot,
+  OneShotRegistry,
   RunOnceError,
   RunOnceInput,
   RunOnceResult,
 } from '@pagr/bridge-core';
-import { newRunId, runOnceFrameMeta, runOnceSessionId } from '@pagr/bridge-core';
+import {
+  newRunId,
+  oneShotSummary,
+  runOnceFinalStatus,
+  runOnceFrameMeta,
+  runOnceSessionId,
+} from '@pagr/bridge-core';
+import type { InstructionDelivery, SessionStatus, SessionSummaryV2 } from '@pagr/protocol';
 import { ClaudeProcess } from './claude-process.js';
-import { clip } from './heuristics.js';
+import { clip, withImages } from './heuristics.js';
 import type { FileLogger } from './logger.js';
 
 /**
@@ -53,6 +62,19 @@ export interface ClaudeRunOnceOptions {
   logger: FileLogger;
   /** One frame the run produced. The adapter decides what to do with it. */
   onFrame?: (f: { body: FrameBody; meta: JournalMeta; endsTurn?: boolean }) => void;
+  /**
+   * Where the run registers itself while it is alive, so `listSessions`, `getStatus`,
+   * `sendInstruction` and `stopSession` can all find it. Absent in a unit test that only wants
+   * the outcome.
+   */
+  registry?: OneShotRegistry | undefined;
+  /** The run's row changed: a status, an active turn, a new `taskSummary` after a steer. */
+  onSession?: (session: SessionSummaryV2) => void;
+  /** One `session.event` for the run: `started`, `completed`, `failed`, `stopped`, follow-ups. */
+  onSessionEvent?: (
+    type: 'started' | 'completed' | 'failed' | 'stopped' | 'queued_followup' | 'followup_delivered',
+    summary: string,
+  ) => void;
 }
 
 export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceResult> {
@@ -73,6 +95,15 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
    * `failed: claude exited (code 0)` — the outcome the caller most needs to tell apart.
    */
   let killing: 'timeout' | 'canceled' | null = null;
+  /**
+   * Instructions a person sent while a turn was in flight, oldest first.
+   *
+   * Claude Code has no live steer (ADR 0001), so this is the same queue an ordinary Claude
+   * session keeps, drained at the same moment: `result`. A run with something in here does not
+   * end at `result` — it takes the next turn on the same process, exactly as `deliverQueued`
+   * does for a session.
+   */
+  const queued: Array<{ instruction: string; images: string[] }> = [];
 
   const proc = new ClaudeProcess({
     command: o.command,
@@ -98,6 +129,68 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
     let timer: NodeJS.Timeout | null = null;
     const onAbort = () => void end('canceled');
 
+    // ---- the row ----
+    //
+    // A run is a session while it lasts (HND-019), so it keeps exactly what a session keeps: a
+    // summary that changes, and events at the moments that matter.
+    const row: LiveOneShot = {
+      runId,
+      sessionId,
+      provider: 'claude',
+      kind: input.kind,
+      projectId: input.projectId,
+      startedAt: new Date(startedMs).toISOString(),
+      updatedAt: new Date(startedMs).toISOString(),
+      status: 'starting',
+      activeTurn: false,
+      send: async (instruction, images) => steer(instruction, images),
+      stop: async () => {
+        await end('canceled');
+      },
+    };
+    const publish = (patch: Partial<LiveOneShot> = {}): void => {
+      Object.assign(row, patch, { updatedAt: new Date().toISOString() });
+      const summary = oneShotSummary(row);
+      if (summary) o.onSession?.(summary);
+    };
+
+    /**
+     * Somebody said something to the run.
+     *
+     * Always `queued`, and that is the honest word rather than a soft one: Claude does not take
+     * an interrupt on its stdin, so the text really does wait for the turn boundary. It is the
+     * same answer `sendInstruction` gives for every other Claude session, and the phone already
+     * knows how to show it.
+     */
+    const steer = async (
+      instruction: string,
+      images: string[],
+    ): Promise<{ delivered: InstructionDelivery }> => {
+      if (settled || killing) throw new Error(`run ${runId} has already finished`);
+      queued.push({ instruction, images });
+      publish({ taskSummary: clip(instruction, 500) });
+      o.onSessionEvent?.('queued_followup', clip(instruction, 500));
+      return { delivered: 'queued' };
+    };
+
+    /** The next queued turn, on the same process. Null when there was nothing waiting. */
+    const deliverQueued = (): boolean => {
+      const next = queued.shift();
+      if (!next) return false;
+      try {
+        proc.sendUser(withImages(next.instruction, next.images));
+      } catch (err) {
+        o.logger.log('warn', 'a queued follow-up to a one-shot run could not be delivered', {
+          runId,
+          message: (err as Error).message,
+        });
+        return false;
+      }
+      publish({ status: 'working', activeTurn: true });
+      o.onSessionEvent?.('followup_delivered', clip(next.instruction, 500));
+      return true;
+    };
+
     const done = (
       outcome: RunOnceResult['outcome'],
       extra: { error?: RunOnceError; exitCode?: number | null } = {},
@@ -106,6 +199,15 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
       settled = true;
       if (timer) clearTimeout(timer);
       input.signal?.removeEventListener('abort', onAbort);
+      // Off the registry before anything else: a finished run must not be steerable or
+      // stoppable for the window in which its last frames are still being written.
+      o.registry?.remove(sessionId);
+      const status: SessionStatus = runOnceFinalStatus(outcome);
+      publish({ status, activeTurn: false });
+      o.onSessionEvent?.(
+        outcome === 'completed' ? 'completed' : outcome === 'canceled' ? 'stopped' : 'failed',
+        outcomeText(outcome, extra.error),
+      );
       o.logger.log('info', 'one-shot claude run finished', {
         runId,
         outcome,
@@ -189,11 +291,19 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
           // kill started.
           if (killing) return;
           if (ev.text.trim()) said.push(ev.text);
-          if (ev.ok) done('completed');
-          else
+          if (!ev.ok) {
             done('failed', {
               error: { code: 'agent_error', message: clip(ev.text || ev.subtype, 300) },
             });
+            proc.end();
+            return;
+          }
+          // The turn boundary is the only moment Claude accepts more input, so it is where a
+          // person's steer lands. Nothing is settled while something is waiting: the run has
+          // not finished, it has been given more to do.
+          publish({ activeTurn: false });
+          if (deliverQueued()) return;
+          done('completed');
           // Nothing more is coming; let the child exit on EOF rather than signalling it.
           proc.end();
           return;
@@ -235,6 +345,9 @@ export async function runClaudeOnce(o: ClaudeRunOnceOptions): Promise<RunOnceRes
       subtype: 'run_once_started',
       text: `Claude Code is running headless in ${input.cwd}.`,
     });
+    o.registry?.add(row);
+    publish({ status: 'working', activeTurn: true });
+    o.onSessionEvent?.('started', `Claude is ${runOnceWorkingOn(input.kind)}`);
 
     if (input.signal?.aborted) {
       void end('canceled');
@@ -263,4 +376,9 @@ function outcomeText(outcome: RunOnceResult['outcome'], error?: RunOnceError): s
     default:
       return `Headless run failed: ${error?.message ?? 'unknown error'}`;
   }
+}
+
+/** What the `started` event says the run is doing, in the same words the row's name uses. */
+function runOnceWorkingOn(kind: RunOnceInput['kind']): string {
+  return kind === 'handoff' ? 'writing the handoff' : 'reviewing the diff';
 }

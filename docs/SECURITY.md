@@ -440,10 +440,24 @@ Cloud-started `claude` children do not receive `PAGR_DAEMON_SOCK`.
 
 ## Headless runs: the handoff writer and the reviewer
 
-Handoff v1 added two runs that have no person attached to them. One writes the handoff note when
+Handoff v1 added two runs the bridge starts for a job of its own. One writes the handoff note when
 the sending agent can no longer be talked to; the other reads a commit range and writes a review.
-Both are started by the bridge, both end when their file appears or their timeout expires, and
-neither is offered as a session you can steer.
+Each ends when its file appears or its timeout expires.
+
+**They are sessions, and you can see them, stop them and talk to them.** Each appears in your
+session list while it runs, saying what it is doing ("Writing the handoff", "Reviewing the diff"),
+which agent is doing it and in which project. Stopping one stops it: the handoff or the review
+then resolves as *cancelled*, not as a failure and not as a timeout. An instruction sent to one
+reaches it the way an instruction reaches any other session of that agent — Codex steers the live
+turn, Claude queues it for the turn boundary — and you are told which of the two happened.
+
+Stopping the handoff writer deliberately leaves **nothing** behind: whatever it had half written
+is deleted rather than handed on, your working tree is not committed, and the sending agent is not
+stopped. A note that is missing its "Not done" and "Known failures" sections still parses, and
+starting the next agent on one would cause exactly the relitigated task the handoff exists to
+prevent. A stopped review is the same: its half-written report is never read, because the verdict
+is the first line of it and "approve" above findings that never arrived is the worst answer Pagr
+could give you.
 
 Otherwise they are ordinary agent runs: the same binary, in the same checkout, under your own
 subscription, with your own settings loaded, free to write your repository. They are not fenced

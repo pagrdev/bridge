@@ -1,4 +1,4 @@
-import type { Provider, SessionStatus } from '@pagr/protocol';
+import type { OneShotKind, Provider, SessionStatus } from '@pagr/protocol';
 import { readJson, writeJson } from './jsonFile.js';
 
 /**
@@ -42,6 +42,14 @@ export interface SessionRecord {
    * rule still holds after the project is unregistered — or removed and re-added under a new id.
    */
   projectPath?: string;
+  /**
+   * Set only on a synthesised row for a headless run in flight (HND-019).
+   *
+   * Never written to `sessions.json` — a run dies with the daemon, so a persisted record would
+   * come back claiming to be live with no process behind it. `daemon.ts`'s `sessions.list` adds
+   * these from the adapters at read time, which is the only place they exist.
+   */
+  oneShot?: { kind: OneShotKind; runId: string };
   startedAt: string;
   updatedAt: string;
 }

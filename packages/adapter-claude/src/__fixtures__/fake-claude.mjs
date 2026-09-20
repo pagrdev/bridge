@@ -35,6 +35,7 @@
 //                     inside the working directory happens with NO prompt at all; a write
 //                     outside it raises a can_use_tool request, and a denial means the file is
 //                     never written.
+//         "slow <word>" → an echo turn that takes 300 ms, so a test can steer into it
 //         "fail"   → result subtype error_during_execution
 //         "hang"   → no result until SIGINT (then result success "interrupted") / SIGTERM exits 143
 //         "crash"  → process.exit(7) mid-turn
@@ -284,6 +285,16 @@ function answerOf(questions, res) {
 async function handleUser(text) {
   init();
   if (/crash/i.test(text)) process.exit(7);
+  // "slow <word>" → an ordinary echo turn that takes long enough for a test to steer into it
+  // before it ends. Used to prove a queued follow-up really does run as the next turn on this
+  // same process (HND-019), which is the whole of Claude's "delivered: queued".
+  const slow = /^slow (\S+)/i.exec(text);
+  if (slow) {
+    await new Promise((r) => setTimeout(r, 300));
+    assistant([{ type: 'text', text: `Echo: ${slow[1]}` }]);
+    result(true, `Echo: ${slow[1]}`);
+    return;
+  }
   if (/hang/i.test(text)) {
     assistant([{ type: 'text', text: 'Working on it…' }]);
     await new Promise((resolve) => {

@@ -805,7 +805,34 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
     emit(makeEvent(dispatcherDeviceId(), 'project.removed', { projectId }, { now }));
     return { projectId };
   });
-  ipc.registerMethod('sessions.list', () => sessions.list());
+  /**
+   * Every session this Mac knows about, plus the headless runs in flight.
+   *
+   * The runs are added here rather than stored, because they are live state: `pagr sessions` is
+   * where a person looks for running work, and a review that is reading their diff right now
+   * belongs in that list even though it will never be in `sessions.json` (HND-019).
+   */
+  ipc.registerMethod('sessions.list', () => {
+    const out = [...sessions.list()];
+    const seen = new Set(out.map((r) => r.sessionId));
+    for (const adapter of o.adapters.values()) {
+      for (const run of adapter.oneShots?.() ?? []) {
+        if (seen.has(run.sessionId)) continue;
+        seen.add(run.sessionId);
+        out.push({
+          sessionId: run.sessionId,
+          provider: run.provider,
+          projectId: run.projectId ?? UNREGISTERED_PROJECT,
+          providerSessionId: run.sessionId,
+          status: run.status,
+          oneShot: { kind: run.kind, runId: run.runId },
+          startedAt: run.startedAt,
+          updatedAt: run.updatedAt,
+        });
+      }
+    }
+    return out;
+  });
   ipc.registerMethod('sessions.reconcile', async () =>
     (await daemon.reconcile()).map((c) => ({
       sessionId: c.record.sessionId,
@@ -1138,8 +1165,9 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       relativePath: `${REVIEW_DIR}/${reviewId}/review.md`,
     };
     // A review that ran and produced nothing is a failure, not a verdict. `no_report` is its own
-    // code so a script can tell "the reviewer never answered" from "the reviewer said block".
-    if (!end.ok) throw new IpcMethodError('no_report', end.message);
+    // code so a script can tell "the reviewer never answered" from "the reviewer said block" —
+    // and `canceled` is its own again, because "you stopped it" is neither of those.
+    if (!end.ok) throw new IpcMethodError(end.canceled ? 'canceled' : 'no_report', end.message);
     return {
       ...where,
       verdict: end.verdict,

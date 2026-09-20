@@ -18,13 +18,17 @@ import type {
   StartSessionInput,
 } from '@pagr/bridge-core';
 import {
+  type LiveOneShot,
   newRunId,
+  OneShotRegistry,
+  oneShotSummary,
+  runOnceFinalStatus,
   runOnceFrameMeta,
   runOnceSessionId,
   syntheticSessionId,
   UNREGISTERED_PROJECT,
 } from '@pagr/bridge-core';
-import type { ApprovalOption } from '@pagr/protocol';
+import type { ApprovalOption, InstructionDelivery } from '@pagr/protocol';
 import { AppServerClient, type AppServerTransportSpec } from './app-server.js';
 import {
   commandApprovalOptions,
@@ -284,6 +288,16 @@ interface RunState {
    * caller — is where the claim is enforced.
    */
   stopping: 'timeout' | 'canceled' | null;
+  /**
+   * Instructions a person sent while the turn was in flight and Codex would not take a steer —
+   * the window before `turn/start` has answered with a turn id. Drained the moment there is one,
+   * and again at every turn boundary.
+   */
+  queued: Array<{ instruction: string; images: string[] }>;
+  /** The run's session row, as `listSessions` and `getStatus` hand it out. */
+  row: LiveOneShot;
+  /** Push the row's latest state out as a `session` event. */
+  publish: (patch?: Partial<LiveOneShot>) => void;
   /** Resolves the run exactly once. */
   settle: (outcome: RunOnceResult['outcome'], error?: RunOnceError) => void;
 }
@@ -297,8 +311,15 @@ export class CodexAdapter implements CodingAgentAdapter {
   private readonly logger: FileLogger;
   private readonly sessions = new Map<string, LiveSession>();
   private readonly byThread = new Map<string, string>();
-  /** In-flight headless runs, by thread id. Never sessions; see `RunState`. */
+  /** In-flight headless runs, by thread id. */
   private readonly runs = new Map<string, RunState>();
+  /**
+   * The same runs, by the `ses_…` each is listed under (HND-019).
+   *
+   * Two keys because the two questions arrive by different doors: a notification off the
+   * app-server names a thread, and a person pressing stop on their phone names a session.
+   */
+  private readonly runSessions = new OneShotRegistry();
   private readonly pending = new Map<string, PendingApproval>();
   private readonly listeners = new Set<(e: AdapterEvent) => void>();
   private readonly map: SessionMap;
@@ -440,10 +461,19 @@ export class CodexAdapter implements CodingAgentAdapter {
       if (s.mirror && !s.summary.projectId) continue;
       out.set(sid, s.summary);
     }
+    // Last, so a live run always wins: it is the most recent truth about that id, and this is
+    // the list a person looks at to find running work.
+    for (const summary of this.runSessions.summaries()) out.set(summary.sessionId, summary);
     return [...out.values()];
   }
 
+  oneShots(): LiveOneShot[] {
+    return this.runSessions.list();
+  }
+
   async getStatus(sessionId: string): Promise<SessionSummaryV2 | null> {
+    const run = this.runSessions.get(sessionId);
+    if (run) return oneShotSummary(run);
     const live = this.sessions.get(sessionId);
     if (live) return live.summary;
     const p = this.map.get(sessionId);
@@ -566,6 +596,22 @@ export class CodexAdapter implements CodingAgentAdapter {
     const finished = new Promise<RunOnceResult>((resolve) => {
       settleRun = resolve;
     });
+    const row: LiveOneShot = {
+      runId,
+      sessionId,
+      provider: 'codex',
+      kind: input.kind,
+      projectId: input.projectId,
+      startedAt: new Date(startedMs).toISOString(),
+      updatedAt: new Date(startedMs).toISOString(),
+      status: 'starting',
+      activeTurn: false,
+      // Filled in below: both close over `run`, which does not exist yet.
+      send: async () => {
+        throw new Error(`run ${runId} is not ready`);
+      },
+      stop: async () => undefined,
+    };
     const run: RunState = {
       runId,
       sessionId,
@@ -574,6 +620,13 @@ export class CodexAdapter implements CodingAgentAdapter {
       turnId: null,
       said,
       stopping: null,
+      queued: [],
+      row,
+      publish: (patch = {}) => {
+        Object.assign(row, patch, { updatedAt: new Date().toISOString() });
+        const summary = oneShotSummary(row);
+        if (summary) this.emit({ kind: 'session', session: summary, localCwd: input.cwd });
+      },
       settle: (outcome, error) => {
         const resolve = settleRun;
         if (!resolve) return;
@@ -583,6 +636,15 @@ export class CodexAdapter implements CodingAgentAdapter {
         const decided = run.stopping ?? outcome;
         const reported = run.stopping ? undefined : error;
         this.runs.delete(threadId);
+        // Off the registry before the last frame goes out: a finished run must not be
+        // steerable or stoppable while its closing frames are still being written.
+        this.runSessions.remove(sessionId);
+        run.publish({ status: runOnceFinalStatus(decided), activeTurn: false });
+        this.runSessionEvent(
+          run,
+          decided === 'completed' ? 'completed' : decided === 'canceled' ? 'stopped' : 'failed',
+          runOutcomeText(decided, reported),
+        );
         this.logger.log('info', 'one-shot codex run finished', {
           runId,
           outcome: decided,
@@ -621,6 +683,34 @@ export class CodexAdapter implements CodingAgentAdapter {
       meta: runOnceFrameMeta(runId, 'app_server'),
     });
 
+    /**
+     * Somebody said something to the run.
+     *
+     * Codex takes a real steer — `turn/steer` against the live turn — so the honest answer is
+     * `steered`, the same answer an ordinary Codex session gives. The only case that is not is
+     * the sliver before `turn/start` has answered with a turn id: there is nothing to steer yet,
+     * so the text waits, which is `queued`.
+     */
+    const steer = async (
+      instruction: string,
+      images: string[],
+    ): Promise<{ delivered: InstructionDelivery }> => {
+      if (!settleRun || run.stopping) throw new Error(`run ${runId} has already finished`);
+      run.publish({ taskSummary: clip(instruction, 500) });
+      if (!run.turnId) {
+        run.queued.push({ instruction, images });
+        this.runSessionEvent(run, 'queued_followup', clip(instruction, 500));
+        return { delivered: 'queued' };
+      }
+      await client.request<TurnSteerResponse>(METHODS.turnSteer, {
+        threadId,
+        input: buildInput(instruction, images),
+        expectedTurnId: run.turnId,
+      });
+      this.runSessionEvent(run, 'followup_delivered', clip(instruction, 500));
+      return { delivered: 'steered' };
+    };
+
     const stop = async (outcome: 'timeout' | 'canceled'): Promise<void> => {
       // Already resolved on its own merits: there is no turn left to interrupt, and claiming an
       // outcome for a run that finished before we decided anything would rewrite a real result.
@@ -639,6 +729,18 @@ export class CodexAdapter implements CodingAgentAdapter {
       }
       run.settle(outcome);
     };
+    row.send = steer;
+    row.stop = async () => {
+      await stop('canceled');
+    };
+    this.runSessions.add(row);
+    run.publish({ status: 'working', activeTurn: true });
+    this.runSessionEvent(
+      run,
+      'started',
+      `Codex is ${input.kind === 'handoff' ? 'writing the handoff' : 'reviewing the diff'}`,
+    );
+
     const timer = setTimeout(() => void stop('timeout'), input.timeoutMs);
     timer.unref();
     const onAbort = () => void stop('canceled');
@@ -651,7 +753,10 @@ export class CodexAdapter implements CodingAgentAdapter {
         runOnceTurnParams(threadId, input),
       );
       // A turn the stream already completed must not be revived by its own late response.
-      if (this.runs.has(threadId)) run.turnId = res.turn.id;
+      if (this.runs.has(threadId)) {
+        run.turnId = res.turn.id;
+        void this.drainRunQueue(run, client);
+      }
     } catch (err) {
       // A `turn/start` that failed BECAUSE we interrupted the turn is not a failure to start.
       if (!run.stopping)
@@ -667,6 +772,7 @@ export class CodexAdapter implements CodingAgentAdapter {
       clearTimeout(timer);
       input.signal?.removeEventListener('abort', onAbort);
       this.runs.delete(threadId);
+      this.runSessions.remove(sessionId);
       // Best effort: the thread is finished with, and leaving it subscribed on the user's own
       // shared daemon means the bridge keeps receiving notifications nobody reads.
       await this.client?.request(METHODS.threadUnsubscribe, { threadId }).catch(() => {});
@@ -676,6 +782,10 @@ export class CodexAdapter implements CodingAgentAdapter {
   async sendInstruction(
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
+    // A headless run Pagr started. Its thread is ours and its turn is live, so Codex takes a
+    // real steer — the same `turn/steer` an ordinary session gets, reported the same way.
+    const run = this.runSessions.get(input.sessionId);
+    if (run) return run.send(input.instruction, input.localImagePaths);
     const live = await this.requireLive(input.sessionId);
     // The thread's own process holds its writer lock (openai/codex#44449): a second writer is
     // refused by Codex itself, and pretending otherwise would lose the user's instruction.
@@ -700,6 +810,13 @@ export class CodexAdapter implements CodingAgentAdapter {
   }
 
   async stopSession(sessionId: string): Promise<void> {
+    // A run stops the way it was always able to: the abort path, reached from the user-facing
+    // stop instead of only from a dying daemon.
+    const run = this.runSessions.get(sessionId);
+    if (run) {
+      await run.stop();
+      return;
+    }
     const live = this.sessions.get(sessionId);
     if (!live) return;
     if (live.mirror) throw new Error(MIRROR_READ_ONLY);
@@ -749,6 +866,10 @@ export class CodexAdapter implements CodingAgentAdapter {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     this.clearIdleTimer();
+    // Stop them first, so each settles as `canceled` — what it is — rather than being swept up
+    // by `failRuns` as though the agent had broken. `failRuns` stays as the backstop for
+    // anything the stop could not reach.
+    await this.runSessions.stopAll();
     this.failRuns('the bridge is shutting down');
     if (this.restartTimer) clearTimeout(this.restartTimer);
     for (const p of [...this.pending.values()]) {
@@ -1536,6 +1657,55 @@ export class CodexAdapter implements CodingAgentAdapter {
   // ---- headless runs ----
 
   /** One frame from a run. Marked as a run's, mirrored under an id nobody can talk to. */
+  /**
+   * One `session.event` for a run.
+   *
+   * Same rule as `runFrame`: an event that names no project is an event the cloud cannot route,
+   * so it stays on this Mac rather than going out addressed to nothing.
+   */
+  private runSessionEvent(
+    run: RunState,
+    type: 'started' | 'completed' | 'failed' | 'stopped' | 'queued_followup' | 'followup_delivered',
+    summary: string,
+  ): void {
+    if (!run.projectId) return;
+    this.emit({
+      kind: 'session_event',
+      sessionId: run.sessionId,
+      projectId: run.projectId,
+      type,
+      summary,
+    });
+  }
+
+  /**
+   * Deliver whatever was said to a run before it had a turn to steer.
+   *
+   * Only ever non-empty for the sliver between `turn/start` going out and its response coming
+   * back; a person is fast enough to hit it, and losing their sentence there would be the kind
+   * of silent drop this whole ticket exists to stop.
+   */
+  private async drainRunQueue(run: RunState, client: AppServerClient): Promise<void> {
+    while (run.queued.length > 0 && run.turnId && !run.stopping) {
+      const next = run.queued.shift();
+      if (!next) return;
+      try {
+        await client.request<TurnSteerResponse>(METHODS.turnSteer, {
+          threadId: run.threadId,
+          input: buildInput(next.instruction, next.images),
+          expectedTurnId: run.turnId,
+        });
+        this.runSessionEvent(run, 'followup_delivered', clip(next.instruction, 500));
+      } catch (err) {
+        this.logger.log('warn', 'a queued follow-up to a one-shot run could not be delivered', {
+          runId: run.runId,
+          message: (err as Error).message,
+        });
+        return;
+      }
+    }
+  }
+
   private runFrame(run: RunState, f: MappedFrame): void {
     if (this.opts.frames === false) return;
     // No project means no route: journaled by nobody, sent to nobody — as with a mirrored

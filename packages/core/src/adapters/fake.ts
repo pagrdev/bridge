@@ -1,4 +1,17 @@
-import type { AgentConnectionStatus, Provider, SessionSummary } from '@pagr/protocol';
+import type {
+  AgentConnectionStatus,
+  InstructionDelivery,
+  OneShotKind,
+  Provider,
+  SessionSummary,
+} from '@pagr/protocol';
+import type { LiveOneShot, RunOnceInput, RunOnceOutcome } from './runOnce.js';
+import {
+  OneShotRegistry,
+  oneShotSummary,
+  runOnceFinalStatus,
+  runOnceSessionId,
+} from './runOnce.js';
 import type {
   AdapterEvent,
   CodingAgentAdapter,
@@ -15,6 +28,14 @@ export class FakeAdapter implements CodingAgentAdapter {
   readonly sessions = new Map<string, SessionSummary>();
   private listeners = new Set<(e: AdapterEvent) => void>();
   canSteer = true;
+  /**
+   * Headless runs this fake has in flight, exactly as a real adapter keeps them (HND-019).
+   *
+   * A test registers one with {@link trackOneShot} from inside whatever `runOnce` it injected,
+   * and from then on the run is listed, answered by `getStatus`, steerable and stoppable through
+   * the ordinary session methods — which is the behaviour under test.
+   */
+  readonly oneShotRuns = new OneShotRegistry();
   failNext: Error | null = null;
   now: () => Date = () => new Date();
 
@@ -53,9 +74,88 @@ export class FakeAdapter implements CodingAgentAdapter {
       },
     };
   }
+  oneShots(): LiveOneShot[] {
+    return this.oneShotRuns.list();
+  }
+
+  /**
+   * Register a headless run, the way `runClaudeOnce` and the Codex adapter do.
+   *
+   * Returns the handle the test drives it with: `finish` settles it the way the agent would, and
+   * `stopped` says whether somebody stopped it first.
+   */
+  trackOneShot(
+    input: Pick<RunOnceInput, 'kind' | 'cwd' | 'projectId'> & { runId: string },
+    o: {
+      onStop: () => void;
+      /** What a steer reports. Defaults to `steered`, which is what Codex does. */
+      delivery?: InstructionDelivery;
+    },
+  ): { sessionId: string; finish: (outcome: RunOnceOutcome) => void } {
+    const sessionId = runOnceSessionId(this.provider, input.runId);
+    const at = this.now().toISOString();
+    const row: LiveOneShot = {
+      runId: input.runId,
+      sessionId,
+      provider: this.provider,
+      kind: input.kind as OneShotKind,
+      projectId: input.projectId,
+      startedAt: at,
+      updatedAt: at,
+      status: 'working',
+      activeTurn: true,
+      send: async (instruction) => {
+        this.record('oneShotSend', { sessionId, instruction });
+        row.taskSummary = instruction;
+        this.publishOneShot(row);
+        return { delivered: o.delivery ?? 'steered' };
+      },
+      stop: async () => {
+        this.record('oneShotStop', sessionId);
+        o.onStop();
+      },
+    };
+    this.oneShotRuns.add(row);
+    this.publishOneShot(row);
+    if (input.projectId)
+      this.push({
+        kind: 'session_event',
+        sessionId,
+        projectId: input.projectId,
+        type: 'started',
+        summary: `working on the ${row.kind}`,
+      });
+    return {
+      sessionId,
+      finish: (outcome) => {
+        this.oneShotRuns.remove(sessionId);
+        row.status = runOnceFinalStatus(outcome);
+        row.activeTurn = false;
+        row.updatedAt = this.now().toISOString();
+        this.publishOneShot(row);
+        if (input.projectId)
+          this.push({
+            kind: 'session_event',
+            sessionId,
+            projectId: input.projectId,
+            type:
+              outcome === 'completed' ? 'completed' : outcome === 'canceled' ? 'stopped' : 'failed',
+            summary: `run ${outcome}`,
+          });
+      },
+    };
+  }
+
+  private publishOneShot(row: LiveOneShot): void {
+    const summary = oneShotSummary(row);
+    if (summary) this.push({ kind: 'session', session: summary });
+  }
+
   async listSessions(): Promise<SessionSummary[]> {
     this.record('listSessions', undefined);
-    return [...this.sessions.values()];
+    const out = new Map<string, SessionSummary>([...this.sessions]);
+    for (const s of this.oneShotRuns.summaries()) out.set(s.sessionId, s);
+    return [...out.values()];
   }
   async startSession(input: StartSessionInput): Promise<SessionSummary> {
     this.record('startSession', input);
@@ -77,6 +177,8 @@ export class FakeAdapter implements CodingAgentAdapter {
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
     this.record('sendInstruction', input);
+    const run = this.oneShotRuns.get(input.sessionId);
+    if (run) return run.send(input.instruction, input.localImagePaths);
     const s = this.sessions.get(input.sessionId);
     if (input.mode === 'steer') return { delivered: 'steered' };
     if (s && !s.activeTurn) {
@@ -87,11 +189,18 @@ export class FakeAdapter implements CodingAgentAdapter {
   }
   async stopSession(sessionId: string): Promise<void> {
     this.record('stopSession', sessionId);
+    const run = this.oneShotRuns.get(sessionId);
+    if (run) {
+      await run.stop();
+      return;
+    }
     const s = this.sessions.get(sessionId);
     if (s) this.sessions.set(sessionId, { ...s, status: 'stopped', activeTurn: false });
   }
   async getStatus(sessionId: string): Promise<SessionSummary | null> {
     this.record('getStatus', sessionId);
+    const run = this.oneShotRuns.get(sessionId);
+    if (run) return oneShotSummary(run);
     return this.sessions.get(sessionId) ?? null;
   }
   async respondToApproval(input: {

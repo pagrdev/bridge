@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { CommandBody, DeviceEvent, EventPayload, Provider } from '@pagr/protocol';
 import { DeviceEvent as DeviceEventSchema } from '@pagr/protocol';
@@ -22,6 +22,10 @@ const RANGE = 'HEAD~1..HEAD';
 const HEAD_SHA = '7'.repeat(40);
 
 type AckPayload = EventPayload<'command.ack'>;
+type HelloPayload = EventPayload<'device.hello'>;
+type SessionUpdatedPayload = EventPayload<'session.updated'>;
+type SessionEventPayload = EventPayload<'session.event'>;
+type CanceledPayload = EventPayload<'review.canceled'>;
 type CompletedPayload = EventPayload<'review.completed'>;
 type FramePayload = EventPayload<'session.frame'>;
 
@@ -80,6 +84,13 @@ describe('review.start / review.apply', () => {
   let d: Dispatcher;
   /** What the reviewing agent writes into `review.md`, and when. */
   let report: { body: string; afterMs: number } | null;
+  /**
+   * Bytes a killed reviewer leaves behind, written the instant the run is called off.
+   *
+   * It is the shape of the real hazard: a `Write` that had flushed the verdict line and not the
+   * findings under it. Nothing should ever read this.
+   */
+  let partialOnCancel: string | null;
 
   beforeEach(() => {
     now = new Date('2026-09-20T09:00:00.000Z');
@@ -90,6 +101,7 @@ describe('review.start / review.apply', () => {
       body: 'verdict: block — the retry never terminates\n\n### src/send.ts:12\n',
       afterMs: 5,
     };
+    partialOnCancel = null;
     codex = new FakeAdapter('codex');
     claude = new FakeAdapter('claude');
     const home = join(t.home, 'home');
@@ -112,25 +124,39 @@ describe('review.start / review.apply', () => {
             writeFileSync(file, pending.body);
           }, pending.afterMs)
         : null;
+      // Registered the way a real adapter registers one, so the run is listed, steerable and
+      // stoppable through the ordinary session methods while it lasts (HND-019).
+      let resolveRun: (() => void) | null = null;
+      const finish = () => {
+        if (timer) clearTimeout(timer);
+        resolveRun?.();
+        resolveRun = null;
+      };
+      const cancel = () => {
+        aborted = true;
+        if (partialOnCancel !== null) {
+          const file = join(input.cwd, '.pagr', 'review', REVIEW_ID, 'review.md');
+          mkdirSync(dirname(file), { recursive: true });
+          writeFileSync(file, partialOnCancel);
+        }
+        finish();
+      };
+      const runId = input.runId ?? 'run_fake';
+      const tracked = codex.trackOneShot(
+        { runId, kind: input.kind, cwd: input.cwd, projectId: input.projectId },
+        { onStop: cancel },
+      );
       await new Promise<void>((resolve) => {
-        const finish = () => {
-          if (timer) clearTimeout(timer);
-          resolve();
-        };
+        resolveRun = resolve;
         if (!pending) setTimeout(finish, 5);
-        input.signal?.addEventListener(
-          'abort',
-          () => {
-            aborted = true;
-            finish();
-          },
-          { once: true },
-        );
+        input.signal?.addEventListener('abort', cancel, { once: true });
       });
+      const outcome = aborted ? ('canceled' as const) : ('completed' as const);
+      tracked.finish(outcome);
       return {
-        runId: input.runId ?? 'run_fake',
-        sessionId: 'ses_fake',
-        outcome: aborted ? 'canceled' : 'completed',
+        runId,
+        sessionId: tracked.sessionId,
+        outcome,
         output: '',
         durationMs: 1,
       };
@@ -364,5 +390,151 @@ describe('review.start / review.apply', () => {
   it('refuses a review it has never heard of rather than guessing a project', async () => {
     const applied = await d.handle(command('review.apply', { reviewId: `rev_${'e'.repeat(32)}` }));
     expect(ack(applied)).toMatchObject({ status: 'failed', errorCode: 'unknown_session' });
+  });
+
+  // ---------- HND-019: the run is a visible, steerable, stoppable session ----------
+
+  /**
+   * The row is the whole point of the ticket. These four tests fail the moment a reviewer stops
+   * appearing where a person looks for running work, stops being stoppable, or starts reporting
+   * a stop as a failure.
+   */
+  describe('the reviewer is a session', () => {
+    /** The `ses_…` the reviewer is listed under, once it is live. */
+    const reviewerSession = async (): Promise<string> => {
+      const until = Date.now() + 2_000;
+      while (codex.oneShots().length === 0) {
+        if (Date.now() > until) throw new Error('the reviewer never became visible');
+        await new Promise((r) => setTimeout(r, 2));
+      }
+      return codex.oneShots()[0]?.sessionId ?? '';
+    };
+
+    it('appears in device.hello and in session.updated while it runs', async () => {
+      report = null; // it never writes, so it stays live until we stop it
+      const started = start();
+      const sessionId = await reviewerSession();
+
+      const hello = (await d.probe()) as HelloPayload;
+      const row = hello.sessions.find((s) => s.sessionId === sessionId);
+      expect(row).toBeDefined();
+      expect(row).toMatchObject({
+        provider: 'codex',
+        projectId,
+        status: 'working',
+        displayName: 'Reviewing the diff',
+        controlLevel: 'full',
+        origin: 'pagr',
+      });
+      expect(row?.oneShot?.kind).toBe('review');
+      // The row and the frames nested under it share one id, so a client can join them.
+      expect(row?.oneShot?.runId).toBe(codex.oneShots()[0]?.runId);
+
+      const updated = events
+        .filter((e) => e.type === 'session.updated')
+        .map((e) => e.payload as SessionUpdatedPayload);
+      expect(updated.some((u) => u.sessionId === sessionId && u.oneShot !== undefined)).toBe(true);
+      expect(
+        events
+          .filter((e) => e.type === 'session.event')
+          .map((e) => e.payload as SessionEventPayload)
+          .some((p) => p.sessionId === sessionId && p.kind === 'started'),
+      ).toBe(true);
+
+      await d.handle(command('agent.stop_session', { sessionId }));
+      await started;
+      await d.settleReviews();
+    });
+
+    it('stops on agent.stop_session, and the review ends canceled rather than failed', async () => {
+      report = null;
+      const started = start();
+      const sessionId = await reviewerSession();
+
+      const stopped = await d.handle(command('agent.stop_session', { sessionId }));
+      expect(ack(stopped)).toMatchObject({ status: 'completed' });
+      await started;
+      await d.settleReviews();
+
+      // The review's own terminal event says "stopped", and there is no verdict anywhere.
+      const canceled = events
+        .filter((e) => e.type === 'review.canceled')
+        .map((e) => e.payload as CanceledPayload);
+      expect(canceled).toHaveLength(1);
+      expect(canceled[0]?.reviewId).toBe(REVIEW_ID);
+      expect(canceled[0]?.message).toContain('stopped');
+      expect(completed()).toEqual([]);
+      // Not a failure: the session event is `stopped`, not `failed`.
+      const evs = events
+        .filter((e) => e.type === 'session.event')
+        .map((e) => e.payload as SessionEventPayload)
+        .filter((p) => p.sessionId === sessionId);
+      expect(evs.at(-1)?.kind).toBe('stopped');
+      expect(evs.some((p) => p.kind === 'failed')).toBe(false);
+    });
+
+    it('never salvages the half-written report a kill leaves behind', async () => {
+      // A partial report still parses — the verdict is the FIRST line — so reading it would turn
+      // "I stopped the review" into "the review approved your change".
+      report = null;
+      partialOnCancel = 'verdict: approve — looks fine\n\n### the findings that never arriv';
+      const started = start();
+      const sessionId = await reviewerSession();
+
+      await d.handle(command('agent.stop_session', { sessionId }));
+      await started;
+      await d.settleReviews();
+
+      // The bytes really are there…
+      expect(readFileSync(join(repo, '.pagr', 'review', REVIEW_ID, 'review.md'), 'utf8')).toContain(
+        'verdict: approve',
+      );
+      // …and nothing read them.
+      expect(completed()).toEqual([]);
+      expect(reviewFrames()).toEqual([]);
+      expect(events.filter((e) => e.type === 'review.canceled')).toHaveLength(1);
+    });
+
+    it('takes an instruction mid-run and reports how it landed', async () => {
+      report = null;
+      const started = start();
+      const sessionId = await reviewerSession();
+
+      const sent = await d.handle(
+        command('agent.send_instruction', {
+          sessionId,
+          instruction: 'focus on the auth path',
+          mode: 'auto',
+          attachments: [],
+        }),
+      );
+      // Codex steers a live turn; the delivery word is the one the rest of the product uses.
+      expect(ack(sent)).toMatchObject({ status: 'completed', result: { delivered: 'steered' } });
+      expect(codex.calls.filter((c) => c.method === 'oneShotSend')).toHaveLength(1);
+
+      await d.handle(command('agent.stop_session', { sessionId }));
+      await started;
+      await d.settleReviews();
+    });
+
+    it('refuses to hand off FROM a reviewer, by name', async () => {
+      report = null;
+      const started = start();
+      const sessionId = await reviewerSession();
+
+      const refused = await d.handle(
+        command('session.handoff.capture', {
+          handoffId: `hnd_${'f'.repeat(32)}`,
+          sessionId,
+          to: 'claude',
+        }),
+      );
+      expect(ack(refused)).toMatchObject({ status: 'failed', errorCode: 'capability_unsupported' });
+      expect(ack(refused).message).toContain('reviewing your diff');
+
+      await d.handle(command('agent.stop_session', { sessionId }));
+      await started;
+      await d.settleReviews();
+    });
   });
 });

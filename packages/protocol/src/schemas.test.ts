@@ -679,6 +679,7 @@ describe('handoff.v1 — events', () => {
       'running',
       'done',
       'failed',
+      'canceled',
     ]);
   });
 
