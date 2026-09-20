@@ -75,6 +75,8 @@ export const V2_ONLY_EVENTS: ReadonlySet<EventType> = new Set<EventType>([
   'question.asked',
   'question.answered',
   'approval.applied',
+  'handoff.updated',
+  'review.completed',
 ]);
 
 export interface AuthFailure {

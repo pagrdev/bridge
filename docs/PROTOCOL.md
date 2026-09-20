@@ -106,6 +106,7 @@ something that would fail:
 | `repo_scan.v1` | `PAGR_REMOTE_PROJECT_PICK` is not `0` | `repo.scan`, `project.register_handle` |
 | `keep_awake.v1` | macOS, and `PAGR_KEEP_AWAKE` is not `0` | the "your Mac will not idle-sleep while this runs" promise |
 | `channel.v1` | the Claude channel is registered on this Mac | giving a terminal Claude session a turn from the phone |
+| `handoff.v1` | this Mac has a handoff engine wired up | `session.handoff.capture`, `review.start`, `review.apply`, `rules.migrate`, the `handoff.updated` / `review.completed` events and the `handoff` / `review` frame kinds |
 
 A v2-only command sent on a v1 link acks `failed` / `not_negotiated`; one whose capability is
 absent acks `failed` / `capability_unsupported`. The two are different answers to different
@@ -232,6 +233,28 @@ Both commands are v2, are gated on `PAGR_REMOTE_PROJECT_PICK` (default on) and a
 `repo_scan.v1` in `device.hello.capabilities` exactly when they will run. With the flag off they
 ack `failed` / `capability_unsupported`. A second `repo.scan` within 30 s acks `failed` /
 `rate_limited`. `docs/SECURITY.md` § "Projects a phone can add" states what this widens.
+
+### Handing a task over, and reviewing one
+
+Four commands let a person say "hand this to codex" or "have codex review this" from their phone
+and have it happen on their Mac. They are v2 commands behind `handoff.v1`, all `mutate` risk:
+
+| Command | What it does here |
+| --- | --- |
+| `session.handoff.capture` | writes `<repo>/.pagr/handoff/<hnd_…>.md` for one session and, if the tree is dirty, WIP-commits it. Acks `{writer, summary, wipCommit?, filesChanged, truncated}` |
+| `review.start` | builds a review packet for a commit range — the diff plus one line of intent, never a transcript — and starts the reviewing agent read-only on it. Acks `{reviewId}` |
+| `review.apply` | sends a finished review's findings to the builder. Never automatic: it is the answer to a person saying *fix it* |
+| `rules.migrate` | decides the one `CLAUDE.md` ↔ `AGENTS.md` conversion a switch may need, and performs it only with `consent: true`. Acks `{action, sourceFile?, lineCount?, targetFile?}` and never modifies an existing rules file |
+
+The file itself never travels in the clear: the cloud gets the `# Goal` line as `summary` and,
+sealed, a frame of kind `handoff` (a review report is a frame of kind `review`). The transcript a
+handoff is written from stays on the Mac in every path. `handoff.updated` reports each state of a
+switch — `requested → capturing → committing → stopping → starting → running → done`, or `failed`
+with a reason — and `review.completed` carries the verdict line.
+
+`agent.start_session` grew `context?: { handoffId?, reviewId? }` for this, which is how a session
+the bridge starts is joined to the switch that asked for it. It is optional, and so is everything
+inside it: a payload written before any of this existed parses exactly as it did.
 
 ### History and backfill
 

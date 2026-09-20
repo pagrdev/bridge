@@ -9,8 +9,13 @@ import {
   DeviceEvent,
   FrameKind,
   GatewayFrame,
+  GitRange,
+  HandoffCaptureResult,
+  HandoffState,
   RECIPIENT_KEY_SET_CONTEXT,
   RepoScanResult,
+  ReviewStartResult,
+  RulesMigrateResult,
   SEAL_CONTEXT,
   SealedEnvelope,
   SendInstructionResult,
@@ -261,6 +266,8 @@ describe('protocol v2 — sealed frames', () => {
       'approval_preview',
       'system',
       'imessage',
+      'handoff',
+      'review',
     ]);
   });
 });
@@ -536,5 +543,253 @@ describe('protocol v2 — gateway frames', () => {
     expect(GatewayFrame.safeParse({ kind: 'auth.challenge', nonce: 'n'.repeat(40) }).success).toBe(
       true,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handoff.v1
+//
+// The switch and the review, added on top of v2 and gated on a named capability rather than on a
+// version. Everything here is additive: the cases above that pin v1 shapes are the proof.
+// ---------------------------------------------------------------------------
+
+const hnd = `hnd_${hex32}`;
+const rev = `rev_${hex32}`;
+const cmd = (type: string, payload: unknown) => CommandBody.safeParse({ ...base, type, payload });
+
+describe('handoff.v1 — commands', () => {
+  it('parses a capture, with and without the optional note', () => {
+    const payload = { handoffId: hnd, sessionId: `ses_${hex32}`, to: 'codex' as const };
+    expect(cmd('session.handoff.capture', payload).success).toBe(true);
+    expect(
+      cmd('session.handoff.capture', { ...payload, note: 'focus on the refund path' }).success,
+    ).toBe(true);
+  });
+
+  it('parses review.start, review.apply and rules.migrate', () => {
+    expect(
+      cmd('review.start', {
+        reviewId: rev,
+        projectId: `proj_${hex32}`,
+        reviewer: 'codex',
+        range: 'HEAD~1..HEAD',
+        intent: 'add partial refunds to the checkout API',
+      }).success,
+    ).toBe(true);
+    expect(cmd('review.apply', { reviewId: rev }).success).toBe(true);
+    expect(cmd('review.apply', { reviewId: rev, sessionId: `ses_${hex32}` }).success).toBe(true);
+    expect(
+      cmd('rules.migrate', {
+        projectId: `proj_${hex32}`,
+        from: 'claude',
+        to: 'codex',
+        consent: false,
+      }).success,
+    ).toBe(true);
+  });
+
+  it('refuses a malformed handoff or review id', () => {
+    expect(
+      cmd('session.handoff.capture', {
+        handoffId: 'hnd_not-hex',
+        sessionId: `ses_${hex32}`,
+        to: 'codex',
+      }).success,
+    ).toBe(false);
+    // A session id where a handoff id belongs is a different object, not a near miss.
+    expect(
+      cmd('session.handoff.capture', {
+        handoffId: `ses_${hex32}`,
+        sessionId: `ses_${hex32}`,
+        to: 'codex',
+      }).success,
+    ).toBe(false);
+    expect(cmd('review.apply', { reviewId: `rev_${'a'.repeat(31)}` }).success).toBe(false);
+    // And a path is still a path wherever it is put.
+    expect(cmd('review.apply', { reviewId: '/Users/x/code' }).success).toBe(false);
+  });
+
+  it('refuses a range that is not a commit range', () => {
+    const start = (range: string) =>
+      cmd('review.start', {
+        reviewId: rev,
+        projectId: `proj_${hex32}`,
+        reviewer: 'claude',
+        range,
+        intent: 'x',
+      }).success;
+    expect(start('origin/main..HEAD')).toBe(true);
+    expect(start('main...feat/refunds')).toBe(true);
+    expect(start('HEAD')).toBe(false);
+    // Nothing that could reach `git` as a flag or a second word.
+    expect(start('--upload-pack=touch x..HEAD')).toBe(false);
+    expect(start('a..b; rm -rf /')).toBe(false);
+    expect(GitRange.safeParse('HEAD~1..HEAD').success).toBe(true);
+  });
+
+  it('adds `context` to start_session without disturbing a v1 payload', () => {
+    const v1 = {
+      provider: 'codex' as const,
+      projectId: `proj_${hex32}`,
+      sessionId: `ses_${hex32}`,
+      instruction: 'run tests',
+    };
+    const plain = cmd('agent.start_session', v1);
+    expect(plain.success).toBe(true);
+    if (plain.success && plain.data.type === 'agent.start_session') {
+      expect(plain.data.payload.context).toBeUndefined();
+    }
+    const withContext = cmd('agent.start_session', {
+      ...v1,
+      instruction: 'Read .pagr/handoff/hnd_…md and continue the task.',
+      context: { handoffId: hnd },
+    });
+    expect(withContext.success).toBe(true);
+    if (withContext.success && withContext.data.type === 'agent.start_session') {
+      expect(withContext.data.payload.context?.handoffId).toBe(hnd);
+    }
+    expect(cmd('agent.start_session', { ...v1, context: { reviewId: rev } }).success).toBe(true);
+    // Empty is legal (nothing is required inside it); a bad id inside it is not.
+    expect(cmd('agent.start_session', { ...v1, context: {} }).success).toBe(true);
+    expect(cmd('agent.start_session', { ...v1, context: { handoffId: 'hnd_x' } }).success).toBe(
+      false,
+    );
+  });
+
+  it('still has no generic shell or filesystem command', () => {
+    for (const forbidden of ['shell', 'exec', 'filesystem', 'spawn', 'read_any', 'write_any']) {
+      expect(CommandType.options.some((t) => t.includes(forbidden))).toBe(false);
+    }
+  });
+});
+
+describe('handoff.v1 — events', () => {
+  it('walks every state of a switch on handoff.updated', () => {
+    for (const state of HandoffState.options) {
+      expect(
+        DeviceEvent.safeParse(event('handoff.updated', { handoffId: hnd, state })).success,
+      ).toBe(true);
+    }
+    expect(HandoffState.options).toEqual([
+      'requested',
+      'capturing',
+      'committing',
+      'stopping',
+      'starting',
+      'running',
+      'done',
+      'failed',
+    ]);
+  });
+
+  it('carries the per-step fields, and refuses a state or a writer it has never heard of', () => {
+    const full = DeviceEvent.safeParse(
+      event('handoff.updated', {
+        handoffId: hnd,
+        state: 'committing',
+        summary: 'Add partial refunds to the checkout API',
+        wipCommit: '7a1d3f9',
+        writer: 'sender',
+        filesChanged: 3,
+        truncated: false,
+      }),
+    );
+    expect(full.success).toBe(true);
+    if (full.success && full.data.type === 'handoff.updated') {
+      expect(full.data.payload.writer).toBe('sender');
+      expect(full.data.payload.filesChanged).toBe(3);
+    }
+    expect(
+      DeviceEvent.safeParse(
+        event('handoff.updated', {
+          handoffId: hnd,
+          state: 'failed',
+          error: 'pre-commit hook failed',
+        }),
+      ).success,
+    ).toBe(true);
+    expect(
+      DeviceEvent.safeParse(event('handoff.updated', { handoffId: hnd, state: 'compacting' }))
+        .success,
+    ).toBe(false);
+    expect(
+      DeviceEvent.safeParse(
+        event('handoff.updated', { handoffId: hnd, state: 'capturing', writer: 'cloud' }),
+      ).success,
+    ).toBe(false);
+    // A branch name is not a commit.
+    expect(
+      DeviceEvent.safeParse(
+        event('handoff.updated', { handoffId: hnd, state: 'committing', wipCommit: 'HEAD' }),
+      ).success,
+    ).toBe(false);
+  });
+
+  it('parses review.completed for each verdict and refuses any other', () => {
+    for (const verdict of ['approve', 'comment', 'block']) {
+      expect(
+        DeviceEvent.safeParse(
+          event('review.completed', { reviewId: rev, verdict, summary: 'refund path skips auth' }),
+        ).success,
+      ).toBe(true);
+    }
+    expect(
+      DeviceEvent.safeParse(
+        event('review.completed', { reviewId: rev, verdict: 'lgtm', summary: 'fine' }),
+      ).success,
+    ).toBe(false);
+    expect(
+      DeviceEvent.safeParse(event('review.completed', { reviewId: rev, verdict: 'approve' }))
+        .success,
+    ).toBe(false);
+  });
+});
+
+describe('handoff.v1 — ack results', () => {
+  it('types the capture ack, defaulting the two fields a clean tree leaves out', () => {
+    const clean = HandoffCaptureResult.safeParse({
+      writer: 'receiver',
+      summary: 'Finish the refunds endpoint',
+    });
+    expect(clean.success).toBe(true);
+    if (clean.success) {
+      expect(clean.data.wipCommit).toBeUndefined();
+      expect(clean.data.filesChanged).toBe(0);
+      expect(clean.data.truncated).toBe(false);
+    }
+    expect(
+      HandoffCaptureResult.safeParse({
+        writer: 'sender',
+        summary: 'Finish the refunds endpoint',
+        wipCommit: '7a1d3f9c',
+        filesChanged: 3,
+        truncated: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      HandoffCaptureResult.safeParse({ writer: 'sender', summary: 'x', filesChanged: -1 }).success,
+    ).toBe(false);
+  });
+
+  it('types the review.start ack and the rules.migrate proposal', () => {
+    expect(ReviewStartResult.safeParse({ reviewId: rev }).success).toBe(true);
+    expect(ReviewStartResult.safeParse({ reviewId: `hnd_${hex32}` }).success).toBe(false);
+
+    expect(RulesMigrateResult.safeParse({ action: 'already_present' }).success).toBe(true);
+    expect(RulesMigrateResult.safeParse({ action: 'native_read' }).success).toBe(true);
+    expect(RulesMigrateResult.safeParse({ action: 'none' }).success).toBe(true);
+    const proposal = RulesMigrateResult.safeParse({
+      action: 'write',
+      sourceFile: 'CLAUDE.md',
+      lineCount: 142,
+      targetFile: 'AGENTS.md',
+    });
+    expect(proposal.success).toBe(true);
+    if (proposal.success) expect(proposal.data.lineCount).toBe(142);
+    expect(RulesMigrateResult.safeParse({ action: 'migrated' }).success).toBe(false);
+    // The file names are named, so a path can never arrive in their place.
+    expect(
+      RulesMigrateResult.safeParse({ action: 'write', targetFile: '/Users/x/AGENTS.md' }).success,
+    ).toBe(false);
   });
 });

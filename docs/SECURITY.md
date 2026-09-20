@@ -215,8 +215,12 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | `session.list_history` | list this Mac's sessions for a time window — ids, project ids, names, statuses, timestamps. Never a path, and never a session outside a registered project |
 | `session.backfill` | re-send part of a session's own transcript from `~/.pagr/journal/`, sealed, capped, one at a time. It reads the same files the mirror already reads and opens no new ones |
 | `keys.sync` | ask the gateway to re-send the phone key set. Carries nothing and changes nothing on this Mac by itself |
+| `session.handoff.capture` | write one handoff file under `<repo>/.pagr/handoff/` for a session you can already see, and — only if the tree is dirty — `git add -A && git commit` a WIP commit on the branch you are already on. It writes nowhere else, and the transcript it is written from never leaves this Mac |
+| `review.start` | build a review packet under `<repo>/.pagr/review/` from a commit range and start the reviewing agent **read-only** on it. The packet is the diff and one line of intent; no transcript and no reasoning from the agent that wrote the code |
+| `review.apply` | hand a finished review's findings back to the builder. It sends text; it never applies a change by itself |
+| `rules.migrate` | with `consent: true`, and only after you said yes by text, write ONE rules file (`AGENTS.md` or `CLAUDE.md`) that did not exist. An existing rules file is never modified, and with `consent: false` the command only reports what it would do |
 
-That table is the whole surface — **fifteen commands** at this version, counting the three
+That table is the whole surface — **nineteen commands** at this version, counting the three
 read-only ones grouped in the first row. It is not fixed at that number: a bridge that gains a
 command gains a row here in the same change, and `pagr doctor` reports which of the optional ones
 this Mac will actually honour.

@@ -22,6 +22,13 @@ import { z } from 'zod';
  * each other's frames on the same socket. Every v2 field a v1 peer would not send is therefore
  * optional (or defaulted), and no v1 shape has been narrowed.
  *
+ * ## Named capabilities on top of v2
+ *
+ * A version says what the LINK can carry; a capability says what this Mac will actually do.
+ * `handoff.v1` is the second kind: the handoff and review commands below are v2 commands that a
+ * bridge only honours once its handoff engine is wired up, and a cloud that respects
+ * `device.hello.capabilities` never sends one to a Mac that did not name it (`capability_unsupported`).
+ *
  * Which version is in force is negotiated, not assumed: the bridge OFFERS
  * `auth.response.protocolVersion` (2 for a current bridge) and the gateway ANSWERS with
  * `auth.result.protocolVersion` — absent means 1. Neither side may send a v2-only command or
@@ -66,7 +73,25 @@ export const QuestionId = prefixed('qst');
  * can offer "add this repo" without the cloud ever learning where anything lives.
  */
 export const RepoHandle = prefixed('rh');
+/** v2, `handoff.v1`. One mid-task switch from one agent to another. */
+export const HandoffId = prefixed('hnd');
+/** v2, `handoff.v1`. One cross-agent review of a commit range. */
+export const ReviewId = prefixed('rev');
 export const IsoDate = z.string().datetime({ offset: true });
+
+/**
+ * An abbreviated or full git object name. Never a ref and never a path: this is the WIP commit a
+ * switch made, reported back so the person can find it.
+ */
+export const GitCommit = z.string().regex(/^[0-9a-f]{7,40}$/);
+
+/**
+ * A `<base>..HEAD` (or `...`) commit range, restricted to ref characters at the schema so that a
+ * string the cloud chose can never reach `git` as an option or a second argument. A leading `-`
+ * is refused for the same reason paths are: the bridge passes this straight to `git log`/`diff`.
+ */
+const gitRef = '(?!-)[A-Za-z0-9._/~^@{}-]{1,100}';
+export const GitRange = z.string().regex(new RegExp(`^${gitRef}\\.\\.\\.?${gitRef}$`));
 
 /**
  * v2. A public key's fingerprint: `sha256(raw key).hex[0:16]` in groups of four. Identical on
@@ -233,6 +258,10 @@ export const FrameKind = z.enum([
   'approval_preview',
   'system',
   'imessage',
+  /** v2, `handoff.v1`. The sealed handoff file, so the phone can read what was handed over. */
+  'handoff',
+  /** v2, `handoff.v1`. The sealed review report a reviewing agent wrote. */
+  'review',
 ]);
 export type FrameKind = z.infer<typeof FrameKind>;
 
@@ -385,6 +414,96 @@ export const RepoScanResult = z.object({
 });
 export type RepoScanResult = z.infer<typeof RepoScanResult>;
 
+// ---------- v2: handoff and review (`handoff.v1`) ----------
+
+/**
+ * Where a switch has got to. The cloud's `handoff` workflow walks these in order and texts the
+ * phone at each one; `failed` can follow any of them and is the only state that carries `error`.
+ */
+export const HandoffState = z.enum([
+  'requested',
+  'capturing',
+  'committing',
+  'stopping',
+  'starting',
+  'running',
+  'done',
+  'failed',
+]);
+export type HandoffState = z.infer<typeof HandoffState>;
+
+/**
+ * Which agent actually wrote the handoff file. The sender writes its own when Pagr can talk to it;
+ * otherwise the receiving agent writes it headless from the transcript. Both happen on the Mac —
+ * the difference matters to the person because a receiver-written handoff is a reconstruction.
+ */
+export const HandoffWriter = z.enum(['sender', 'receiver']);
+export type HandoffWriter = z.infer<typeof HandoffWriter>;
+
+/** A reviewing agent's answer, in the order a person cares about it. */
+export const ReviewVerdict = z.enum(['approve', 'comment', 'block']);
+export type ReviewVerdict = z.infer<typeof ReviewVerdict>;
+
+/**
+ * The rules files a migration can read from or write to, named rather than free text: everything
+ * else in this protocol refuses a path, and a filename the cloud could choose is a path with the
+ * directory left off. These three are the whole set the conversion knows about.
+ */
+export const RulesFile = z.enum(['AGENTS.md', 'CLAUDE.md', '.claude/CLAUDE.md']);
+export type RulesFile = z.infer<typeof RulesFile>;
+
+/**
+ * What `rules.migrate` decided, in its `command.ack.result`. It is a PROPOSAL when `consent` was
+ * false: nothing is written until the person says yes by text and the command is sent again.
+ */
+export const RulesMigrationAction = z.enum([
+  /** The receiver already has its own rules file; nothing to do. */
+  'already_present',
+  /** The receiver reads the sender's file natively (Claude ≥ 2.1.277 reading `AGENTS.md`). */
+  'native_read',
+  /** A file was written, because consent was given. */
+  'write',
+  /** Proposed and declined, or nothing was asked; the handoff carries the rules instead. */
+  'skipped',
+  /** Neither repo has a rules file. */
+  'none',
+]);
+export type RulesMigrationAction = z.infer<typeof RulesMigrationAction>;
+
+/**
+ * What `session.handoff.capture` answers with. `summary` is the one line under `# Goal` — the only
+ * part of the handoff that is allowed to reach the cloud in the clear; the file itself travels as
+ * a sealed `handoff` frame, and its transcript never leaves the Mac at all.
+ */
+export const HandoffCaptureResult = z.object({
+  writer: HandoffWriter,
+  summary: z.string().max(500),
+  /** Absent when the tree was already clean, which is the common case at the end of a turn. */
+  wipCommit: GitCommit.optional(),
+  filesChanged: z.number().int().nonnegative().max(100_000).default(0),
+  /** True when the file hit the 64 KiB cap and sections were dropped from the bottom. */
+  truncated: z.boolean().default(false),
+});
+export type HandoffCaptureResult = z.infer<typeof HandoffCaptureResult>;
+
+/** What `review.start` answers with: the review it accepted. The verdict arrives later, as an event. */
+export const ReviewStartResult = z.object({ reviewId: ReviewId });
+export type ReviewStartResult = z.infer<typeof ReviewStartResult>;
+
+/**
+ * What `rules.migrate` answers with. The line count and the file names are composed on the Mac so
+ * the cloud can write "Write AGENTS.md from CLAUDE.md (142 lines)?" without ever holding the body.
+ */
+export const RulesMigrateResult = z.object({
+  action: RulesMigrationAction,
+  /** The file the rules would be converted FROM, when there is one. */
+  sourceFile: RulesFile.optional(),
+  lineCount: z.number().int().nonnegative().max(1_000_000).optional(),
+  /** The file the conversion would write, when the action is a proposal or a `write`. */
+  targetFile: RulesFile.optional(),
+});
+export type RulesMigrateResult = z.infer<typeof RulesMigrateResult>;
+
 // ---------- v2: recipient keys ----------
 
 /** Feature flags the gateway tells the bridge about; they decide what may be sent in the clear. */
@@ -483,6 +602,16 @@ export const CommandPayloads = {
     attachments: z.array(AttachmentRef).max(4).default([]),
     /** Reviewer sessions default to read-only where the provider supports it. */
     readOnly: z.boolean().default(false),
+    /**
+     * v2, `handoff.v1`. What this session is a continuation of, so the bridge and the cloud can
+     * join it to the switch or the review that asked for it.
+     *
+     * Additive and optional in every part: a v1 payload has no `context` at all and parses
+     * unchanged, and the adapters prepend nothing — `instruction` already names the file to read.
+     */
+    context: z
+      .object({ handoffId: HandoffId.optional(), reviewId: ReviewId.optional() })
+      .optional(),
   }),
   'agent.send_instruction': z.object({
     sessionId: SessionId,
@@ -560,6 +689,51 @@ export const CommandPayloads = {
   }),
   /** Ask the gateway to re-send the recipient key set (after a phone was added or revoked). */
   'keys.sync': z.object({}),
+
+  // ---- v2, capability `handoff.v1` ----
+
+  /**
+   * Write the handoff file for a session and, if the tree is dirty, WIP-commit it. The bridge
+   * decides who writes (see `HandoffWriter`); the cloud never sees the file, only the ack's
+   * summary line and, sealed, the `handoff` frame.
+   */
+  'session.handoff.capture': z.object({
+    handoffId: HandoffId,
+    sessionId: SessionId,
+    /** The agent that will pick the task up. */
+    to: Provider,
+    /** An optional line from the person: "focus on the refund path". */
+    note: z.string().max(2000).optional(),
+  }),
+  /**
+   * Build the review packet for a commit range and start the reviewing agent read-only on it.
+   * The packet is the diff plus one line of intent — never the builder's transcript or reasoning.
+   */
+  'review.start': z.object({
+    reviewId: ReviewId,
+    projectId: ProjectId,
+    reviewer: Provider,
+    range: GitRange,
+    /** One line: what the builder was trying to do. */
+    intent: z.string().min(1).max(500),
+  }),
+  /** Send a finished review's findings to the builder — the "fix it" reply. Never automatic. */
+  'review.apply': z.object({
+    reviewId: ReviewId,
+    /** The live builder session to steer; absent means start a fresh one. */
+    sessionId: SessionId.optional(),
+  }),
+  /**
+   * Decide — and, with consent, perform — the one rules conversion a switch may need. Sent twice:
+   * once with `consent: false` to get the proposal the phone asks about, and again with
+   * `consent: true` only after the person said yes. An existing rules file is never modified.
+   */
+  'rules.migrate': z.object({
+    projectId: ProjectId,
+    from: Provider,
+    to: Provider,
+    consent: z.boolean(),
+  }),
 } as const;
 
 export type CommandType = keyof typeof CommandPayloads;
@@ -816,6 +990,36 @@ export const EventPayloads = {
     /** What the agent did with it, when that differs from the option asked for. */
     appliedAs: z.string().min(1).max(64).optional(),
     error: z.string().max(500).optional(),
+  }),
+
+  // ---- v2, capability `handoff.v1` ----
+
+  /**
+   * A switch moved. One of these is emitted for every `HandoffState` the bridge enters, which is
+   * what makes the phone's running commentary ("Handing off…", "✓ WIP committed (3 files)") a
+   * report of what happened rather than an optimistic guess.
+   *
+   * Everything past `state` is optional because each field becomes true at a different step:
+   * `writer` and `summary` at `capturing`, `wipCommit` and `filesChanged` at `committing`,
+   * `error` only on `failed`.
+   */
+  'handoff.updated': z.object({
+    handoffId: HandoffId,
+    state: HandoffState,
+    /** The `# Goal` line. The only part of the handoff the cloud sees in the clear. */
+    summary: z.string().max(500).optional(),
+    wipCommit: GitCommit.optional(),
+    writer: HandoffWriter.optional(),
+    filesChanged: z.number().int().nonnegative().max(100_000).optional(),
+    truncated: z.boolean().optional(),
+    /** Set only with `state: 'failed'`; the first line of whatever went wrong, never a path. */
+    error: z.string().max(500).optional(),
+  }),
+  /** The reviewing agent wrote its report. `summary` is the verdict line the phone is sent. */
+  'review.completed': z.object({
+    reviewId: ReviewId,
+    verdict: ReviewVerdict,
+    summary: z.string().max(500),
   }),
 } as const;
 
