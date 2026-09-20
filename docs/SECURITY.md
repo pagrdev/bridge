@@ -125,7 +125,10 @@ the above:
   bridge-spawned path sees, so its classification is coarser.
 - **Codex `read-only` vs Claude read-only.** Codex enforces read-only with a real sandbox. Claude
   Code has none, so read-only there is enforced by withholding tools (below). That is a deny-list
-  against a tool set that can change between releases.
+  against a tool set that can change between releases. The two headless runs handoff v1 added —
+  the handoff writer and the reviewer — are neither of those things, and their confinement is
+  weaker on the Codex side than on the Claude side: see "Headless runs" below, which states it in
+  full rather than implying parity.
 
 ## What changed for the iPhone app
 
@@ -216,7 +219,7 @@ Only the commands in `CommandPayloads` in `packages/protocol/src/schemas.ts`:
 | `session.backfill` | re-send part of a session's own transcript from `~/.pagr/journal/`, sealed, capped, one at a time. It reads the same files the mirror already reads and opens no new ones |
 | `keys.sync` | ask the gateway to re-send the phone key set. Carries nothing and changes nothing on this Mac by itself |
 | `session.handoff.capture` | write one handoff file under `<repo>/.pagr/handoff/` for a session you can already see, and — only if the tree is dirty — `git add -A && git commit` a WIP commit on the branch you are already on. It writes nowhere else, and the transcript it is written from never leaves this Mac |
-| `review.start` | build a review packet under `<repo>/.pagr/review/` from a commit range and start the reviewing agent **read-only** on it. The packet is the diff and one line of intent; no transcript and no reasoning from the agent that wrote the code |
+| `review.start` | build a review packet under `<repo>/.pagr/review/` from a commit range and run the reviewing agent headless over the work tree, allowed to write only its own report directory (see "Headless runs" — the Codex side of that is weaker than the Claude side, and this document says how). The packet is the diff and one line of intent; no transcript and no reasoning from the agent that wrote the code |
 | `review.apply` | hand a finished review's findings back to the builder. It sends text; it never applies a change by itself |
 | `rules.migrate` | with `consent: true`, and only after you said yes by text, write ONE rules file (`AGENTS.md` or `CLAUDE.md`) that did not exist. An existing rules file is never modified, and with `consent: false` the command only reports what it would do |
 
@@ -236,6 +239,47 @@ it up first; it is still the *naming*, locally, that creates the id. An id the r
 know is `unknown_project`, whether it was invented, guessed, or once belonged to a project you
 removed. Nothing in this list can write
 `device-policy.json` or change what the floor refuses.
+
+## Git commits the bridge makes (`git.ts`)
+
+**This is new, and it is the largest change to what a cloud-sent command can cause on your Mac
+since the bridge shipped.** Before handoff v1 the bridge never ran `git` at all. It does now.
+
+When you switch a task from one agent to another and the working tree is dirty, Pagr makes a
+commit before it stops the first agent:
+
+```
+git add -A
+git commit -m "wip(pagr): handoff claude → codex"
+```
+
+Said plainly, with nothing softened:
+
+- **It commits everything**, exactly as your own `git add -A` would, and it respects your
+  `.gitignore` exactly as your own `git add -A` would. `.pagr/` is not in it, because `.pagr/` is
+  excluded through `.git/info/exclude`.
+- **On the branch you are already on.** It never creates, switches or deletes a branch.
+- **It never pushes.** There is no command in the protocol that makes the bridge push, and
+  `git.ts` has no code that could. Network-reaching git is also a floored class
+  (`network`), so a cloud `allow` for one is answered `deny`.
+- **Only when the tree is dirty**, and only as part of a switch or a review you asked for.
+- **Repository hooks are not skipped.** The bridge never passes `-c core.hooksPath=` and never
+  `--no-verify`. Your `pre-commit` is your code and your policy: if it fails, the commit fails,
+  the switch fails loudly with the hook's own first line of stderr, and the handoff file is kept
+  so nothing is lost.
+- **It rewrites no history.** No `reset --hard`, no `rebase`, no `commit --amend`, no
+  `filter-branch`. Those are all in the `destructive` floor class as well.
+
+Why that is acceptable rather than alarming: **a local commit is recoverable by anyone, and work
+that was never committed and is then trampled by a second agent is not.** That asymmetry is the
+whole argument. The switch exists to put a second agent into the same working tree; the commit is
+what makes the first agent's uncommitted work survive it. `git reset HEAD~1` undoes the commit and
+costs you nothing; there is no command that undoes an overwrite.
+
+Every git subprocess in the bridge lives in one module, `packages/core/src/git.ts`, and a test
+fails the build if a `git` call appears anywhere else. It runs with `GIT_TERMINAL_PROMPT=0` so a
+credential prompt can never hang the daemon, with a 30 s timeout, and with the project root as its
+working directory.
 
 ## Projects a phone can add (`repoScan.ts`, `scan.ts`)
 
@@ -396,6 +440,71 @@ write-capable session into the same working tree — the exact race the one-writ
 prevent. Codex read-only sessions use the provider's own `sandbox: 'read-only'`.
 
 Cloud-started `claude` children do not receive `PAGR_DAEMON_SOCK`.
+
+## Headless runs: the handoff writer and the reviewer
+
+Handoff v1 added two runs that have no person attached to them. One writes the handoff note when
+the sending agent can no longer be talked to; the other reads a commit range and writes a review.
+Both are started by the bridge, both end when their file appears or their timeout expires, neither
+is offered as a session you can steer, and **both auto-deny every permission prompt they raise** —
+a headless run has nobody to ask, so the honest answer to a prompt is no.
+
+### What the reviewer is given, and what it is not
+
+The review packet is the commit list, `git diff --stat`, the unified diff, and the full current
+contents of changed files under `PAGR_REVIEW_MAX_FILE_LINES` lines, plus **one line of intent**:
+what the builder was trying to do, capped at 500 characters and cut at the first newline.
+
+It contains **no transcript, no handoff file, and no self-assessment from the agent that wrote the
+code.** That is not a size optimisation. A reviewer that is handed the author's reasoning inherits
+the author's confidence and approves almost everything, which is the failure every published
+cross-vendor review workflow is built to avoid. Anything under `.pagr/` is stripped out of the
+diff and the diffstat and is counted rather than named, so an earlier handoff or an earlier review
+sitting in the range cannot leak in sideways.
+
+The property is easy to erode by accident, so it is a test rather than a convention:
+`review/packet.test.ts` plants a handoff note, a transcript dump, an earlier review and several
+paragraphs of author reasoning inside the commit range, builds the packet, and greps the packet's
+own output for session text — `ses_…` and `hnd_…` ids, transcript JSON, the handoff file's own
+section headings, the planted sentences. If any of it appears, the build fails.
+
+### The sandbox asymmetry, stated rather than implied
+
+The two providers are **not** confined to the same degree, and no sentence in this document should
+be read as saying they are.
+
+**Claude.** The run is given an explicit tool list: `Read`, `Glob`, `Grep`, `NotebookRead`,
+read-only `git` invocations (`status`, `log`, `diff`, `show`, `branch`, `rev-parse`), and
+`Write` / `Edit` / `MultiEdit` narrowed to `.pagr/**` for the handoff writer and to
+`.pagr/review/<reviewId>/**` for the reviewer. It runs sealed (`--setting-sources user,local`,
+`--strict-mcp-config`). Two limits worth knowing: `--allowedTools` is an *allow* list rather than
+a restriction — a tool outside it raises a permission prompt instead of being refused outright,
+and what makes it a boundary here is that the run denies every prompt it is asked — and there is
+no OS sandbox behind it, so a `permissions.allow` you have already put in your own
+`~/.claude/settings.json`, or one in the checkout's `.claude/settings.local.json`, still applies.
+
+**Codex.** The run gets a real OS sandbox, and it is *not* narrowed to the same paths. Codex's
+sandbox has no way to express "read-only except this one directory": in the app-server protocol
+the `readOnly` policy carries only a network flag, `writableRoots` exists solely on
+`workspaceWrite`, and there is no permission-profile field on a turn. So `writable_roots` **widens
+an otherwise read-only sandbox rather than narrowing a writable one** — the roots add to the
+workspace, they do not replace it. Today the one-shot starts its thread with the repository root
+as its working directory, which means the sandbox grants the repository, and
+`writableRoots: ["<repo>/.pagr/…"]` adds nothing it did not already have. What actually keeps a
+Codex writer or reviewer inside `.pagr/` today is **its prompt**, not the sandbox.
+
+What the Codex sandbox does still enforce is the boundary at the edge of the repository: your home
+directory, a sibling checkout, `$TMPDIR` and `/tmp` are all outside it, and network access is off
+for the run.
+
+**HND-015 is the open ticket to close this structurally**, by starting the one-shot's thread with
+`<repo>/.pagr` as its working directory so a `workspace-write` sandbox cannot reach source files
+at all. Until it lands, a Codex handoff writer or reviewer is a process that could write anywhere
+in the repository it was pointed at, and is stopped from doing so by instructions rather than by
+the kernel. The path is reached in exactly two cases: Codex is the agent *receiving* a handoff the
+sender could no longer write for itself, or Codex is the agent doing a review. A handoff the
+sending agent writes itself never starts a one-shot at all, and a run on the Claude side is
+bounded by the tool list above instead.
 
 ## The Claude Code channel (`pagr claude`)
 

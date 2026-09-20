@@ -183,6 +183,10 @@ otherwise. Nothing anywhere claims an interruption the bridge cannot perform.
 
 ### Commands
 
+`CommandPayloads` in `packages/protocol/src/schemas.ts` is the whole surface: **nineteen command
+types** at this version — the fifteen below, plus the four under *Handing a task over, and
+reviewing one*. A type that is not in that object does not parse, so it cannot be sent.
+
 | `type` | payload | result in `command.ack.result` |
 | --- | --- | --- |
 | `device.probe` | `{}` | a `device.hello` payload: agents, projects, sessions |
@@ -199,6 +203,7 @@ otherwise. Nothing anywhere claims an interruption the bridge cannot perform.
 | `session.backfill` | `{ sessionId, fromSeq, toSeq?, maxBytes ≤ 8 MiB (default 1 MiB) }` | `{ frames, bytes, lastSeq, truncated }` |
 | `repo.scan` | `{}` | `RepoScanResult`: `{ repos: [{ handle: rh_<32hex>, displayName, repoHint?, registeredAs? }], truncated }` |
 | `project.register_handle` | `{ handle, displayName? }` | `ProjectSummary` |
+| `keys.sync` | `{}` | `{}` — the gateway answers by re-sending the recipient key set on `keys.updated` |
 
 `settings.sync_public_policy` once also carried `smartApprovalsTierA`, which let the bridge answer
 "obviously safe" prompts itself. The bridge no longer decides approvals at all, so the field was
@@ -242,7 +247,7 @@ and have it happen on their Mac. They are v2 commands behind `handoff.v1`, all `
 | Command | What it does here |
 | --- | --- |
 | `session.handoff.capture` | writes `<repo>/.pagr/handoff/<hnd_…>.md` for one session and, if the tree is dirty, WIP-commits it. Acks `{writer, summary, wipCommit?, filesChanged, truncated}` |
-| `review.start` | builds a review packet for a commit range — the diff plus one line of intent, never a transcript — and starts the reviewing agent read-only on it. Acks `{reviewId}` |
+| `review.start` | builds a review packet for a commit range — the diff plus one line of intent, never a transcript — and runs the reviewing agent headless on the work tree, able to write only its own report directory. Acks `{reviewId}` |
 | `review.apply` | sends a finished review's findings to the builder. Never automatic: it is the answer to a person saying *fix it* |
 | `rules.migrate` | decides the one `CLAUDE.md` ↔ `AGENTS.md` conversion a switch may need, and performs it only with `consent: true`. Acks `{action, sourceFile?, lineCount?, targetFile?}` and never modifies an existing rules file |
 
@@ -255,6 +260,21 @@ with a reason — and `review.completed` carries the verdict line.
 `agent.start_session` grew `context?: { handoffId?, reviewId? }` for this, which is how a session
 the bridge starts is joined to the switch that asked for it. It is optional, and so is everything
 inside it: a payload written before any of this existed parses exactly as it did.
+
+Four clocks and caps, all bridge-side, all read from the daemon's environment. They are the only
+knobs these two commands have:
+
+| Variable | Default | What it bounds |
+| --- | --- | --- |
+| `PAGR_HANDOFF_CAPTURE_TIMEOUT_MS` | `90000` | how long the sender is given to write its own handoff before the receiving agent is asked to write it from the transcript instead (`handoff/capture.ts`) |
+| `PAGR_REVIEW_TIMEOUT_MS` | `600000` | how long the reviewing agent's one headless run may take before it is killed and the review reported as failed (`review/run.ts`) |
+| `PAGR_REVIEW_MAX_FILE_LINES` | `600` | a changed file longer than this is named in the packet's manifest rather than inlined (`review/packet.ts`) |
+| `PAGR_REVIEW_MAX_PACKET_BYTES` | `262144` | the whole packet's byte budget; the diff may take at most 70 % of it (`review/packet.ts`) |
+
+The cloud's own ceiling on a switch is a different number in a different repository —
+`HANDOFF_TIMEOUT_MS`, five minutes, and it only runs while a command is actually in flight, so a
+queued command waiting for a sleeping Mac does not burn it. Nothing the cloud sends can change any
+of the four above.
 
 ### History and backfill
 
@@ -315,7 +335,8 @@ Both commands need the frame journal; a bridge built without one answers `capabi
 
 ## Device events (bridge → cloud)
 
-Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payload }`.
+Every event carries `{ version: 1|2, eventId, deviceId, at, inReplyTo?, type, payload }` —
+**seventeen event types**, the whole of `EventPayloads`.
 
 | `type` | when | payload |
 | --- | --- | --- |
@@ -333,6 +354,8 @@ Every event carries `{ version: 1, eventId, deviceId, at, inReplyTo?, type, payl
 | `question.answered` | the question is no longer pending (v2 only) | `{ questionId, answeredElsewhere, reason? }` |
 | `session.frame` | one transcript frame, v2 only | `{ sessionId, projectId, provider, seq, kind, at, providerRecordId?, sealed, meta, imessage? }` — see *Transcript frames and cursors* |
 | `attachment.consumed` | after a download attempt | `{ attachmentId, ok, error? }` |
+| `handoff.updated` | each state of a switch (v2, `handoff.v1`) | `{ handoffId, state, summary?, wipCommit?, writer?, error? }` |
+| `review.completed` | the reviewer wrote its report (v2, `handoff.v1`) | `{ reviewId, verdict: approve\|comment\|block, summary }` |
 
 `errorCode` values: `bad_signature`, `expired`, `replayed`, `wrong_device`, `unknown_project`,
 `unknown_session`, `unknown_approval`, `unknown_question`, `rate_limited`, `not_negotiated`,

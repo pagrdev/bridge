@@ -34,9 +34,11 @@ it is *the cloud cannot read them*. The table below says exactly what it can.
 | `session.updated` / `session.event` | session id, status, control level, origin, a ≤2000-char summary produced by the adapter | the rest of the session; the summary is a clip, and everything else travels sealed |
 | `approval.requested` | approval id, action type, the sha256 of the preview, the risk hints, expiry. On v2 the preview itself moves into a **sealed** frame and this field goes out empty | the command line or file list, once v2 is in force |
 | `question.asked` | question id, how many options each question has, which take more than one, which must never be echoed back | the question's words and its option labels — those are in the sealed frame |
-| `session.frame` | session/project/provider ids, a sequence number, the frame's **kind** (`assistant`, `tool_call`, `diff`, `terminal`…), a timestamp, its size, whether it was clipped, and the **sealed** body | the body. It is encrypted on this Mac for the phones you paired. A frame over 512 KiB is clipped for the wire (command output keeps its first 8 KiB and last 56 KiB) and the full text stays in `~/.pagr/journal/` |
+| `session.frame` | session/project/provider ids, a sequence number, the frame's **kind** (`assistant`, `tool_call`, `diff`, `terminal`, `handoff`, `review`…), a timestamp, its size, whether it was clipped, and the **sealed** body | the body. It is encrypted on this Mac for the phones you paired. A frame over 512 KiB is clipped for the wire (command output keeps its first 8 KiB and last 56 KiB) and the full text stays in `~/.pagr/journal/` |
 | `imessage` (a field on the three events above) | **plaintext**, and only while you have an iMessage thread linked: the agent's final message of a turn clipped to 500 characters, an approval's one-liner, or "<Agent> asked: <header>" | nothing — this field is deliberately readable, because it is the line your iMessage thread shows. Unlink the thread and it stops on the very next event |
 | `attachment.consumed` | attachment id and ok/error | image bytes |
+| `handoff.updated` | handoff id, which state the switch reached, which agent wrote the note, the WIP commit hash, and the handoff's one-line `# Goal` summary | the handoff file. Everything else in it — what was decided and why, which files were touched, what is still failing — is in the sealed frame |
+| `review.completed` | review id, the verdict word (`approve` / `comment` / `block`) and the reviewer's one-line summary | the review report, the diff it read, and the packet it was given |
 
 **The phone → Mac direction is not sealed.** What you type on your phone — instructions, answers,
 decisions — travels in the signed command payloads the cloud queues, re-mints and audits, and the
@@ -61,6 +63,50 @@ transcript it does not have. Nothing about them widens what leaves the Mac in th
   an `rh_…` handle only this Mac can resolve.
 - **No new reach.** Both commands are signed, device-bound cloud commands like every other, refused
   on a v1 link, and one at a time. `pagr sessions backfill` runs the same code path locally.
+
+## Handoff files never leave the Mac in the clear
+
+When you hand a task from one agent to another, the thing that carries the context is a markdown
+file, and it is written **into your own repository on your own disk**:
+
+- `<repo>/.pagr/handoff/<hnd_…>.md` — the handoff note: the goal, what is done, what is not, the
+  decisions and why, the files touched, the commands to run, the known failures, the rules in
+  force, the open questions.
+- `<repo>/.pagr/review/<rev_…>/packet.md` — what a reviewing agent is given: the commit list, the
+  diffstat, the unified diff, and the full contents of changed files under 600 lines.
+- `<repo>/.pagr/review/<rev_…>/review.md` — what it wrote back.
+
+`.pagr/` is excluded from git through **`.git/info/exclude`**, appended once and idempotently, and
+never through `.gitignore` — `.gitignore` is a tracked file that belongs to you and to everyone
+else who clones the repository, and Pagr does not get to commit a line to it. `.git/info/exclude`
+is local to your checkout and travels nowhere. Nothing under `.pagr/` is ever put in a commit
+Pagr makes, and the review packet strips `.pagr/` paths out of the diff it shows the reviewer —
+they are counted, never named.
+
+**The copy that travels is sealed.** The file is encrypted on this Mac for the phones you have
+paired and sent as a `session.frame` of kind `handoff` (a review report is kind `review`), under
+exactly the rules the rest of the transcript follows: the Pagr cloud stores and relays ciphertext
+it holds no key for. There is no cloud writer and no server-side summariser; a handoff is written
+by an agent on this Mac, from a transcript that is read where it lies.
+
+**What the cloud does hold, in plaintext, is metadata.** For a handoff, one row: the handoff id,
+your user and project ids, the workflow driving the switch, which agent it came from and which it
+went to, the two session ids, the state it reached, which side wrote the note, a summary line of
+at most 500 characters, the WIP commit's hash, whether the body was truncated, and an error string
+if it failed, with created and updated timestamps. For a review: the review id, the project, the
+builder's session, the reviewing agent and its session, the commit range as a string, the state it
+reached, the verdict word, a summary line and the focus note (500 characters each), the session any
+fix was sent to, an error string, and the same timestamps.
+
+The summary line is the one piece of the file's content the cloud can read, and it is deliberate:
+it is the first non-empty line under `# Goal`, it is what your phone shows you when the switch
+lands, and the iMessage thread cannot show you a line it cannot read. Everything else in the file
+— every decision, every path, every failing test — is only in the sealed frame and on your disk.
+
+The transcript a handoff is written *from* never leaves this Mac in any path. A Claude transcript
+is already a file and is read where it lies. A Codex thread has no file, so one is dumped to
+`~/.pagr/tmp/<handoffId>.ndjson` (0600) for the length of one headless run on this machine and
+deleted afterwards, whether that run succeeded, timed out, was cancelled or crashed.
 
 ## What stays local
 
