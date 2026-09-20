@@ -519,7 +519,7 @@ export interface RulesProposalOptions {
  * | claude → codex | `AGENTS.md`                                    | `already_present`|
  * | claude → codex | `CLAUDE.md` or `.claude/CLAUDE.md`, no AGENTS  | `write`          |
  * | codex → claude | `CLAUDE.md` **or `.claude/CLAUDE.md`**          | `already_present`|
- * | codex → claude | `AGENTS.md`, Claude ≥ 2.1.277                   | `native_read`    |
+ * | codex → claude | `AGENTS.md`, Claude ≥ 2.1.277, no ancestor CLAUDE.md | `native_read` |
  * | codex → claude | `AGENTS.md`, older or unknown Claude           | `write` (shim)   |
  * | any            | neither                                        | `none`           |
  *
@@ -567,7 +567,13 @@ export function proposal(opts: RulesProposalOptions): RulesProposal {
       });
     }
     if (!d.agentsMd) return decorate({ action: 'none' });
-    if (readsAgentsMdNatively(opts.claudeVersion)) {
+    // Claude reads AGENTS.md only when there is no CLAUDE.md in this directory *or above it*.
+    // With an ancestor CLAUDE.md — a monorepo root, ~/code/CLAUDE.md, ~/.claude/CLAUDE.md —
+    // saying `native_read` would be silently wrong: Claude would follow the ancestor's rules and
+    // never open the AGENTS.md we pointed at, with nothing on screen to say so. The shim is
+    // correct on every version (a new Claude follows the import, an old one needs it), so when
+    // an ancestor exists we fall through to writing it rather than assume.
+    if (readsAgentsMdNatively(opts.claudeVersion) && !hasAncestorClaudeRules(d)) {
       return decorate({ action: 'native_read', sourceFile: AGENTS_MD });
     }
     const c = convert({ repo, from: 'codex', to: 'claude', now: opts.now });
