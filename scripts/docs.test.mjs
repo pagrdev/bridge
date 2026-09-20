@@ -42,6 +42,10 @@ const FORBIDDEN = [
     pattern: /cannot name a directory/i,
     why: 'repo.scan + project.register_handle exist; the true claim is that it cannot CHOOSE one',
   },
+  {
+    pattern: /HND-015 is the open ticket/i,
+    why: 'HND-015 shipped: the Codex one-shot starts in `<repo>/.pagr`, so say what is true now',
+  },
 ];
 
 describe('public docs · claims that stopped being true', () => {
@@ -113,6 +117,29 @@ describe('public docs · what v2 must actually document', () => {
     ];
     expect(names.length).toBe(19);
     for (const name of names) expect(sec).toContain(`\`${name}\``);
+  });
+
+  /**
+   * The one sentence in this document that a reader would act on: what a headless Codex run can
+   * reach. It is pinned to the code that decides it, because a doc that said "confined to
+   * `.pagr`" while the adapter started the thread at the repository root would be the most
+   * expensive wrong sentence in the repository.
+   */
+  it('SECURITY.md describes the headless sandbox the adapter actually asks for', () => {
+    const sec = read('docs/SECURITY.md');
+    const src = read('packages/adapter-codex/src/run-once.ts');
+    // The code: the thread's cwd is `<repo>/.pagr`, and that is what `thread/start` is handed.
+    expect(src).toMatch(/RUN_ONCE_SANDBOX_DIR = '\.pagr'/);
+    expect(src).toMatch(/resolve\(cwd, RUN_ONCE_SANDBOX_DIR\)/);
+    expect(src).toMatch(/cwd: sandboxCwd/);
+    // The document: the same fact, and the two limits that come with it.
+    expect(sec).toContain('### The sandbox asymmetry, stated rather than implied');
+    expect(sec).toMatch(/working directory is `<repo>\/\.pagr`, not the\nrepository root/);
+    expect(sec).toMatch(/cannot write a source file at all/i);
+    expect(sec).toMatch(/Reads are not narrowed with it/i);
+    // Claude is the weaker of the two now, and the document has to keep saying so.
+    expect(sec).toMatch(/No OS sandbox exists for it/i);
+    expect(sec).toMatch(/can write outside `\.pagr`, and a\nCodex one cannot/);
   });
 
   it('PRIVACY.md describes the whole `~/.pagr` inventory, not just the v1 half', () => {

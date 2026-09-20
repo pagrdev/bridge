@@ -26,7 +26,9 @@ import type { JournalMeta } from '../journal.js';
  *   3. **The agent's own sandbox does the refusing.** `allowedWrites` is handed to the agent —
  *      Claude's permission rules, Codex's `workspace-write` roots — and the refusal happens
  *      inside the agent. The bridge does not diff the tree afterwards and undo things: by then
- *      the write has already happened.
+ *      the write has already happened. The two agents do not refuse equally well, and
+ *      `docs/SECURITY.md` says so: Codex runs under an OS sandbox started inside `<cwd>/.pagr`
+ *      (HND-015), Claude under a tool allow-list with every other prompt denied.
  *   4. **The timeout is an outcome, not an exception.** `timeoutMs` kills the process and the
  *      call resolves `{ outcome: 'timeout' }`, because every caller has something to say to the
  *      person about it ("Claude didn't finish the handoff in 90 s…") and nothing to say about a
@@ -91,7 +93,16 @@ export function isRunOnceFrame(meta: JournalMeta): boolean {
 // ---------- the call ----------
 
 export interface RunOnceInput {
-  /** Working directory. Always a real directory; the agent is started there and nowhere else. */
+  /**
+   * The repository the run is about. Always a real directory.
+   *
+   * It is what `allowedWrites` is relative to and what the prompt's absolute paths are built
+   * from — **not necessarily the process's working directory.** The Codex adapter starts its
+   * thread in `<cwd>/.pagr` instead, because Codex's `workspace-write` sandbox always grants the
+   * thread's own cwd and a run started at the repository root could therefore write anywhere in
+   * the repository (`adapter-codex/src/run-once.ts`). So a prompt must name every file it wants
+   * read or written by ABSOLUTE path; a relative one is not guaranteed to resolve.
+   */
   cwd: string;
   /** The whole instruction. One turn, no follow-ups. */
   prompt: string;
@@ -99,7 +110,9 @@ export interface RunOnceInput {
    * Where the run may write, as globs relative to `cwd` (`['.pagr/**']`).
    *
    * Handed to the agent, never enforced afterwards. An empty list is legal and means "this run
-   * writes nothing" — the reviewer's read-only pass is the caller that wants it.
+   * writes nothing" — the reviewer's read-only pass is the caller that wants it. On the Codex
+   * side "nothing" is approximate: its sandbox cannot express an empty workspace, so a run is
+   * confined to `<cwd>/.pagr` whatever this says.
    */
   allowedWrites: string[];
   /** Kill the run after this long and resolve `timeout`. */

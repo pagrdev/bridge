@@ -32,8 +32,9 @@ import { type ParsedVerdict, parseVerdict, reviewPrompt } from './prompt.js';
  * or review report into the user's history.
  *
  * Everything after that is waiting. {@link awaitReview} starts the reviewer through the
- * adapter's `runOnce` — its own process, no prompts, writes confined to this review's own
- * directory — and watches for `review.md`. It does NOT wait for the agent's turn to end: the
+ * adapter's `runOnce` — its own process, no prompts, writes confined to `.pagr` and no further
+ * out than that whatever the reviewer decides to do — and watches for `review.md` at the
+ * absolute path the packet named, which is not relative to the run's working directory. It does NOT wait for the agent's turn to end: the
  * report is the deliverable, the turn ending is not, and a reviewer that writes its file and
  * then spends four minutes summarising itself to nobody should not hold the verdict hostage.
  * Once the file is read the run is aborted, which is what the prompt already told it to do
@@ -112,9 +113,11 @@ export const reviewApplyInstruction = (reviewId: string): string =>
  * The only thing a reviewing run may write.
  *
  * One review's own directory, so a reviewer cannot "helpfully" fix what it found, and two
- * concurrent reviews cannot overwrite each other's report. Codex widens this to the workspace
- * on its side (see `adapter-codex/src/run-once.ts`) because its `read-only` sandbox has no
- * writable-root variant; Claude's rules really are limited to these globs.
+ * concurrent reviews cannot overwrite each other's report. Claude's rules really are limited to
+ * these globs. Codex widens them to `<repo>/.pagr` — its sandbox grants the directory the thread
+ * is started in and has no way to express anything narrower (`adapter-codex/src/run-once.ts`) —
+ * so on that side a reviewer cannot touch the repository, but could in principle write elsewhere
+ * under `.pagr`. Neither can fix what it found, which is the property this exists for.
  */
 export const reviewAllowedWrites = (reviewId: string): string[] => [`${REVIEW_DIR}/${reviewId}/**`];
 
@@ -253,7 +256,11 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Prepared
     repo: root,
     packet,
     reviewPath: packet.reviewPath,
-    prompt: reviewPrompt({ packetPath: packet.packetPath, outPath: packet.reviewPath }),
+    prompt: reviewPrompt({
+      packetPath: packet.packetPath,
+      outPath: packet.reviewPath,
+      repo: root,
+    }),
     allowedWrites: reviewAllowedWrites(input.reviewId),
     ...(commit.committed && commit.sha ? { wipCommit: commit.sha } : {}),
     filesChanged: commit.filesChanged,
