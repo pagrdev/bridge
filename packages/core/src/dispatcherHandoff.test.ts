@@ -501,6 +501,131 @@ describe('session.handoff.capture — the receiver writes', () => {
     expect(gitCalls(repo, 'commit')).toBe(0);
   });
 
+  /**
+   * HND-019. The handoff writer is a session too: visible while it runs, stoppable, and — the
+   * part that needed a decision rather than wiring — a stop leaves NOTHING behind.
+   */
+  describe('the handoff writer is a session', () => {
+    /**
+     * A run that hangs until it is stopped, and — like a real killed agent — leaves the bytes it
+     * had already flushed on disk. A note written top-down can parse while missing `# Not done`
+     * and `# Known failures`, so reading this would start the receiver on a confidently wrong
+     * picture of the work. That is why the stop path deletes it.
+     */
+    const hangingRun =
+      (partial: string) =>
+      async (input: RunOnceInput): Promise<RunOnceResult> => {
+        runs.push(input);
+        const runId = input.runId ?? 'run_0123456789abcdef0123456789abcdef';
+        const tracked = codex.trackOneShot(
+          { runId, kind: input.kind, cwd: input.cwd, projectId: input.projectId },
+          { onStop: () => undefined },
+        );
+        await new Promise<void>((resolve) => {
+          const stop = () => {
+            writeFileSync(path, partial);
+            resolve();
+          };
+          if (input.signal?.aborted) stop();
+          else input.signal?.addEventListener('abort', stop, { once: true });
+        });
+        tracked.finish('canceled');
+        return {
+          runId,
+          sessionId: tracked.sessionId,
+          outcome: 'canceled',
+          output: '',
+          durationMs: 3,
+        };
+      };
+
+    /** The `ses_…` the writer is listed under, once it is live. */
+    const writerSession = async (): Promise<string> => {
+      const until = Date.now() + 2_000;
+      while (codex.oneShots().length === 0) {
+        if (Date.now() > until) throw new Error('the handoff writer never became visible');
+        await new Promise((r) => setTimeout(r, 2));
+      }
+      return codex.oneShots()[0]?.sessionId ?? '';
+    };
+
+    it('is listed while it writes, says what it is doing, and can be stopped', async () => {
+      writeClaudeTranscript();
+      sending();
+      Object.assign(codex, { runOnce: hangingRun(FILE) });
+      const pending = capture();
+      const runSession = await writerSession();
+
+      const hello = await d.probe();
+      const row = hello.sessions.find((s) => s.sessionId === runSession);
+      expect(row).toMatchObject({
+        provider: 'codex',
+        projectId,
+        status: 'working',
+        displayName: 'Writing the handoff',
+        controlLevel: 'full',
+        origin: 'pagr',
+      });
+      expect(row?.oneShot?.kind).toBe('handoff');
+
+      await d.handle({
+        ...makeBody('agent.stop_session', { sessionId: runSession } as never, { deviceId, now }),
+        version: 2,
+      } as CommandBody);
+      await pending;
+    });
+
+    it('resolves the switch as canceled — not failed, not a timeout', async () => {
+      writeClaudeTranscript();
+      sending();
+      Object.assign(codex, { runOnce: hangingRun(FILE) });
+      repo.dirty = [' M src/payments/refund.ts'];
+      const pending = capture();
+      const runSession = await writerSession();
+
+      await d.handle({
+        ...makeBody('agent.stop_session', { sessionId: runSession } as never, { deviceId, now }),
+        version: 2,
+      } as CommandBody);
+      await pending;
+
+      const states = updates().map((u) => u.state);
+      expect(states).toContain('canceled');
+      expect(states).not.toContain('failed');
+      // `canceled` is terminal and carries no error: nothing broke.
+      const last = updates().at(-1);
+      expect(last?.state).toBe('canceled');
+      expect(last?.error).toBeUndefined();
+      // Nothing was committed and the sender was never stopped: a canceled switch leaves the
+      // person exactly where they were.
+      expect(repo.log.some((l) => l.startsWith('commit'))).toBe(false);
+      expect(repo.head).toBe('a'.repeat(40));
+      expect(claude.calls.filter((c) => c.method === 'stopSession')).toHaveLength(0);
+      expect(frames().filter((e) => (e.payload as { kind: string }).kind === 'handoff')).toEqual(
+        [],
+      );
+    });
+
+    it('deletes the half-written note rather than handing it on', async () => {
+      writeClaudeTranscript();
+      sending();
+      // Everything down to "Not done" — parseable, and missing the half that matters.
+      Object.assign(codex, {
+        runOnce: hangingRun(FILE.slice(0, FILE.indexOf('# Not done'))),
+      });
+      const pending = capture();
+      const runSession = await writerSession();
+
+      await d.handle({
+        ...makeBody('agent.stop_session', { sessionId: runSession } as never, { deviceId, now }),
+        version: 2,
+      } as CommandBody);
+      await pending;
+
+      expect(existsSync(path)).toBe(false);
+    });
+  });
+
   it('refuses honestly when the sending session left no transcript on this Mac', async () => {
     // No transcript written: the session ended long ago, or Claude never wrote one.
     sending();

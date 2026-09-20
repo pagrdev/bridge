@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AdapterEvent } from '@pagr/bridge-core';
-import { isRunOnceFrame } from '@pagr/bridge-core';
+import { isRunOnceFrame, runOnceSessionId } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from './adapter.js';
 
@@ -39,12 +39,22 @@ describe('ClaudeAdapter.runOnce against fake claude', () => {
     adapter.runOnce({
       cwd: project,
       prompt,
+      kind: 'handoff' as const,
       timeoutMs: 15_000,
       projectId: PROJ,
       ...over,
     });
 
   const frames = () => events.filter((e) => e.kind === 'frame');
+
+  /** Poll rather than sleep: a run becomes live when its child does, not after a fixed wait. */
+  const waitFor = async (cond: () => boolean, ms = 5_000): Promise<void> => {
+    const until = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > until) throw new Error('condition never became true');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
 
   it('writes the file it was asked for and resolves with it there', async () => {
     const rel = '.pagr/handoff/hnd_1.md';
@@ -143,22 +153,85 @@ describe('ClaudeAdapter.runOnce against fake claude', () => {
     expect((await p).outcome).toBe('canceled');
   });
 
-  it('is never a controllable session', async () => {
+  /**
+   * HND-019. A run used to be registered nowhere, which took visibility and cancellation away
+   * along with steering. These four tests are the tripwire on each half of that.
+   */
+  it('is a session while it runs: listed, answered by getStatus, and announced', async () => {
+    const runId = 'run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const sessionId = runOnceSessionId('claude', runId);
+    const pending = run('hang', { runId });
+    await waitFor(() => adapter.oneShots().length === 1);
+
+    const listed = await adapter.listSessions();
+    const row = listed.find((s) => s.sessionId === sessionId);
+    expect(row).toBeDefined();
+    expect(row?.status).toBe('working');
+    expect(row?.provider).toBe('claude');
+    expect(row?.projectId).toBe(PROJ);
+    expect(row?.displayName).toBe('Writing the handoff');
+    // It is ours, and we can do everything to it: that is what `full` means.
+    expect(row?.controlLevel).toBe('full');
+    expect(row?.origin).toBe('pagr');
+    expect(row?.oneShot).toEqual({ kind: 'handoff', runId });
+    expect(await adapter.getStatus(sessionId)).toMatchObject({ sessionId, status: 'working' });
+    expect(events.filter((e) => e.kind === 'session_event' && e.type === 'started')).toHaveLength(
+      1,
+    );
+
+    await adapter.stopSession(sessionId);
+    await pending;
+  });
+
+  it('stops when told to, and reports itself canceled rather than failed', async () => {
+    const runId = 'run_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const sessionId = runOnceSessionId('claude', runId);
+    const pending = run('hang', { runId });
+    await waitFor(() => adapter.oneShots().length === 1);
+
+    await adapter.stopSession(sessionId);
+    const res = await pending;
+    expect(res.outcome).toBe('canceled');
+    expect(res.error).toBeUndefined();
+    // And the row settles as stopped, not failed, in the list and in the event stream.
+    expect(await adapter.getStatus(sessionId)).toBeNull();
+    expect(adapter.oneShots()).toEqual([]);
+    const last = events.filter((e) => e.kind === 'session_event').at(-1);
+    expect(last).toMatchObject({ type: 'stopped', sessionId });
+  });
+
+  it('takes an instruction mid-run — queued, then run as the next turn on the same process', async () => {
+    const runId = 'run_cccccccccccccccccccccccccccccccc';
+    const sessionId = runOnceSessionId('claude', runId);
+    const pending = run('slow one', { runId });
+    await waitFor(() => adapter.oneShots().length === 1);
+
+    // Claude takes no live steer (ADR 0001), so `queued` is the honest answer — the same one an
+    // ordinary Claude session gives for a follow-up sent mid-turn.
+    const sent = await adapter.sendInstruction({
+      sessionId,
+      instruction: 'two',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    expect(sent).toEqual({ delivered: 'queued' });
+    expect(events.some((e) => e.kind === 'session_event' && e.type === 'queued_followup')).toBe(
+      true,
+    );
+
+    // The run does NOT end at the first `result`: the queued turn goes out on the same process,
+    // and both turns are in the output the caller gets back.
+    const res = await pending;
+    expect(res.outcome).toBe('completed');
+    expect(res.output).toContain('Echo: one');
+    expect(res.output).toContain('Echo: two');
+    expect(events.some((e) => e.kind === 'session_event' && e.type === 'followup_delivered')).toBe(
+      true,
+    );
+  });
+
+  it('keeps its frames nested under the run, exactly as before', async () => {
     const res = await run('write file .pagr/handoff/hnd_3.md');
-    // Not listed, not resumable, not steerable, not stoppable — and never announced.
-    expect(await adapter.listSessions()).toEqual([]);
-    expect(await adapter.getStatus(res.sessionId)).toBeNull();
-    await expect(
-      adapter.sendInstruction({
-        sessionId: res.sessionId,
-        instruction: 'keep going',
-        mode: 'auto',
-        localImagePaths: [],
-      }),
-    ).rejects.toThrow(/unknown session/);
-    expect(events.some((e) => e.kind === 'session')).toBe(false);
-    expect(events.some((e) => e.kind === 'session_event')).toBe(false);
-    // Its frames still reach the phone, marked as a run's.
     const got = frames();
     expect(got.length).toBeGreaterThan(0);
     expect(

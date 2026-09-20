@@ -137,7 +137,7 @@ export async function runSessions(ctx: CliContext, opts: SessionsOptions = {}): 
           s.projectId === UNREGISTERED_PROJECT
             ? dim(s.cwd ?? 'no registered project')
             : (nameOf.get(s.projectId) ?? s.projectId),
-          isAdopted(s) ? 'terminal' : dim('pagr'),
+          s.oneShot ? `pagr · ${s.oneShot.kind}` : isAdopted(s) ? 'terminal' : dim('pagr'),
           controlOf(s),
           j?.lastSeq ? String(j.lastSeq) : dim('—'),
           j?.bytes ? bytes(j.bytes) : dim('—'),
@@ -148,6 +148,7 @@ export async function runSessions(ctx: CliContext, opts: SessionsOptions = {}): 
     ),
   );
   const live = list.filter((s) => isLiveStatus(s.status)).length;
+  const runs = list.filter((s) => s.oneShot !== undefined);
   const adopted = list.filter(isAdopted);
   const unregistered = adopted.filter((s) => s.projectId === UNREGISTERED_PROJECT);
   const journalBytes = Object.values(journals).reduce((n, j) => n + j.bytes, 0);
@@ -157,6 +158,12 @@ export async function runSessions(ctx: CliContext, opts: SessionsOptions = {}): 
     ctx.out(
       dim(
         `${bytes(journalBytes)} of transcript in ~/.pagr/journal — \`pagr sessions purge\` frees what is past retention`,
+      ),
+    );
+  for (const r of runs)
+    ctx.out(
+      dim(
+        `  ${r.sessionId} is Pagr ${r.oneShot?.kind === 'handoff' ? 'writing a handoff' : 'reviewing a diff'} — it can be stopped and told what to focus on, like any session`,
       ),
     );
   if (adopted.length > 0)

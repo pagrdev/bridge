@@ -11,7 +11,7 @@ import type { LocalActionDetail } from '../deviceFloor.js';
 import type { FrameBody, FrameQuestion } from '../frames.js';
 import type { CodexThread } from '../handoff/receiver.js';
 import type { JournalMeta } from '../journal.js';
-import type { RunOnceInput, RunOnceResult } from './runOnce.js';
+import type { LiveOneShot, RunOnceInput, RunOnceResult } from './runOnce.js';
 
 export interface LocalProject {
   projectId: string;
@@ -229,11 +229,21 @@ export interface CodingAgentAdapter {
   /**
    * One bounded, headless run: a prompt in, a file on disk and whatever the agent printed out.
    *
-   * Never a session — see `runOnce.ts`. Optional, because an adapter whose agent cannot be run
-   * headlessly is still a perfectly good adapter; the handoff engine falls back to the
-   * sender-writes path (spec §3) when the receiver has none.
+   * A session like any other while it lasts — see `runOnce.ts`. It is listed by `listSessions`,
+   * answered by `getStatus`, steered by `sendInstruction` and killed by `stopSession`, under the
+   * `ses_…` in the result. What makes it a one-shot is that Pagr started it for a job of its own
+   * and is holding this promise for the file it produces.
+   *
+   * Optional, because an adapter whose agent cannot be run headlessly is still a perfectly good
+   * adapter; the handoff engine falls back to the sender-writes path (spec §3) when the receiver
+   * has none.
    */
   runOnce?(input: RunOnceInput): Promise<RunOnceResult>;
+  /**
+   * The runs this adapter has in flight, so the daemon can list, steer and stop them without
+   * knowing how either agent is driven. Absent on an adapter with no `runOnce`.
+   */
+  oneShots?(): LiveOneShot[];
   /**
    * One session's raw transcript, for a provider that keeps it inside a server instead of in a
    * file on this Mac.

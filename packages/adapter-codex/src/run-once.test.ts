@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AdapterEvent } from '@pagr/bridge-core';
-import { isRunOnceFrame } from '@pagr/bridge-core';
+import { isRunOnceFrame, runOnceSessionId } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from './adapter.js';
 import { runOnceThreadParams, runOnceTurnParams } from './run-once.js';
@@ -68,6 +68,7 @@ describe('CodexAdapter.runOnce against the fake app-server', () => {
     adapter.runOnce({
       cwd: project,
       prompt,
+      kind: 'review' as const,
       timeoutMs: 15_000,
       projectId: PROJ,
       ...over,
@@ -80,6 +81,15 @@ describe('CodexAdapter.runOnce against the fake app-server', () => {
       .filter(Boolean)
       .map((l) => JSON.parse(l));
   const frames = () => events.filter((e) => e.kind === 'frame');
+
+  /** Poll rather than sleep: a run becomes live when its thread does, not after a fixed wait. */
+  const waitFor = async (cond: () => boolean, ms = 5_000): Promise<void> => {
+    const until = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > until) throw new Error('condition never became true');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
 
   // Absolute, like every prompt the bridge really builds (`review/prompt.ts`,
   // `handoff/prompt.ts`): the watcher polls an absolute path, so the prompt names one.
@@ -139,20 +149,80 @@ describe('CodexAdapter.runOnce against the fake app-server', () => {
     expect((await p).outcome).toBe('canceled');
   });
 
-  it('is never a controllable session', async () => {
+  /**
+   * HND-019. A run used to be registered nowhere, which took visibility and cancellation away
+   * along with steering. These four tests are the tripwire on each half of that.
+   */
+  it('is a session while it runs: listed, answered by getStatus, and announced', async () => {
+    const runId = 'run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const sessionId = runOnceSessionId('codex', runId);
+    const pending = run('wait', { runId, timeoutMs: 20_000 });
+    await waitFor(() => adapter.oneShots().length === 1);
+
+    const row = (await adapter.listSessions()).find((s) => s.sessionId === sessionId);
+    expect(row).toBeDefined();
+    expect(row?.status).toBe('working');
+    expect(row?.provider).toBe('codex');
+    expect(row?.projectId).toBe(PROJ);
+    expect(row?.displayName).toBe('Reviewing the diff');
+    expect(row?.controlLevel).toBe('full');
+    expect(row?.origin).toBe('pagr');
+    expect(row?.oneShot).toEqual({ kind: 'review', runId });
+    expect(await adapter.getStatus(sessionId)).toMatchObject({ sessionId, status: 'working' });
+    expect(events.filter((e) => e.kind === 'session_event' && e.type === 'started')).toHaveLength(
+      1,
+    );
+
+    await adapter.stopSession(sessionId);
+    await pending;
+  });
+
+  it('stops when told to, and reports itself canceled rather than failed', async () => {
+    const runId = 'run_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const sessionId = runOnceSessionId('codex', runId);
+    const pending = run('wait', { runId, timeoutMs: 20_000 });
+    await waitFor(() => adapter.oneShots().length === 1);
+
+    await adapter.stopSession(sessionId);
+    const res = await pending;
+    expect(res.outcome).toBe('canceled');
+    expect(res.error).toBeUndefined();
+    expect(rpc().some((l) => l.method === 'turn/interrupt')).toBe(true);
+    expect(await adapter.getStatus(sessionId)).toBeNull();
+    expect(adapter.oneShots()).toEqual([]);
+    const last = events.filter((e) => e.kind === 'session_event').at(-1);
+    expect(last).toMatchObject({ type: 'stopped', sessionId });
+  });
+
+  it('takes an instruction mid-run — a real steer against the live turn', async () => {
+    const runId = 'run_cccccccccccccccccccccccccccccccc';
+    const sessionId = runOnceSessionId('codex', runId);
+    const pending = run('wait', { runId, timeoutMs: 20_000 });
+    await waitFor(() => adapter.oneShots().length === 1);
+    // `turn/steer` needs the turn id, which arrives with `turn/start`'s response.
+    await waitFor(() => rpc().some((l) => l.method === 'turn/start'));
+
+    const sent = await adapter.sendInstruction({
+      sessionId,
+      instruction: 'focus on the auth path',
+      mode: 'auto',
+      localImagePaths: [],
+    });
+    // Codex owns the thread and the turn is live, so this is a steer, not a queue.
+    expect(sent).toEqual({ delivered: 'steered' });
+    const steer = rpc().find((l) => l.method === 'turn/steer');
+    expect(steer?.params.threadId).toBeDefined();
+    expect(steer?.params.input).toEqual([
+      { type: 'text', text: 'focus on the auth path', text_elements: [] },
+    ]);
+    await waitFor(() => frames().some((e) => JSON.stringify(e).includes('focus on the auth path')));
+
+    await adapter.stopSession(sessionId);
+    expect((await pending).outcome).toBe('canceled');
+  });
+
+  it('keeps its frames nested under the run, exactly as before', async () => {
     const res = await run(`write file ${path.join(project, '.pagr/handoff/hnd_3.md')}`);
-    expect(await adapter.listSessions()).toEqual([]);
-    expect(await adapter.getStatus(res.sessionId)).toBeNull();
-    await expect(
-      adapter.sendInstruction({
-        sessionId: res.sessionId,
-        instruction: 'keep going',
-        mode: 'auto',
-        localImagePaths: [],
-      }),
-    ).rejects.toThrow(/unknown session/);
-    expect(events.some((e) => e.kind === 'session')).toBe(false);
-    expect(events.some((e) => e.kind === 'session_event')).toBe(false);
     const got = frames();
     expect(got.length).toBeGreaterThan(0);
     expect(

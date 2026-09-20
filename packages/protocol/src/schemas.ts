@@ -356,6 +356,33 @@ export type ControlLevel = z.infer<typeof ControlLevel>;
 export const SessionOrigin = z.enum(['pagr', 'terminal', 'ide', 'unknown']);
 export type SessionOrigin = z.infer<typeof SessionOrigin>;
 
+/**
+ * The job Pagr started a headless run to do.
+ *
+ * A one-shot run — the handoff writer (spec §3) and the cross-agent reviewer (spec §5) — is an
+ * ordinary agent session that Pagr started with a job in mind and knows what to do with the file
+ * it produces. It is listed, steered and stopped exactly like any other session; this field is
+ * the only thing that separates it, and it exists so a phone can say "Claude is writing the
+ * handoff" instead of "a session".
+ */
+export const OneShotKind = z.enum(['handoff', 'review']);
+export type OneShotKind = z.infer<typeof OneShotKind>;
+
+/**
+ * The marker on a session Pagr started for a job of its own.
+ *
+ * `runId` is the SAME `run_…` id the run's frames already carry in `FrameMeta.subagent.id`, and
+ * carrying it here is what lets a client join the row to the frames nested under it without
+ * inventing a second identifier. (It is also the answer to HND-010b: the frame marker keeps
+ * meaning "nested agent work", and the session row — not the frame — is where "this is a
+ * one-shot" is said.)
+ */
+export const OneShotRun = z.object({
+  kind: OneShotKind,
+  runId: z.string().min(1).max(200),
+});
+export type OneShotRun = z.infer<typeof OneShotRun>;
+
 /** Whether the session's directory is a project the user has registered. */
 export const ProjectStatus = z.enum(['registered', 'unregistered']);
 export type ProjectStatus = z.infer<typeof ProjectStatus>;
@@ -429,6 +456,13 @@ export const HandoffState = z.enum([
   'running',
   'done',
   'failed',
+  /**
+   * A person stopped it. Terminal, and deliberately NOT `failed`: nothing broke, and a switch
+   * reported as a failure sends somebody looking for a bug they caused on purpose. It can only
+   * follow `capturing` — once the WIP commit has been made the switch is past the point where
+   * stopping it would leave less behind than finishing it.
+   */
+  'canceled',
 ]);
 export type HandoffState = z.infer<typeof HandoffState>;
 
@@ -578,6 +612,14 @@ export type RecipientKeySetSignature = z.infer<typeof RecipientKeySetSignature>;
 export const SessionSummaryV2 = SessionSummary.extend({
   controlLevel: ControlLevel.optional(),
   origin: SessionOrigin.optional(),
+  /**
+   * Set only on a session Pagr started to do a job of its own: write a handoff, review a diff.
+   *
+   * Absent on every ordinary session, which is why it is the discriminator rather than a new
+   * `origin` value — a run's origin really is `pagr`, and overloading that field would make a
+   * client that only knows origins stop recognising the sessions it has always recognised.
+   */
+  oneShot: OneShotRun.optional(),
   projectStatus: ProjectStatus.optional(),
   /** Highest frame sequence the bridge has journaled for this session. */
   lastSeq: z.number().int().nonnegative().optional(),
@@ -1031,6 +1073,19 @@ export const EventPayloads = {
     truncated: z.boolean().optional(),
     /** Set only with `state: 'failed'`; the first line of whatever went wrong, never a path. */
     error: z.string().max(500).optional(),
+  }),
+  /**
+   * A review ended because a person stopped it, and there is no verdict.
+   *
+   * Its own event rather than a `review.completed` with a made-up verdict, and rather than the
+   * `failed` path: a stopped review is not a broken one, and the difference decides both the
+   * sentence the phone gets and whether anybody goes looking for a bug. The reviewer's partial
+   * report — if it had begun one — is deliberately NOT read: see `review/run.ts`.
+   */
+  'review.canceled': z.object({
+    reviewId: ReviewId,
+    /** One line for the phone. Never a path, never a stack. */
+    message: z.string().max(500),
   }),
   /** The reviewing agent wrote its report. `summary` is the verdict line the phone is sent. */
   'review.completed': z.object({

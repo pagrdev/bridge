@@ -46,6 +46,10 @@ export const EXIT_FOR_CODE: Record<string, number> = {
   // The work was attempted and did not produce what it promised.
   no_report: EXIT.error,
   provider_error: EXIT.error,
+  // Somebody stopped it. Still a non-zero exit — the command did not produce the verdict it was
+  // asked for — but it reuses `error` rather than taking a sixth code, because `EXIT_CODES` is
+  // asserted to be exactly six in the web CLI reference (see HND-034b).
+  canceled: EXIT.error,
 };
 
 /** Any IPC failure, as the CliError the exit-code contract describes. */

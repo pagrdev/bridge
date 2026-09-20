@@ -10,6 +10,7 @@ import {
   canonicalize,
   type DeviceEvent,
   type EventPayload,
+  type OneShotKind,
   type ProjectSummary,
   type Provider,
   type RepoScanResult,
@@ -22,7 +23,12 @@ import {
   type SessionSummary,
   type SessionSummaryV2,
 } from '@pagr/protocol';
-import { runOnceFrameMeta } from './adapters/runOnce.js';
+import {
+  newRunId,
+  oneShotSummary,
+  runOnceFrameMeta,
+  runOnceSessionId,
+} from './adapters/runOnce.js';
 import type { AdapterEvent, CodingAgentAdapter } from './adapters/types.js';
 import {
   APPROVAL_OPTION_KINDS,
@@ -403,6 +409,14 @@ export type ReviewEnd =
   | {
       reviewId: string;
       ok: false;
+      /**
+       * True when a person stopped it rather than it breaking.
+       *
+       * The local waiter needs the difference for the same reason the phone does: a stopped
+       * review is not an error a script should shout about, and `pagr review` turns this into a
+       * different exit code and a different sentence.
+       */
+      canceled?: boolean;
       /** Where the report would have been. It is not there. */
       path: string;
       /** One line: why there is no verdict. */
@@ -849,6 +863,9 @@ export class Dispatcher {
       case 'agent.stop_session': {
         this.assertOurSession(body.payload.sessionId, 'stop');
         const { adapter } = this.sessionAdapter(body.payload.sessionId);
+        // First, so a handoff or a review that this run belongs to knows it was called off
+        // before the process it is watching starts dying. See `runAborts`.
+        this.runAborts.get(body.payload.sessionId)?.abort();
         await adapter.stopSession(body.payload.sessionId);
         this.o.sessions.setStatus(body.payload.sessionId, 'stopped');
         return { sessionId: body.payload.sessionId };
@@ -885,6 +902,7 @@ export class Dispatcher {
         return this.applyReview(body.payload);
       case 'session.handoff.capture':
         this.assertV2(body.version, 'session.handoff.capture');
+        this.refuseOnOneShot(body.payload.sessionId, 'hand off');
         return this.handoffCapture(body.payload);
       case 'repo.scan':
         return this.scanRepositories();
@@ -933,6 +951,17 @@ export class Dispatcher {
     // what it spawned — but they are real, and the phone has to be able to see one to answer its
     // prompts. Only those inside a registered project can be described: a `SessionSummary` names
     // a `proj_…` id. The `device.hello` ceiling below still applies to all of them together.
+    // Live headless runs, for an adapter whose `listSessions` a probe could not reach. The
+    // adapters list their own runs, so this is normally a no-op — but a hello that silently
+    // dropped the run a person is watching is the exact regression HND-019 exists to stop.
+    for (const adapter of this.o.adapters.values()) {
+      for (const run of adapter.oneShots?.() ?? []) {
+        const summary = oneShotSummary(run);
+        if (!summary || seen.has(summary.sessionId)) continue;
+        seen.add(summary.sessionId);
+        sessions.push(summary);
+      }
+    }
     for (const rec of this.o.sessions.list()) {
       if (!isAdopted(rec) || !isReportable(rec) || seen.has(rec.sessionId)) continue;
       seen.add(rec.sessionId);
@@ -1226,8 +1255,42 @@ export class Dispatcher {
 
   private sessionAdapter(sessionId: string) {
     const rec = this.o.sessions.get(sessionId);
-    if (!rec) throw new DispatchError('unknown_session', 'unknown session');
-    return { rec, adapter: this.adapterFor(rec.provider) };
+    if (rec) return { rec, adapter: this.adapterFor(rec.provider) };
+    // A live headless run. It has no persisted record, so one is synthesised from what the
+    // adapter told us — enough for `stop` and `send_instruction`, which are the two commands
+    // that reach a run, and honest about the rest (it is ours, it is not adopted, it is live).
+    const run = this.oneShots.get(sessionId);
+    if (run) {
+      const now = this.now().toISOString();
+      const rec: SessionRecord = {
+        sessionId,
+        provider: run.provider,
+        projectId: run.projectId,
+        providerSessionId: sessionId,
+        status: 'working',
+        startedAt: now,
+        updatedAt: now,
+      };
+      return { rec, adapter: this.adapterFor(run.provider) };
+    }
+    throw new DispatchError('unknown_session', 'unknown session');
+  }
+
+  /**
+   * Refuse a command that names a headless run when the command makes no sense for one.
+   *
+   * Only two do. A run can be stopped and a run can be steered — those are the whole of what
+   * HND-019 added — but there is nothing to hand OFF from a run (its transcript is the handoff
+   * being written) and nothing to migrate rules for. Saying so by name beats `unknown_session`,
+   * which would be a lie about a session the phone is looking at.
+   */
+  private refuseOnOneShot(sessionId: string, what: string): void {
+    const run = this.oneShots.get(sessionId);
+    if (!run) return;
+    throw new DispatchError(
+      'capability_unsupported',
+      `that is ${run.kind === 'handoff' ? 'the run writing your handoff' : 'the run reviewing your diff'}, not a session you can ${what}. You can stop it, and you can tell it what to focus on.`,
+    );
   }
 
   /** A live Pagr channel bound to this exact session, i.e. a `pagr claude` terminal. */
@@ -1674,6 +1737,27 @@ export class Dispatcher {
     p: CommandPayload<'session.handoff.capture'>,
   ): Promise<HandoffCaptureAck> {
     const { rec, adapter } = this.sessionAdapter(p.sessionId);
+    // The capture's own abort handle, keyed by the `ses_…` the receiver's run will be listed
+    // under — so stopping that run from a phone calls the whole capture off at the moment the
+    // person presses stop, not when the dying process reports back. The run id is minted here
+    // for exactly that reason (it is also what makes a retry group under one id).
+    const capture = new AbortController();
+    const runId = newRunId();
+    const runSessions = [runOnceSessionId('claude', runId), runOnceSessionId('codex', runId)];
+    for (const id of runSessions) this.runAborts.set(id, capture);
+    try {
+      return await this.runHandoff(p, rec, adapter, { capture, runId });
+    } finally {
+      for (const id of runSessions) this.runAborts.delete(id);
+    }
+  }
+
+  private async runHandoff(
+    p: CommandPayload<'session.handoff.capture'>,
+    rec: SessionRecord,
+    adapter: CodingAgentAdapter,
+    o: { capture: AbortController; runId: string },
+  ): Promise<HandoffCaptureAck> {
     const run = await runHandoffCapture({
       handoffId: p.handoffId,
       sessionId: p.sessionId,
@@ -1695,7 +1779,7 @@ export class Dispatcher {
       // and never answered — falls through to the RECEIVING agent, which writes the note from
       // the sender's transcript. `receiverCapture` is the adapter between the switch's seam and
       // `handoff/receiver.ts`; everything it cannot supply is refused there, by name.
-      captureFromReceiver: this.receiverCapture(rec),
+      captureFromReceiver: this.receiverCapture(rec, o),
       ...(p.note !== undefined ? { note: p.note } : {}),
       ...(this.o.env ? { env: this.o.env } : {}),
       ...(this.o.git ? { git: this.o.git } : {}),
@@ -1769,7 +1853,10 @@ export class Dispatcher {
    * transcript was there and whether the run could be started, and duplicating the checks here
    * would give a person two different sentences for one fact.
    */
-  private receiverCapture(rec: SessionRecord): ReceiverCapture {
+  private receiverCapture(
+    rec: SessionRecord,
+    o: { capture: AbortController; runId: string },
+  ): ReceiverCapture {
     const refuse = (reason: CaptureRefusal, message: string): CaptureOutcome => ({
       outcome: 'refused',
       writer: 'receiver',
@@ -1807,6 +1894,8 @@ export class Dispatcher {
         to: input.to,
         receiver,
         transcript,
+        runId: o.runId,
+        signal: o.capture.signal,
         ...(rec.cwd ? { cwd: rec.cwd } : {}),
         ...(isReportable(rec) ? { projectId: rec.projectId } : {}),
         ...(input.note !== undefined ? { note: input.note } : {}),
@@ -2263,6 +2352,30 @@ export class Dispatcher {
     { controller: AbortController; task: Promise<void> }
   >();
   private readonly reviewProjects = new Map<string, { projectId: string; reviewer: Provider }>();
+  /**
+   * Headless runs that are live right now, by the `ses_…` each is listed under (HND-019).
+   *
+   * It exists because a run has no row in `sessions.json` and must not get one: a run dies with
+   * the daemon, so a persisted record would come back after a restart claiming to be `working`
+   * with no process behind it — and `reconcile`, `prune`, the keep-awake tally and the working-
+   * tree guard would all then be reasoning about a session that does not exist. This map is the
+   * live answer instead, rebuilt from the `session` events the adapters emit, and it is what
+   * lets `agent.stop_session` and `agent.send_instruction` resolve a run's id to its adapter.
+   */
+  /**
+   * The abort handle for the JOB a live run belongs to, by the run's `ses_…`.
+   *
+   * `agent.stop_session` fires this BEFORE it asks the adapter to kill anything, and the order
+   * is the point. The caller — `awaitReview`, the handoff capture — then knows the job was
+   * called off at the instant the person pressed stop, rather than a few milliseconds later when
+   * the dead process's outcome comes back. Without it there is a window in which the watcher can
+   * read the half-flushed file the kill left behind and report it as an answer.
+   */
+  private readonly runAborts = new Map<string, AbortController>();
+  private readonly oneShots = new Map<
+    string,
+    { provider: Provider; projectId: string; kind: OneShotKind; runId: string }
+  >();
 
   /**
    * Callers on this Mac waiting for a review to end — today, `pagr review` through the daemon's
@@ -2350,15 +2463,25 @@ export class Dispatcher {
 
     this.rememberReview(p.reviewId, { projectId: p.projectId, reviewer: p.reviewer });
     const controller = new AbortController();
+    // Minted here, not inside `awaitReview`, so the `ses_…` the reviewer will be listed under is
+    // known before it exists — which is what lets `agent.stop_session` on that id reach this
+    // controller the instant a person presses stop.
+    const runId = newRunId();
+    const runSession = runOnceSessionId(p.reviewer, runId);
+    this.runAborts.set(runSession, controller);
     const task = this.finishReview({
       prepared,
       reviewer: p.reviewer,
       projectId: p.projectId,
       runner: { runOnce },
       signal: controller.signal,
+      runId,
       commandId,
     })
-      .finally(() => this.reviewRuns.delete(p.reviewId))
+      .finally(() => {
+        this.runAborts.delete(runSession);
+        this.reviewRuns.delete(p.reviewId);
+      })
       // Nothing awaits this task until `settleReviews`, so it owns its own failures: an
       // unhandled rejection here would take the daemon down minutes after the ack said yes.
       .catch((err: unknown) =>
@@ -2378,6 +2501,7 @@ export class Dispatcher {
     projectId: string;
     runner: ReviewRunner;
     signal: AbortSignal;
+    runId: string;
     commandId: string;
   }): Promise<void> {
     const bounds = this.o.review ?? {};
@@ -2389,6 +2513,7 @@ export class Dispatcher {
         runner: o.runner,
         projectId: o.projectId,
         signal: o.signal,
+        runId: o.runId,
         ...(this.o.env ? { env: this.o.env } : {}),
         ...(bounds.timeoutMs !== undefined ? { timeoutMs: bounds.timeoutMs } : {}),
         ...(bounds.pollIntervalMs !== undefined ? { pollIntervalMs: bounds.pollIntervalMs } : {}),
@@ -2404,6 +2529,34 @@ export class Dispatcher {
         ok: false,
         path: o.prepared.reviewPath,
         message: `the review of ${o.prepared.repo} broke down: ${message}`,
+      });
+      return;
+    }
+
+    if (outcome.outcome === 'canceled') {
+      // Stopped, not failed, and said that way in all three places a person might look: the
+      // session row goes `stopped`, the review gets its own terminal event, and the local
+      // waiter is told it was canceled so `pagr review` does not print an error.
+      this.logger.info('review stopped', { reviewId: outcome.reviewId, reviewer: o.reviewer });
+      this.send('session.event', {
+        sessionId: outcome.sessionId,
+        projectId: o.projectId,
+        provider: o.reviewer,
+        kind: 'stopped',
+        summary: outcome.message,
+        at: this.now().toISOString(),
+      });
+      this.send(
+        'review.canceled',
+        { reviewId: outcome.reviewId, message: outcome.message },
+        o.commandId,
+      );
+      this.endReview({
+        reviewId: outcome.reviewId,
+        ok: false,
+        canceled: true,
+        path: outcome.path,
+        message: outcome.message,
       });
       return;
     }
@@ -2603,6 +2756,20 @@ export class Dispatcher {
       case 'session': {
         const s = e.session;
         this.noteTurnStatus(s.sessionId, s.status, s.activeTurn);
+        if (s.oneShot) {
+          // A run is live state, never a persisted record — see `oneShots`. The row still goes
+          // to the cloud exactly as any other session's does, which is the whole point.
+          if (isTerminalStatus(s.status)) this.oneShots.delete(s.sessionId);
+          else
+            this.oneShots.set(s.sessionId, {
+              provider,
+              projectId: s.projectId,
+              kind: s.oneShot.kind,
+              runId: s.oneShot.runId,
+            });
+          this.send('session.updated', this.withLastSeq(s));
+          return;
+        }
         const rec = this.o.sessions.get(s.sessionId);
         const adopted = e.adopted ?? rec?.adopted;
         const cwd = e.localCwd ?? rec?.cwd;
@@ -2766,8 +2933,11 @@ export class Dispatcher {
 
   async shutdown(): Promise<void> {
     for (const u of this.unsubscribes) u();
-    // A reviewer is a headless process reading the user's repository with nobody waiting on it;
-    // it does not outlive the daemon that started it.
+    // A headless run is an agent reading the user's repository with nobody left waiting on it;
+    // it does not outlive the daemon that started it. `runAborts` covers the handoff writer as
+    // well as the reviewer — before HND-019 a daemon shutting down mid-handoff left the writer
+    // running, because only the review path had a controller at all.
+    for (const c of this.runAborts.values()) c.abort();
     for (const r of this.reviewRuns.values()) r.controller.abort();
     await this.settleReviews();
     // Every session ends with the daemon, so no agent is going to read these files again.
@@ -2817,4 +2987,8 @@ const HANDOFF_ACK_CODE: Record<HandoffFailure, AckErrorCode> = {
   commit_failed: 'provider_error',
   write_failed: 'provider_error',
   stop_failed: 'provider_error',
+  // Not `provider_error`: no provider erred. The cloud reads the `handoff.updated` state for
+  // the fact and this only decides which ack the command gets; `capability_unsupported` is the
+  // closest existing code for "this did not happen, and not because anything is broken".
+  canceled: 'capability_unsupported',
 };

@@ -13,3 +13,14 @@ export {
   realpathNearest,
   relativizePaths,
 } from '@pagr/bridge-core';
+
+/**
+ * Attachments, as a line the model can act on.
+ *
+ * Paths rather than bytes: the images are already on this Mac, the agent can open a file, and
+ * inlining them would put them through the model's context twice.
+ */
+export const withImages = (instruction: string, images: string[]): string =>
+  images.length
+    ? `${images.map((p) => `See screenshot at ${p}`).join('\n')}\n\n${instruction}`
+    : instruction;

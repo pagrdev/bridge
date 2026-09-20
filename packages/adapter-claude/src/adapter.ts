@@ -21,7 +21,10 @@ import {
   askUserQuestionUpdatedInput,
   claudeApprovalOptions,
   type FrameQuestion,
+  type LiveOneShot,
   newRunId,
+  OneShotRegistry,
+  oneShotSummary,
   type QuestionAnswer,
   questionBodyFor,
   runOnceSessionId,
@@ -37,7 +40,7 @@ import {
   TranscriptResultLookup,
   terminalBodyFor,
 } from './diffs.js';
-import { clip, type Hints, hintsForCommand, hintsForFiles } from './heuristics.js';
+import { clip, type Hints, hintsForCommand, hintsForFiles, withImages } from './heuristics.js';
 import { claudeHookState } from './hooks/install.js';
 import { FileLogger } from './logger.js';
 import { runClaudeOnce } from './run-once.js';
@@ -215,11 +218,6 @@ const DELIVERY_TEXT = {
   delivered: 'Claude Code picked it up; it runs at the next turn boundary.',
 } as const;
 
-const withImages = (instruction: string, images: string[]): string =>
-  images.length
-    ? `${images.map((p) => `See screenshot at ${p}`).join('\n')}\n\n${instruction}`
-    : instruction;
-
 const CAPABILITIES = {
   canStartSession: true,
   canResumeSession: true,
@@ -253,6 +251,14 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   readonly provider = 'claude' as const;
   private readonly logger: FileLogger;
   private readonly sessions = new Map<string, LiveSession>();
+  /**
+   * Headless runs in flight, by the `ses_…` each is listed under (HND-019).
+   *
+   * Separate from `sessions` on purpose: a run has no persisted row, is never resumed, and dies
+   * with this process. What it shares with a session is everything a person can do to it, which
+   * is why `listSessions`, `getStatus`, `sendInstruction` and `stopSession` all consult it.
+   */
+  private readonly runs = new OneShotRegistry();
   private readonly pending = new Map<string, PendingApproval>();
   /** Pending `AskUserQuestion` prompts, keyed by the id the dispatcher answers with. */
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
@@ -423,16 +429,25 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     return value;
   }
 
+  oneShots(): LiveOneShot[] {
+    return this.runs.list();
+  }
+
   async listSessions(): Promise<SessionSummary[]> {
     // Bound what we remember before anyone copies it into a `device.hello` (BR-3).
     this.map.prune({ protect: new Set(this.sessions.keys()) });
     const out = new Map<string, SessionSummary>();
     for (const [sid, p] of this.map.entries()) out.set(sid, persistedSummary(sid, p));
     for (const [sid, s] of this.sessions) out.set(sid, s.summary);
+    // Last, so a run always wins over anything that happens to share its id: a live run is the
+    // most recent truth about it, and this is the list a person looks at to find running work.
+    for (const summary of this.runs.summaries()) out.set(summary.sessionId, summary);
     return [...out.values()];
   }
 
   async getStatus(sessionId: string): Promise<SessionSummary | null> {
+    const run = this.runs.get(sessionId);
+    if (run) return oneShotSummary(run);
     const live = this.sessions.get(sessionId);
     if (live) return live.summary;
     const p = this.map.get(sessionId);
@@ -499,9 +514,9 @@ export class ClaudeAdapter implements CodingAgentAdapter {
    * One bounded headless run (`runOnce.ts` in core): the handoff writer, the reviewer.
    *
    * Deliberately not a session. Nothing here writes to `this.sessions` or to the session map, so
-   * `listSessions` never returns it, `getStatus` has never heard of it, `sendInstruction` and
-   * `stopSession` cannot reach it, and no `session` event is emitted — which is the whole of
-   * "must not be offered by what's running?".
+   * `listSessions` returns it, `getStatus` answers for it, `sendInstruction` queues onto it and
+   * `stopSession` kills it — it is a session Pagr started with a job in mind (HND-019). What it
+   * is not is resumable: there is one artefact and the caller is holding the promise for it.
    *
    * It also does not take a slot in `maxLiveProcesses`. That budget exists to stop one `claude`
    * per remembered session piling up forever; a run has a timeout, and making a handoff evict
@@ -538,6 +553,20 @@ export class ClaudeAdapter implements CodingAgentAdapter {
       ...(settingSources ? { settingSources } : {}),
       sealed: sealedModeEnabled(env),
       logger: this.logger,
+      registry: this.runs,
+      onSession: (session) => this.emit({ kind: 'session', session, localCwd: input.cwd }),
+      onSessionEvent: (type, summary) => {
+        // Same rule as a frame: an event that names no project is an event the cloud cannot
+        // route, so it stays here rather than going out addressed to nothing.
+        if (!input.projectId) return;
+        this.emit({
+          kind: 'session_event',
+          sessionId,
+          projectId: input.projectId,
+          type,
+          summary,
+        });
+      },
       onFrame: ({ body, meta, endsTurn }) => {
         // No project means no route: a frame the cloud cannot address is journaled by nobody and
         // sent to nobody, exactly as a mirrored thread in an unregistered directory is.
@@ -557,6 +586,12 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   async sendInstruction(
     input: SendInstructionInput,
   ): Promise<{ delivered: 'steered' | 'queued' | 'new_turn' }> {
+    // A headless run Pagr started: it holds its own process, so the text goes straight onto its
+    // queue and lands at the next turn boundary. `queued` is the honest word — Claude takes no
+    // interrupt (ADR 0001) — and it is the same word this method gives for every other Claude
+    // session that is mid-turn.
+    const run = this.runs.get(input.sessionId);
+    if (run) return run.send(input.instruction, input.localImagePaths);
     // Channel mode: a Pagr channel server is polling for this session, so the text goes into the
     // running Claude Code session (`notifications/claude/channel`). It renders in that terminal at
     // once and the model acts on it at the next turn boundary — so the honest answer is `queued`,
@@ -593,6 +628,13 @@ export class ClaudeAdapter implements CodingAgentAdapter {
   }
 
   async stopSession(sessionId: string): Promise<void> {
+    // A run stops the way it was always able to: the `AbortSignal` path, reached from the
+    // user-facing stop instead of only from a dying daemon.
+    const run = this.runs.get(sessionId);
+    if (run) {
+      await run.stop();
+      return;
+    }
     const live = this.sessions.get(sessionId);
     if (!live) return;
     live.queued = [];
@@ -646,6 +688,9 @@ export class ClaudeAdapter implements CodingAgentAdapter {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    // A headless run is a `claude` reading the user's repository with nobody left to read what
+    // it writes; it does not outlive the daemon that started it.
+    await this.runs.stopAll();
     this.unsubscribePickup?.();
     this.unsubscribePickup = null;
     this.mirror?.stop();

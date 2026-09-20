@@ -164,7 +164,7 @@ export type StopSender = () => Promise<void>;
  * guessing about work it has not been asked to do yet.
  */
 export interface HandoffUpdate {
-  state: Extract<HandoffState, 'capturing' | 'committing' | 'stopping' | 'failed'>;
+  state: Extract<HandoffState, 'capturing' | 'committing' | 'stopping' | 'failed' | 'canceled'>;
   summary?: string;
   writer?: HandoffWriter;
   wipCommit?: string;
@@ -212,7 +212,16 @@ export type HandoffFailure =
   /** The handoff file could not be written: its directory, or the rewrite that stamps it. */
   | 'write_failed'
   /** The sender is still running and could not be stopped. Two agents, one tree: refuse. */
-  | 'stop_failed';
+  | 'stop_failed'
+  /**
+   * A person stopped the run that was writing the note.
+   *
+   * Its own reason, not `no_handoff`: nothing broke. It can only happen during `capturing` —
+   * once the WIP commit exists the switch is past the point where stopping leaves less behind
+   * than finishing — and the receiver deletes whatever it had half written (see `receiver.ts`),
+   * so the sender keeps running with its work untouched.
+   */
+  | 'canceled';
 
 export type HandoffCaptureRun =
   | {
@@ -357,6 +366,19 @@ export async function runHandoffCapture(input: HandoffCaptureRunInput): Promise<
 
   // ---- 2. get the file written ----
   const captured = await capture(input, root, notify);
+  if (captured.outcome === 'refused' && captured.reason === 'run_canceled') {
+    // Stopped, not broken. `canceled` is terminal and carries no `error`, so nothing downstream
+    // reads it as a fault: the sender is untouched, nothing was committed, and the only honest
+    // thing left to say is that the person stopped it.
+    notify({ state: 'canceled', writer: captured.writer });
+    return {
+      outcome: 'failed',
+      reason: 'canceled',
+      message: captured.message,
+      path: captured.path,
+      writer: captured.writer,
+    };
+  }
   if (captured.outcome !== 'written') {
     return fail('no_handoff', captureFailureMessage(captured), {
       path: captured.path,

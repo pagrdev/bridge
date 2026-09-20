@@ -288,6 +288,7 @@ async function runReceiver(
         transcript: transcriptFile,
         note: o.note,
       }),
+      kind: 'handoff',
       timeoutMs,
       ...(o.signal ? { signal: o.signal } : {}),
       ...(o.runId ? { runId: o.runId } : {}),
@@ -297,6 +298,24 @@ async function runReceiver(
     // `runOnce` is specified to resolve rather than throw, but an adapter is a subprocess with
     // an owner, and a handoff must not die on somebody else's stack trace.
     return refuse('run_failed', errorMessage(e), path);
+  }
+
+  /**
+   * Somebody stopped it, so there is no handoff — and whatever is at `path` is deleted rather
+   * than read.
+   *
+   * This is the one case where the file is checked AFTER the outcome, and it is the whole of the
+   * design answer to "does stopping mid-write leave a half-written handoff?". Yes, it can: the
+   * format's required sections are written top-down, so a note killed part way through can still
+   * parse while missing `# Not done` and `# Known failures` — and the receiving agent is then
+   * started on an instruction that says "continue the task" against a note that says the work is
+   * finished. A relitigated task is the failure this feature exists to prevent, and a confidently
+   * wrong handoff causes it. So a stop produces nothing, which is what the person asked for, and
+   * the sender is never stopped and never committed against.
+   */
+  if (result.outcome === 'canceled') {
+    await rm(path, { force: true }).catch(() => undefined);
+    return refuse('run_canceled', 'the handoff was stopped before it was written', path);
   }
 
   // The file is checked before the outcome is, and on purpose: an agent that wrote the note and
@@ -341,8 +360,6 @@ async function runReceiver(
     });
     return { outcome: 'timeout', writer, path, waitedMs: timeoutMs };
   }
-  if (result.outcome === 'canceled')
-    return refuse('run_canceled', 'the handoff was called off', path);
   if (result.outcome === 'failed') {
     return refuse('run_failed', result.error?.message ?? `${o.to} failed to run`, path);
   }
