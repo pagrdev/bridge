@@ -12,7 +12,6 @@ import {
   REVIEW_TIMEOUT_MS,
   type ReviewRunner,
   ReviewStartError,
-  reviewAllowedWrites,
   reviewApplyInstruction,
   reviewTimeoutMs,
   reviewWipCommitMessage,
@@ -206,18 +205,13 @@ describe('prepareReview', () => {
     expect((err as ReviewStartError).reason).toBe('hook_failed');
   });
 
-  it('points the reviewer at the packet and lets it write only its own review directory', async () => {
+  it('points the reviewer at the packet and at the one file it is asked to write', async () => {
     const prepared = await prepare(t.home, []);
-    expect(prepared.allowedWrites).toEqual(reviewAllowedWrites(REVIEW_ID));
-    expect(prepared.allowedWrites).toEqual([`.pagr/review/${REVIEW_ID}/**`]);
     expect(prepared.prompt).toContain(prepared.packet.packetPath);
     expect(prepared.prompt).toContain(prepared.reviewPath);
     // The reviewer is never told how the author got there (ADR 0019 decision 4).
     expect(prepared.prompt).not.toContain('handoff');
-    // HND-015: on the Codex side the run's working directory is `<repo>/.pagr`, so the tree it
-    // is reviewing is named absolutely and every path it is given is absolute too.
-    expect(prepared.prompt).toContain(prepared.repo);
-    expect(prepared.prompt).toContain('working directory is not necessarily that root');
+    // Every path a run is given is absolute, so nothing depends on where it resolves one from.
     expect(isAbsolute(prepared.packet.packetPath)).toBe(true);
     expect(isAbsolute(prepared.reviewPath)).toBe(true);
   });
@@ -242,10 +236,7 @@ describe('awaitReview', () => {
     expect(outcome.text).toContain('### findings');
     // The prompt told it to write the file and stop; once it has, nothing else it does is wanted.
     expect(reviewer.aborted).toBe(true);
-    expect(reviewer.calls[0]).toMatchObject({
-      cwd: prepared.repo,
-      allowedWrites: [`.pagr/review/${REVIEW_ID}/**`],
-    });
+    expect(reviewer.calls[0]).toMatchObject({ cwd: prepared.repo });
   });
 
   it('degrades an unreadable verdict to comment and carries the line the reviewer wrote', async () => {

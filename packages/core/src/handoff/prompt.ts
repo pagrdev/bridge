@@ -22,16 +22,6 @@ export interface HandoffWritePromptInput {
    * where the writing agent was not in the conversation and has to read it first.
    */
   transcriptPath?: string | undefined;
-  /**
-   * Absolute path to the work tree root, for a writer whose working directory is not it.
-   *
-   * The receiver-writes path spawns a headless run, and a Codex run is started inside
-   * `<repo>/.pagr` so its sandbox cannot reach source (`adapter-codex/src/run-once.ts`,
-   * HND-015). The transcript it is reading is full of repository-relative paths; without this
-   * line none of them resolve. Omitted on the sender path, where the agent is already sitting
-   * in the repository and a second sentence about where it is would be noise.
-   */
-  repo?: string | undefined;
 }
 
 /** The four rules from spec §2, in the order they are stated there. */
@@ -70,14 +60,6 @@ export function handoffWritePrompt(input: HandoffWritePromptInput): string {
       `Stop what you are doing and write a handoff note. The work is moving to ${receiver},`,
       'which has none of this conversation. Do not change any other file, and do not try to',
       'finish the current task first.',
-    );
-  }
-
-  if (input.repo) {
-    lines.push(
-      '',
-      `The repository is at ${input.repo}. You may read any file in it, but your working`,
-      'directory is not necessarily that root: open files by their absolute path.',
     );
   }
 

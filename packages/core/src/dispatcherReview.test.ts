@@ -251,7 +251,6 @@ describe('review.start / review.apply', () => {
     expect(runs).toHaveLength(1);
     const run = runs[0] as RunOnceInput;
     expect(run.cwd).toBe(repo);
-    expect(run.allowedWrites).toEqual([`.pagr/review/${REVIEW_ID}/**`]);
     expect(run.prompt).toContain(join(repo, '.pagr', 'review', REVIEW_ID, 'packet.md'));
     expect(run.projectId).toBe(projectId);
   });

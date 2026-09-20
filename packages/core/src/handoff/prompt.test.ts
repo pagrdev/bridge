@@ -105,20 +105,6 @@ describe('handoffWritePrompt', () => {
     `);
   });
 
-  /**
-   * HND-015: the receiver path spawns a headless run whose working directory is `<repo>/.pagr`
-   * on the Codex side, so the repository is named. The sender path is a live session sitting in
-   * the repository already and says nothing about it.
-   */
-  it('names the repository only when the caller passes one', () => {
-    const withRepo = handoffWritePrompt({ path: PATH, to: 'codex', repo: '/Users/x/code/api' });
-    expect(withRepo).toContain('The repository is at /Users/x/code/api.');
-    expect(withRepo).toContain('open files by their absolute path');
-    expect(handoffWritePrompt({ path: PATH, to: 'codex' })).not.toContain('The repository is at');
-    // Whatever is added, the last instruction stays last.
-    expect(withRepo.trimEnd().endsWith('Write the file, then stop. Say nothing else.')).toBe(true);
-  });
-
   it('snapshot — receiver path, with a note', () => {
     expect(
       handoffWritePrompt({

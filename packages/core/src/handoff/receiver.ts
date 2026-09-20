@@ -134,15 +134,6 @@ export interface CaptureFromReceiverInput {
   runId?: string | undefined;
 }
 
-/**
- * What a receiver run may write: `.pagr/`, and nothing else in the tree.
- *
- * It is also, on the Codex side, exactly what the OS sandbox grants — the run's thread is
- * started in `<repo>/.pagr` (HND-015), so this glob and the kernel's boundary say the same
- * thing. On the Claude side it is a tool allow-list with every other prompt denied.
- */
-export const RECEIVER_ALLOWED_WRITES = ['.pagr/**'] as const;
-
 const errorMessage = (e: unknown): string =>
   e instanceof Error ? e.message : typeof e === 'string' ? e : 'unknown error';
 
@@ -160,8 +151,7 @@ function notify(sink: ((e: CaptureProgress) => void) | undefined, event: Capture
  * The instruction the headless writer gets.
  *
  * `handoffWritePrompt` unchanged — the format has exactly one statement of itself and this path
- * does not get a second one. Two things are added: the work tree root, because a headless run's
- * working directory is not it (`repo`, HND-015), and the spill directory, PREPENDED rather than
+ * does not get a second one. One thing is added: the spill directory, PREPENDED rather than
  * appended, because the prompt's last line is "Write the file, then stop" and nothing should
  * come after it.
  */
@@ -170,15 +160,12 @@ export function receiverWritePrompt(input: {
   to: HandoffProvider;
   transcript: ResolvedTranscript;
   note?: string | undefined;
-  /** The work tree root. Named in the prompt because the run's cwd may not be it (HND-015). */
-  repo: string;
 }): string {
   const prompt = handoffWritePrompt({
     path: input.path,
     to: input.to,
     note: input.note,
     transcriptPath: input.transcript.path,
-    repo: input.repo,
   });
   if (!input.transcript.spillDir) return prompt;
   return [
@@ -300,9 +287,7 @@ async function runReceiver(
         to: o.to,
         transcript: transcriptFile,
         note: o.note,
-        repo: root,
       }),
-      allowedWrites: [...RECEIVER_ALLOWED_WRITES],
       timeoutMs,
       ...(o.signal ? { signal: o.signal } : {}),
       ...(o.runId ? { runId: o.runId } : {}),

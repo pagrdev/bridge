@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  isRunOnceFrame,
-  newRunId,
-  runOnceFrameMeta,
-  runOnceSessionId,
-  writableRootsFor,
-} from './runOnce.js';
+import { isRunOnceFrame, newRunId, runOnceFrameMeta, runOnceSessionId } from './runOnce.js';
 
 describe('run ids', () => {
   it('mints a local `run_` id and a stable `ses_` id from it', () => {
@@ -33,28 +27,5 @@ describe('the frame marker', () => {
     expect(isRunOnceFrame({ source: 'transcript', subagent: { id: 'agent-7', depth: 1 } })).toBe(
       false,
     );
-  });
-});
-
-describe('writableRootsFor', () => {
-  it('cuts a glob at its first magic segment and makes it absolute', () => {
-    expect(writableRootsFor('/repo', ['.pagr/**'])).toEqual(['/repo/.pagr']);
-    expect(writableRootsFor('/repo', ['.pagr/review/*/packet.md'])).toEqual(['/repo/.pagr/review']);
-  });
-
-  it('keeps an absolute glob absolute', () => {
-    expect(writableRootsFor('/repo', ['/var/folders/x/**'])).toEqual(['/var/folders/x']);
-  });
-
-  it('collapses a root another root already contains, in either order', () => {
-    expect(writableRootsFor('/repo', ['.pagr/**', '.pagr/handoff/**'])).toEqual(['/repo/.pagr']);
-    expect(writableRootsFor('/repo', ['.pagr/handoff/**', '.pagr/**'])).toEqual(['/repo/.pagr']);
-  });
-
-  it('grants nothing for an empty list, and nothing extra for a bare `**`', () => {
-    expect(writableRootsFor('/repo', [])).toEqual([]);
-    // `**` has no literal prefix: the workspace is whatever the sandbox already grants, and this
-    // must not quietly widen it to the filesystem root.
-    expect(writableRootsFor('/repo', ['**'])).toEqual([]);
   });
 });

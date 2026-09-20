@@ -109,18 +109,6 @@ export const reviewWipCommitMessage = (reviewer: Provider): string =>
 export const reviewApplyInstruction = (reviewId: string): string =>
   `Read ${REVIEW_DIR}/${reviewId}/review.md and fix the blocking findings`;
 
-/**
- * The only thing a reviewing run may write.
- *
- * One review's own directory, so a reviewer cannot "helpfully" fix what it found, and two
- * concurrent reviews cannot overwrite each other's report. Claude's rules really are limited to
- * these globs. Codex widens them to `<repo>/.pagr` — its sandbox grants the directory the thread
- * is started in and has no way to express anything narrower (`adapter-codex/src/run-once.ts`) —
- * so on that side a reviewer cannot touch the repository, but could in principle write elsewhere
- * under `.pagr`. Neither can fix what it found, which is the property this exists for.
- */
-export const reviewAllowedWrites = (reviewId: string): string[] => [`${REVIEW_DIR}/${reviewId}/**`];
-
 /** Where the reviewer's report goes, under the work tree root. */
 export const reviewFilePath = (repoRootDir: string, reviewId: string): string =>
   join(repoRootDir, REVIEW_DIR, reviewId, 'review.md');
@@ -184,7 +172,6 @@ export interface PreparedReview {
   reviewPath: string;
   /** The reviewer's whole instruction. */
   prompt: string;
-  allowedWrites: string[];
   /** The WIP commit, when the tree was dirty. Absent when it was already clean. */
   wipCommit?: string;
   /** Files that commit carried. 0 when nothing was committed. */
@@ -259,9 +246,7 @@ export async function prepareReview(input: PrepareReviewInput): Promise<Prepared
     prompt: reviewPrompt({
       packetPath: packet.packetPath,
       outPath: packet.reviewPath,
-      repo: root,
     }),
-    allowedWrites: reviewAllowedWrites(input.reviewId),
     ...(commit.committed && commit.sha ? { wipCommit: commit.sha } : {}),
     filesChanged: commit.filesChanged,
   };
@@ -363,7 +348,6 @@ export async function awaitReview(input: AwaitReviewInput): Promise<ReviewOutcom
       state.run = await input.runner.runOnce({
         cwd: prepared.repo,
         prompt: prepared.prompt,
-        allowedWrites: prepared.allowedWrites,
         timeoutMs,
         runId,
         signal: controller.signal,

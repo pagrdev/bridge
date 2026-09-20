@@ -13,9 +13,7 @@ const PACKET =
 const OUT =
   '/Users/x/code/checkout-api/.pagr/review/rev_0123456789abcdef0123456789abcdef/review.md';
 
-const REPO = '/Users/x/code/checkout-api';
-
-const prompt = () => reviewPrompt({ packetPath: PACKET, outPath: OUT, repo: REPO });
+const prompt = () => reviewPrompt({ packetPath: PACKET, outPath: OUT });
 
 describe('reviewPrompt', () => {
   it('matches the snapshot', () => {
@@ -30,19 +28,6 @@ describe('reviewPrompt', () => {
     const text = prompt();
     expect(text).toContain(PACKET);
     expect(text).toContain(`Write exactly one file, at this absolute path: ${OUT}`);
-  });
-
-  /**
-   * HND-015. A Codex reviewer's working directory is `<repo>/.pagr`, so the repository has to be
-   * named absolutely or the packet's repo-relative paths point at nothing. The sandbox does not
-   * narrow reads, so this is the whole of what the reviewer needs to reach the tree.
-   */
-  it('names the repository root and does not assume it is the working directory', () => {
-    const text = prompt();
-    expect(text).toContain(`  ${REPO}`);
-    expect(text).toContain('You may read any file in it');
-    expect(text).toContain('open');
-    expect(text).toMatch(/working directory is not necessarily that root/);
   });
 
   it('sets the adversarial stance rather than asking for an opinion', () => {

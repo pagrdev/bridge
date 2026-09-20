@@ -6,26 +6,9 @@ import type { AdapterEvent } from '@pagr/bridge-core';
 import { isRunOnceFrame } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeAdapter } from './adapter.js';
-import { runOnceAllowedTools } from './run-once.js';
 
 const FIXTURE = fileURLToPath(new URL('./__fixtures__/fake-claude.mjs', import.meta.url));
 const PROJ = 'proj_0000000000000000000000000000000a';
-const ALLOWED = ['.pagr/**'];
-
-describe('runOnceAllowedTools', () => {
-  it('permits reading, read-only git, and writing only under the caller’s globs', () => {
-    const tools = runOnceAllowedTools(ALLOWED);
-    expect(tools).toContain('Read');
-    expect(tools).toContain('Bash(git status:*)');
-    expect(tools).toContain('Write(.pagr/**)');
-    expect(tools).toContain('Edit(.pagr/**)');
-    // No unscoped write, no general Bash, and nothing that commits: the WIP commit is the
-    // bridge's own git subprocess (HND-003), not something the model runs.
-    expect(tools).not.toContain('Write');
-    expect(tools).not.toContain('Bash');
-    expect(tools.some((t) => t.includes('git commit'))).toBe(false);
-  });
-});
 
 describe('ClaudeAdapter.runOnce against fake claude', () => {
   let home: string;
@@ -56,7 +39,6 @@ describe('ClaudeAdapter.runOnce against fake claude', () => {
     adapter.runOnce({
       cwd: project,
       prompt,
-      allowedWrites: ALLOWED,
       timeoutMs: 15_000,
       projectId: PROJ,
       ...over,
@@ -64,7 +46,7 @@ describe('ClaudeAdapter.runOnce against fake claude', () => {
 
   const frames = () => events.filter((e) => e.kind === 'frame');
 
-  it('writes a file under the allowed path and resolves with it there', async () => {
+  it('writes the file it was asked for and resolves with it there', async () => {
     const rel = '.pagr/handoff/hnd_1.md';
     const res = await run(`write file ${rel}`);
     expect(res.outcome).toBe('completed');
@@ -73,31 +55,49 @@ describe('ClaudeAdapter.runOnce against fake claude', () => {
     expect(res.error).toBeUndefined();
   });
 
-  it('passes print mode, the allowlist and sealed settings on the argv', async () => {
+  /**
+   * A run is an ordinary agent run in an ordinary checkout, so it is not fenced into `.pagr`.
+   * Constraining it was never a boundary: Pagr starts full sessions in this same repository on
+   * a text message, and this is strictly less than one of those.
+   */
+  it('is not confined to .pagr — it may write a source file like any other run', async () => {
+    fs.mkdirSync(path.join(project, 'src'), { recursive: true });
+    const res = await run('write file src/index.ts');
+    expect(res.outcome).toBe('completed');
+    expect(fs.existsSync(path.join(project, 'src', 'index.ts'))).toBe(true);
+  });
+
+  it('passes print mode, acceptEdits and the user’s own settings on the argv', async () => {
     await run('write file .pagr/handoff/hnd_2.md');
     const { argv, env, cwd } = JSON.parse(
       fs.readFileSync(path.join(home, 'args.json'), 'utf8'),
     ) as { argv: string[]; env: Record<string, string | undefined>; cwd: string };
+    // The repository itself, exactly as a session gets it.
     expect(cwd).toBe(fs.realpathSync(project));
     expect(argv).toContain('-p');
-    expect(argv).toContain('--allowedTools');
-    expect(argv).toContain('Write(.pagr/**)');
-    expect(argv).toContain('Read');
-    // Sealed: the checked-out repo's own settings and MCP servers cannot grant this run a tool,
-    // because nobody is watching it to notice that they did.
-    expect(argv[argv.indexOf('--setting-sources') + 1]).toBe('user,local');
-    expect(argv).toContain('--strict-mcp-config');
+    // Nothing narrows what the run may use.
+    expect(argv).not.toContain('--allowedTools');
+    // The one flag a run does not share with a session, and it is about nobody being attached.
+    expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    // The person's own settings, and their MCP servers, exactly as a session loads them.
+    expect(argv[argv.indexOf('--setting-sources') + 1]).toBe('user,project,local');
+    expect(argv).not.toContain('--strict-mcp-config');
     // Prompts come back to us over stdio, which is what makes auto-denial possible at all.
     expect(argv[argv.indexOf('--permission-prompt-tool') + 1]).toBe('stdio');
     // The daemon socket is never handed to a child.
     expect(env.PAGR_DAEMON_SOCK).toBeUndefined();
   });
 
-  it('is refused by the agent when it writes outside the allowed globs', async () => {
-    const outside = 'notes/escape.md';
-    fs.mkdirSync(path.join(project, 'notes'), { recursive: true });
+  /**
+   * The auto-deny that remains is about interactivity, not containment: nobody is attached to
+   * answer, and `allow` is not the bridge's to give (`core/src/deviceFloor.ts`). A prompt that
+   * is never answered is a handoff that hangs until its timeout.
+   */
+  it('denies a prompt it cannot relay, rather than hanging on it', async () => {
+    const outside = path.join(path.dirname(project), 'escape.md');
     const res = await run(`write file ${outside}`);
-    expect(fs.existsSync(path.join(project, outside))).toBe(false);
+    expect(fs.existsSync(outside)).toBe(false);
+    expect(res.outcome).toBe('completed');
     expect(res.output).toContain('Could not write');
     // The refusal is the agent's: it asked, and the run denied it on the spot.
     expect(events.some((e) => e.kind === 'approval_requested')).toBe(false);

@@ -79,9 +79,8 @@ describe('daemon · review over IPC', () => {
     codex = new FakeAdapter('codex');
     const runOnce = async (input: RunOnceInput): Promise<RunOnceResult> => {
       if (report !== null) {
-        // The reviewer is told exactly one path it may write; this is that path.
-        const dir = join(input.cwd, input.allowedWrites[0]?.replace('/**', '') ?? '');
-        const file = join(dir, 'review.md');
+        // The prompt names the file to write, absolutely; a real reviewer reads it from there.
+        const file = /\S+review\.md/.exec(input.prompt)?.[0] ?? join(input.cwd, 'review.md');
         mkdirSync(dirname(file), { recursive: true });
         writeFileSync(file, report);
       }

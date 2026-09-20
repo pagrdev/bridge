@@ -30,10 +30,11 @@
 //         "elsewhere" → asks permission and then answers it ITSELF, as a terminal user would:
 //                     the tool_result arrives with no control_response, which is what
 //                     `answeredElsewhere` looks like on the wire
-//         "write file <path>" → a one-shot run's write. The fake honours `--allowedTools`
-//                     the way the real permission engine does: a path a `Write(<glob>)` rule
-//                     covers is written with NO prompt at all; anything else raises a
-//                     can_use_tool request, and a denial means the file is never written.
+//         "write file <path>" → a one-shot run's write. The fake honours `--permission-mode`
+//                     the way the real permission engine does: under `acceptEdits` a write
+//                     inside the working directory happens with NO prompt at all; a write
+//                     outside it raises a can_use_tool request, and a denial means the file is
+//                     never written.
 //         "fail"   → result subtype error_during_execution
 //         "hang"   → no result until SIGINT (then result success "interrupted") / SIGTERM exits 143
 //         "crash"  → process.exit(7) mid-turn
@@ -65,37 +66,15 @@ const flagValue = (name) => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
 };
-/** Every value of a variadic flag: everything after it until the next `--flag`. */
-const flagValues = (name) => {
-  const i = argv.indexOf(name);
-  if (i < 0) return [];
-  const out = [];
-  for (let j = i + 1; j < argv.length && !argv[j].startsWith('--'); j++) out.push(argv[j]);
-  return out;
-};
-const allowedToolRules = flagValues('--allowedTools');
-
-/** gitignore-ish: `**` crosses directories, `*` does not. Anchored at the working directory. */
-function globMatches(glob, relPath) {
-  const rx = glob
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*\//g, '(?:.*/)?')
-    .replace(/\*\*/g, '.*')
-    .replace(/(?<!\.)\*/g, '[^/]*');
-  return new RegExp(`^${rx}$`).test(relPath);
-}
-
 /**
- * What the real `--allowedTools` does for a `Write`: a rule whose glob covers the path means the
- * tool runs with no prompt. Everything else prompts — and a one-shot run denies every prompt.
+ * What `--permission-mode acceptEdits` does for a `Write`: an edit inside the working directory
+ * runs with no prompt. Anything outside it still prompts — and a one-shot run denies every
+ * prompt it is asked, which is what makes it non-interactive rather than what confines it.
  */
 function writeAllowed(absPath) {
+  if (flagValue('--permission-mode') !== 'acceptEdits') return false;
   const rel = nodePath.relative(process.cwd(), absPath);
-  if (rel.startsWith('..') || nodePath.isAbsolute(rel)) return false;
-  return allowedToolRules.some((rule) => {
-    const m = /^Write\((.+)\)$/.exec(rule);
-    return m ? globMatches(m[1], rel) : false;
-  });
+  return !rel.startsWith('..') && !nodePath.isAbsolute(rel);
 }
 
 const sessionId = flagValue('--session-id') ?? flagValue('--resume') ?? 'fake-session';

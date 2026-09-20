@@ -6,77 +6,32 @@ import type { AdapterEvent } from '@pagr/bridge-core';
 import { isRunOnceFrame } from '@pagr/bridge-core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from './adapter.js';
-import {
-  runOnceSandboxCwd,
-  runOnceThreadParams,
-  runOnceTurnParams,
-  runOnceWritableRoots,
-} from './run-once.js';
+import { runOnceThreadParams, runOnceTurnParams } from './run-once.js';
 
 const FIXTURE = fileURLToPath(new URL('./__fixtures__/fake-app-server.mjs', import.meta.url));
 const PROJ = 'proj_0000000000000000000000000000000a';
-const ALLOWED = ['.pagr/**'];
 
 describe('the params a headless codex run uses', () => {
-  it('starts the thread workspace-write, never asking, with the roots as config', () => {
-    const { params, sandboxCwd, writableRoots } = runOnceThreadParams({
-      cwd: '/repo',
-      allowedWrites: ALLOWED,
-    });
+  /**
+   * The same thread an ordinary session gets — the repository as cwd, `workspace-write`, and no
+   * sandbox overrides of our own. The one difference is `approvalPolicy`, and it is about there
+   * being no phone to ask rather than about what the run may touch.
+   */
+  it('starts the thread in the repository, workspace-write, never asking', () => {
+    const params = runOnceThreadParams({ cwd: '/repo' });
+    expect(params.cwd).toBe('/repo');
     expect(params.approvalPolicy).toBe('never');
     expect(params.sandbox).toBe('workspace-write');
-    expect(sandboxCwd).toBe('/repo/.pagr');
-    expect(writableRoots).toEqual(['/repo/.pagr']);
-    expect(params.config).toEqual({
-      sandbox_workspace_write: {
-        writable_roots: ['/repo/.pagr'],
-        network_access: false,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-      },
-    });
+    // No config overrides: the user's own Codex configuration decides the rest, as it does for
+    // a session they started themselves.
+    expect(params.config).toBeUndefined();
   });
 
-  /**
-   * HND-015. `workspace-write` grants the thread's cwd ON TOP OF `writableRoots`, so the cwd is
-   * the real boundary and the repository root is the one value it must never be.
-   */
-  it('starts the thread inside .pagr, never at the repository root', () => {
-    const { params } = runOnceThreadParams({ cwd: '/repo', allowedWrites: ALLOWED });
-    expect(params.cwd).toBe('/repo/.pagr');
-    expect(params.cwd).not.toBe('/repo');
-    expect(runOnceSandboxCwd('/repo/')).toBe('/repo/.pagr');
-  });
-
-  /**
-   * The narrower glob a reviewer is given still travels on the wire — it says what Pagr asked
-   * for — but the honest answer to "what may this run write?" is the pair, and the pair is
-   * `.pagr`.
-   */
-  it('reports the cwd as a writable root alongside the declared ones', () => {
-    expect(
-      runOnceWritableRoots({ cwd: '/repo', allowedWrites: ['.pagr/review/rev_1/**'] }),
-    ).toEqual(['/repo/.pagr', '/repo/.pagr/review/rev_1']);
-    // Every root is inside `.pagr`: nothing the sandbox grants is a source file.
-    for (const root of runOnceWritableRoots({ cwd: '/repo', allowedWrites: ['.pagr/**'] }))
-      expect(root.startsWith('/repo/.pagr')).toBe(true);
-  });
-
-  it('restates the policy on the turn, where writableRoots can actually be spelled', () => {
-    const turn = runOnceTurnParams('thr_1', {
-      cwd: '/repo',
-      prompt: 'write the handoff',
-      allowedWrites: ALLOWED,
-    });
+  it('sends the prompt on the turn and no policy with it', () => {
+    const turn = runOnceTurnParams('thr_1', { prompt: 'write the handoff' });
     expect(turn.threadId).toBe('thr_1');
     expect(turn.input).toEqual([{ type: 'text', text: 'write the handoff', text_elements: [] }]);
-    expect(turn.sandboxPolicy).toEqual({
-      type: 'workspaceWrite',
-      writableRoots: ['/repo/.pagr'],
-      networkAccess: false,
-      excludeTmpdirEnvVar: true,
-      excludeSlashTmp: true,
-    });
+    expect(turn.sandboxPolicy).toBeUndefined();
   });
 });
 
@@ -113,7 +68,6 @@ describe('CodexAdapter.runOnce against the fake app-server', () => {
     adapter.runOnce({
       cwd: project,
       prompt,
-      allowedWrites: ALLOWED,
       timeoutMs: 15_000,
       projectId: PROJ,
       ...over,
@@ -128,9 +82,8 @@ describe('CodexAdapter.runOnce against the fake app-server', () => {
   const frames = () => events.filter((e) => e.kind === 'frame');
 
   // Absolute, like every prompt the bridge really builds (`review/prompt.ts`,
-  // `handoff/prompt.ts`): the run's working directory is `.pagr`, so a repo-relative path in a
-  // prompt would name a different file than the watcher is waiting for.
-  it('writes a file under the allowed path and resolves with it there', async () => {
+  // `handoff/prompt.ts`): the watcher polls an absolute path, so the prompt names one.
+  it('writes the file it was asked for and resolves with it there', async () => {
     const target = path.join(project, '.pagr/handoff/hnd_1.md');
     const res = await run(`write file ${target}`);
     expect(res.outcome).toBe('completed');
@@ -138,28 +91,15 @@ describe('CodexAdapter.runOnce against the fake app-server', () => {
     expect(res.output).toContain('Wrote');
   });
 
-  it('asks for workspace-write with the roots, and never for an approval', async () => {
+  it('asks for the repository and workspace-write, and never for an approval', async () => {
     await run(`write file ${path.join(project, '.pagr/handoff/hnd_2.md')}`);
     const start = rpc().find((l) => l.method === 'thread/start');
-    expect(start?.params.cwd).toBe(path.join(project, '.pagr'));
+    expect(start?.params.cwd).toBe(project);
     expect(start?.params.approvalPolicy).toBe('never');
     expect(start?.params.sandbox).toBe('workspace-write');
-    expect(start?.params.config).toEqual({
-      sandbox_workspace_write: {
-        writable_roots: [path.join(project, '.pagr')],
-        network_access: false,
-        exclude_tmpdir_env_var: true,
-        exclude_slash_tmp: true,
-      },
-    });
+    expect(start?.params.config).toBeUndefined();
     const turn = rpc().find((l) => l.method === 'turn/start');
-    expect(turn?.params.sandboxPolicy).toEqual({
-      type: 'workspaceWrite',
-      writableRoots: [path.join(project, '.pagr')],
-      networkAccess: false,
-      excludeTmpdirEnvVar: true,
-      excludeSlashTmp: true,
-    });
+    expect(turn?.params.sandboxPolicy).toBeUndefined();
   });
 
   it('is refused by the sandbox when it writes outside the workspace', async () => {
@@ -273,7 +213,6 @@ describe.each([
     adapter.runOnce({
       cwd: project,
       prompt: 'wait',
-      allowedWrites: ALLOWED,
       timeoutMs: 15_000,
       projectId: PROJ,
       ...over,
@@ -318,13 +257,7 @@ describe('CodexAdapter.runOnce and outcomes it did not ask for', () => {
   });
 
   const run = (prompt: string) =>
-    adapter.runOnce({
-      cwd: project,
-      prompt,
-      allowedWrites: ALLOWED,
-      timeoutMs: 15_000,
-      projectId: PROJ,
-    });
+    adapter.runOnce({ cwd: project, prompt, timeoutMs: 15_000, projectId: PROJ });
 
   // The claim only outranks messages inside the window it opened. A run nobody stopped reports
   // exactly what happened to it, which is what makes the claim safe to enforce in `settle`.
@@ -349,32 +282,26 @@ describe('CodexAdapter.runOnce and outcomes it did not ask for', () => {
 });
 
 /**
- * HND-015 — the containment itself, exercised rather than asserted as a string.
+ * A run is an ordinary `workspace-write` run in the user's repository.
  *
- * The fake app-server refuses a write exactly as Codex does: a path is writable when it is
- * inside the thread's `cwd` or inside one of its `writableRoots` (the roots ADD to the
- * workspace; they never narrow it). So these cases test the configuration the adapter really
- * sends. Give the thread the repository root as its cwd again — the shape this code had before
- * HND-015 — and every refusal below turns into a successful write and this suite goes red.
+ * The fake app-server refuses a write exactly as Codex does: a path is writable when it is inside
+ * the thread's `cwd` or one of its `writableRoots`. So this suite tests the configuration the
+ * adapter really sends — the repository is writable, and the boundary that is left is the one an
+ * ordinary session has too.
  */
-describe('a headless codex run is confined to .pagr by the sandbox', () => {
+describe('a headless codex run writes the repository, like any other run', () => {
   let home: string;
   let project: string;
   let sibling: string;
   let adapter: CodexAdapter;
   let events: AdapterEvent[];
 
-  /** Files a reviewer would find interesting, with content that must survive the run. */
-  const SOURCE = ['src/index.ts', 'package.json', '.git/config'];
-
   beforeEach(() => {
-    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-confine-'));
-    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-confine-'));
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-workspace-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-workspace-'));
     sibling = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-sibling-'));
-    for (const rel of SOURCE) {
-      fs.mkdirSync(path.join(project, path.dirname(rel)), { recursive: true });
-      fs.writeFileSync(path.join(project, rel), 'original\n');
-    }
+    fs.mkdirSync(path.join(project, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(project, 'src', 'index.ts'), 'original\n');
     adapter = new CodexAdapter({
       home,
       codexCommand: ['node', FIXTURE],
@@ -390,58 +317,38 @@ describe('a headless codex run is confined to .pagr by the sandbox', () => {
     for (const dir of [home, project, sibling]) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  const run = (target: string, allowedWrites = ['.pagr/**']) =>
+  const run = (target: string) =>
     adapter.runOnce({
       cwd: project,
       prompt: `write file ${target}`,
-      allowedWrites,
       timeoutMs: 15_000,
       projectId: PROJ,
     });
 
-  it.each(SOURCE)('refuses to write %s and leaves it exactly as it was', async (rel) => {
-    const target = path.join(project, rel);
-    const res = await run(target);
-    expect(res.output).toContain('Sandbox denied');
-    expect(fs.readFileSync(target, 'utf8')).toBe('original\n');
-    // No prompt was raised for anybody to answer: the kernel refused, not a policy we relayed.
-    expect(events.some((e) => e.kind === 'approval_requested')).toBe(false);
-  });
-
-  it('refuses a new file anywhere in the repository outside .pagr', async () => {
-    const target = path.join(project, 'src/patched.ts');
-    expect((await run(target)).output).toContain('Sandbox denied');
-    expect(fs.existsSync(target)).toBe(false);
-  });
-
-  it('refuses to climb out of .pagr with a relative path', async () => {
-    // The run's cwd IS `.pagr`, so this is how an agent would reach source by accident.
-    const res = await run('../src/index.ts');
-    expect(res.output).toContain('Sandbox denied');
-    expect(fs.readFileSync(path.join(project, 'src/index.ts'), 'utf8')).toBe('original\n');
-  });
-
-  it('refuses a sibling checkout, exactly as it did before', async () => {
-    const target = path.join(sibling, 'escape.md');
-    expect((await run(target)).output).toContain('Sandbox denied');
-    expect(fs.existsSync(target)).toBe(false);
-  });
-
-  it('still writes the one file it was started for', async () => {
+  it('writes the one file it was started for', async () => {
     const target = path.join(project, '.pagr/review/rev_1/review.md');
-    const res = await run(target, ['.pagr/review/rev_1/**']);
+    const res = await run(target);
     expect(res.outcome).toBe('completed');
     expect(fs.existsSync(target)).toBe(true);
   });
 
   /**
-   * The cwd is granted whole, and `docs/SECURITY.md` says so rather than implying the globs are
-   * the boundary. A bare name lands inside `.pagr`, which is the point: it cannot land in src.
+   * Not confined to `.pagr`. Constraining a run was never a security boundary: Pagr starts full
+   * agent sessions in this same checkout on a text message, and a one-shot is strictly less
+   * than one of those.
    */
-  it('lands a bare relative write inside .pagr, never in the repository root', async () => {
-    const res = await run('notes.md', ['.pagr/review/rev_1/**']);
+  it('is free to write a source file, as a session in the same checkout would be', async () => {
+    const target = path.join(project, 'src', 'index.ts');
+    const res = await run(target);
     expect(res.outcome).toBe('completed');
-    expect(fs.existsSync(path.join(project, '.pagr/notes.md'))).toBe(true);
-    expect(fs.existsSync(path.join(project, 'notes.md'))).toBe(false);
+    expect(fs.readFileSync(target, 'utf8')).not.toBe('original\n');
+  });
+
+  it('is still refused outside the workspace, and raises no prompt for it', async () => {
+    const target = path.join(sibling, 'escape.md');
+    expect((await run(target)).output).toContain('Sandbox denied');
+    expect(fs.existsSync(target)).toBe(false);
+    // The refusal happened inside the agent; no approval was ever raised for a phone to answer.
+    expect(events.some((e) => e.kind === 'approval_requested')).toBe(false);
   });
 });
