@@ -195,3 +195,120 @@ describe('CodexAdapter.runOnce against the fake app-server', () => {
     expect(frames()).toEqual([]);
   });
 });
+
+/**
+ * The ordering the shipped code got wrong, made deterministic.
+ *
+ * `stop()` interrupts and only then settles, so anything the interrupt shakes loose can be
+ * handled first and decide the run instead. Whether it was handled first depended on whether the
+ * server's two writes shared a read chunk, which under the full parallel suite they did about one
+ * gate run in three — a cancel the caller asked for, reported as a crash.
+ *
+ * `FAKE_CODEX_INTERRUPT_RACE` makes the losing order the only order, in the two shapes that
+ * matter: the interrupt landing (`interrupted`), and the turn finishing on its own in the very
+ * same instant (`completed`). The second is the one that survives claiming the outcome only at
+ * the `interrupted` and `turn/start` call sites, so both belong here.
+ */
+describe.each([
+  ['answers the turn interrupted before it answers the interrupt', 'interrupted'],
+  ['completes the turn normally in the same instant as the interrupt', 'completed'],
+])('CodexAdapter.runOnce when the server %s', (_label, mode) => {
+  let home: string;
+  let project: string;
+  let adapter: CodexAdapter;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-race-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-race-'));
+    adapter = new CodexAdapter({
+      home,
+      codexCommand: ['node', FIXTURE],
+      codexHome: path.join(home, 'codex-home'),
+      restartDelayMs: 50,
+      log: false,
+      env: { FAKE_CODEX_INTERRUPT_RACE: mode },
+    });
+  });
+  afterEach(async () => {
+    await adapter.shutdown();
+    for (const dir of [home, project]) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const raced = (over: Partial<Parameters<CodexAdapter['runOnce']>[0]> = {}) =>
+    adapter.runOnce({
+      cwd: project,
+      prompt: 'wait',
+      allowedWrites: ALLOWED,
+      timeoutMs: 15_000,
+      projectId: PROJ,
+      ...over,
+    });
+
+  it('reports the cancel, not what the cancel caused', async () => {
+    const ac = new AbortController();
+    const p = raced({ signal: ac.signal, timeoutMs: 20_000 });
+    setTimeout(() => ac.abort(), 200);
+    const res = await p;
+    expect(res.outcome).toBe('canceled');
+    expect(res.error).toBeUndefined();
+  });
+
+  it('reports the timeout, not what the timeout caused', async () => {
+    const res = await raced({ timeoutMs: 400 });
+    expect(res.outcome).toBe('timeout');
+    expect(res.error).toBeUndefined();
+  });
+});
+
+describe('CodexAdapter.runOnce and outcomes it did not ask for', () => {
+  let home: string;
+  let project: string;
+  let adapter: CodexAdapter;
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-codex-unasked-'));
+    project = fs.mkdtempSync(path.join(os.tmpdir(), 'pagr-proj-unasked-'));
+    adapter = new CodexAdapter({
+      home,
+      codexCommand: ['node', FIXTURE],
+      codexHome: path.join(home, 'codex-home'),
+      restartDelayMs: 50,
+      log: false,
+      env: { FAKE_CODEX_INTERRUPT_RACE: 'interrupted' },
+    });
+  });
+  afterEach(async () => {
+    await adapter.shutdown();
+    for (const dir of [home, project]) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const run = (prompt: string) =>
+    adapter.runOnce({
+      cwd: project,
+      prompt,
+      allowedWrites: ALLOWED,
+      timeoutMs: 15_000,
+      projectId: PROJ,
+    });
+
+  // The claim only outranks messages inside the window it opened. A run nobody stopped reports
+  // exactly what happened to it, which is what makes the claim safe to enforce in `settle`.
+  it('still types a turn the agent failed as an agent error', async () => {
+    const res = await run('fail');
+    expect(res.outcome).toBe('failed');
+    expect(res.error?.code).toBe('agent_error');
+    expect(res.error?.message).toContain('model exploded');
+  });
+
+  it('still types an app-server that died mid-turn as exited', async () => {
+    const res = await run('crash');
+    expect(res.outcome).toBe('failed');
+    expect(res.error?.code).toBe('exited');
+  });
+
+  it('still completes a run that finished before anything stopped it', async () => {
+    const res = await run('write file .pagr/handoff/hnd_race.md');
+    expect(res.outcome).toBe('completed');
+    expect(res.error).toBeUndefined();
+  });
+});

@@ -11,6 +11,19 @@ const SES = 'ses_00000000000000000000000000000001';
 const SES2 = 'ses_00000000000000000000000000000002';
 const PROJ = 'proj_0000000000000000000000000000000a';
 
+/**
+ * Poll until `pred` holds. The ceiling is a stuck-test guard, never the thing being measured:
+ * a test that waits for the state it asserts cannot be made to fail by a slow machine, only by
+ * the behaviour actually being wrong.
+ */
+async function until(pred: () => boolean, ceilingMs = 20_000, everyMs = 10): Promise<void> {
+  const deadline = Date.now() + ceilingMs;
+  while (!pred()) {
+    if (Date.now() > deadline) throw new Error('condition never held');
+    await new Promise((r) => setTimeout(r, everyMs));
+  }
+}
+
 function collector() {
   const events: AdapterEvent[] = [];
   const waiters: Array<{ pred: (e: AdapterEvent) => boolean; resolve: (e: AdapterEvent) => void }> =
@@ -671,14 +684,25 @@ describe('CodexAdapter process lifecycle under load', () => {
   });
 
   it('gives up restarting after a bounded number of consecutive crashes', async () => {
+    // Every spawn writes its own argv, so the restart budget can be counted instead of guessed.
+    const spawnLog = path.join(home, 'spawns.log');
+    const crashes = `require('node:fs').appendFileSync(${JSON.stringify(spawnLog)}, process.argv.slice(1).join(' ') + '\\n'); process.exit(9);`;
     const a = new CodexAdapter({
       home,
-      codexCommand: ['node', '-e', 'process.exit(9);//'],
+      codexCommand: ['node', '-e', crashes],
       restartDelayMs: 5,
       maxRestartAttempts: 2,
       requestTimeoutMs: 300,
       log: false,
     });
+    const spawns = () =>
+      fs.existsSync(spawnLog)
+        ? fs
+            .readFileSync(spawnLog, 'utf8')
+            .split('\n')
+            .filter((l) => l.includes('app-server')).length
+        : 0;
+
     await expect(
       a.startSession({
         sessionId: SES,
@@ -688,7 +712,21 @@ describe('CodexAdapter process lifecycle under load', () => {
         readOnly: false,
       }),
     ).rejects.toThrow();
-    await new Promise((r) => setTimeout(r, 250));
+
+    // One spawn plus `maxRestartAttempts` restarts, and then it is supposed to stop. WAIT for
+    // that to have happened rather than sleeping and hoping: this used to assert after a fixed
+    // 250 ms, which failed whenever the machine was busy enough that three crash-and-respawn
+    // cycles took longer than the sleep — the same "whoever got there first wins" shape as the
+    // run-once cancel race, in test form.
+    await until(() => spawns() >= 3 && !a.appServerRunning);
+    const spent = spawns();
+    // Having given up, it stays given up: the budget is a ceiling, not a rate. Proving that a
+    // fourth spawn does NOT happen needs a window, and a window used to give a bug its chance
+    // can only ever make a test lenient — never flaky, which is the whole difference from the
+    // sleep this replaced.
+    await new Promise((r) => setTimeout(r, 200));
+    expect(spawns()).toBe(spent);
+    expect(spent).toBe(3);
     expect(a.appServerRunning).toBe(false);
     await a.shutdown();
   });
