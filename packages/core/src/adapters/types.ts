@@ -9,6 +9,7 @@ import type {
 } from '@pagr/protocol';
 import type { LocalActionDetail } from '../deviceFloor.js';
 import type { FrameBody, FrameQuestion } from '../frames.js';
+import type { CodexThread } from '../handoff/receiver.js';
 import type { JournalMeta } from '../journal.js';
 import type { RunOnceInput, RunOnceResult } from './runOnce.js';
 
@@ -233,6 +234,20 @@ export interface CodingAgentAdapter {
    * sender-writes path (spec §3) when the receiver has none.
    */
   runOnce?(input: RunOnceInput): Promise<RunOnceResult>;
+  /**
+   * One session's raw transcript, for a provider that keeps it inside a server instead of in a
+   * file on this Mac.
+   *
+   * Codex is the only one: its threads live in the app-server, so the receiver-writes path
+   * (`handoff/receiver.ts`) asks for the thread itself and dumps it to `PAGR_HOME/tmp` for the
+   * length of one headless run. Claude has no need of it — its transcript is already a `.jsonl`
+   * on disk — so the method is optional, and an adapter without one simply cannot be handed off
+   * FROM through the receiver path (`no_transcript`, never a throw).
+   *
+   * Nothing read here is sealed or sent. The shape is structural on purpose: `core` describes
+   * only the fields a dump walks, and the adapter owns the real type.
+   */
+  readThread?(providerSessionId: string): Promise<CodexThread | null | undefined>;
   subscribe(emit: (e: AdapterEvent) => void): () => void;
   shutdown(): Promise<void>;
 }

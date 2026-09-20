@@ -1,4 +1,5 @@
 import { release } from 'node:os';
+import { dirname } from 'node:path';
 import {
   type AgentConnectionStatus,
   type ApprovalOption,
@@ -56,9 +57,17 @@ import { classifyLocally, DeviceFloor, type LocalActionDetail } from './deviceFl
 import { type EventPayloadInput, makeEvent } from './events.js';
 import { chunkFrame, type FrameBody, type FrameQuestion } from './frames.js';
 import type { GitOptions } from './git.js';
+import type { CaptureOutcome, CaptureRefusal } from './handoff/capture.js';
+import {
+  captureFromReceiver,
+  claudeTranscriptSource,
+  codexTranscriptSource,
+  type TranscriptSource,
+} from './handoff/receiver.js';
 import {
   type HandoffCaptureAck,
   type HandoffFailure,
+  type ReceiverCapture,
   runHandoffCapture,
 } from './handoff/switch.js';
 import { clip } from './heuristics.js';
@@ -1651,9 +1660,11 @@ export class Dispatcher {
       // Every state the bridge enters, as it enters it: the phone's running commentary is a
       // report of what happened, never an optimistic guess about what is about to.
       onUpdate: (u) => this.send('handoff.updated', { handoffId: p.handoffId, ...u }),
-      // TODO(HND-012): pass `captureFromReceiver` here once the receiver-writes path lands. Until
-      // then a session that cannot be steered refuses with `receiver_not_available`, which is the
-      // truth about this bridge rather than a silent failure to hand anything over.
+      // The other half of spec §3: a session Pagr cannot steer — and a sender that was steered
+      // and never answered — falls through to the RECEIVING agent, which writes the note from
+      // the sender's transcript. `receiverCapture` is the adapter between the switch's seam and
+      // `handoff/receiver.ts`; everything it cannot supply is refused there, by name.
+      captureFromReceiver: this.receiverCapture(rec),
       ...(p.note !== undefined ? { note: p.note } : {}),
       ...(this.o.env ? { env: this.o.env } : {}),
       ...(this.o.git ? { git: this.o.git } : {}),
@@ -1703,6 +1714,96 @@ export class Dispatcher {
       });
 
     return run.result;
+  }
+
+  /**
+   * The receiver-writes path (HND-012), bound to this session and this Mac (HND-012a).
+   *
+   * `switch.ts` asks for a note about a session; `receiver.ts` needs three concrete things the
+   * switch has no way to know — the agent's OWN id for that session, an adapter to run headless,
+   * and somewhere to read the sending session's transcript. Resolving them is the dispatcher's
+   * job, because all three are facts about this daemon's wiring, and doing it here is what keeps
+   * the seam: neither module learns about `sessions.json`, the adapter map, or `$HOME`.
+   *
+   * Nothing in here throws. Every piece that can be missing is a sentence a person gets told
+   * instead (spec §9), and each maps to the refusal the rest of the system already understands:
+   *
+   *   - no adapter registered for `to` → `receiver_not_available`;
+   *   - no transcript source for `from` on this bridge → `receiver_not_available`;
+   *   - no provider-side id for the sending session → `no_transcript`;
+   *   - nothing readable at the other end of the source → `no_transcript` (`receiver.ts`);
+   *   - the receiving adapter has no `runOnce` → `no_runner` (`receiver.ts`).
+   *
+   * The last two are deliberately left to `receiver.ts`: it is the module that knows whether the
+   * transcript was there and whether the run could be started, and duplicating the checks here
+   * would give a person two different sentences for one fact.
+   */
+  private receiverCapture(rec: SessionRecord): ReceiverCapture {
+    const refuse = (reason: CaptureRefusal, message: string): CaptureOutcome => ({
+      outcome: 'refused',
+      writer: 'receiver',
+      path: null,
+      reason,
+      message,
+    });
+    return async (input) => {
+      // The RECEIVING adapter — the agent the work is moving to, not the one it came from. A
+      // `runOnce` it does not have is `receiver.ts`'s refusal to make, so the adapter goes over
+      // whole and only its absence is answered here.
+      const receiver = this.o.adapters.get(input.to);
+      if (!receiver)
+        return refuse(
+          'receiver_not_available',
+          `there is no ${input.to} adapter on this Mac, so nothing can write this handoff from ${input.from}'s transcript`,
+        );
+      const transcript = this.transcriptSourceFor(input.from);
+      if (!transcript)
+        return refuse(
+          'receiver_not_available',
+          `this bridge cannot read a ${input.from} transcript on this Mac`,
+        );
+      const providerSessionId = providerSessionIdOf(rec);
+      if (!providerSessionId)
+        return refuse(
+          'no_transcript',
+          `Pagr never learned ${input.from}'s own id for this session, so there is no transcript to point ${input.to} at`,
+        );
+      return captureFromReceiver({
+        handoffId: input.handoffId,
+        sessionId: input.sessionId,
+        providerSessionId,
+        repo: input.repo,
+        to: input.to,
+        receiver,
+        transcript,
+        ...(rec.cwd ? { cwd: rec.cwd } : {}),
+        ...(isReportable(rec) ? { projectId: rec.projectId } : {}),
+        ...(input.note !== undefined ? { note: input.note } : {}),
+        ...(input.onProgress !== undefined ? { onProgress: input.onProgress } : {}),
+        ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+        ...(input.env !== undefined ? { env: input.env } : {}),
+        ...(input.git !== undefined ? { git: input.git } : {}),
+      });
+    };
+  }
+
+  /**
+   * Where the SENDING agent's transcript is read from, per provider. Null means "not on this
+   * bridge", which is a refusal rather than a silence.
+   *
+   * Claude's is already a file, so it is found: `~/.claude/projects/*` under the home the
+   * project registry vets paths against — the one place this daemon states where the user's home
+   * is, and the reason a test can point the whole lookup at a temporary directory instead of the
+   * real one. Codex's lives in the app-server, so the adapter is asked for the thread and
+   * `receiver.ts` dumps it under `PAGR_HOME/tmp` for the length of one run, then deletes it.
+   */
+  private transcriptSourceFor(from: Provider): TranscriptSource | null {
+    if (from === 'claude') return claudeTranscriptSource({ home: this.o.registry.homeDirectory });
+    const sender = this.o.adapters.get(from);
+    const readThread = sender?.readThread?.bind(sender);
+    if (!readThread) return null;
+    // `tmpDir` is `<PAGR_HOME>/tmp`; the dump belongs in the same place downloaded attachments do.
+    return codexTranscriptSource({ readThread, pagrHome: dirname(this.o.tmpDir) });
   }
 
   /**
@@ -2588,6 +2689,22 @@ export class Dispatcher {
       }
     }
   }
+}
+
+/**
+ * The agent's OWN id for a session — Claude's session uuid, Codex's thread id — or null.
+ *
+ * `SessionRecord.providerSessionId` is not always one. A session the bridge STARTED records
+ * Pagr's own `ses_…` id there (`agent.start_session` mints the id and hands it to the adapter,
+ * which keeps the mapping to the provider's id to itself), and an adopted session whose hook
+ * never reported a provider id falls back to the same stand-in. Neither can find a transcript,
+ * and the honest answer is "Pagr never learned it" rather than a search that was never going to
+ * match — so the stand-in is recognised here and reported as the absence it is.
+ */
+function providerSessionIdOf(rec: SessionRecord): string | null {
+  const id = rec.providerThreadId ?? rec.providerSessionId;
+  if (!id || id === rec.sessionId) return null;
+  return id;
 }
 
 /**

@@ -77,12 +77,18 @@ export type CaptureRefusal =
   /** Receiver path: the run finished, said it was done, and left no file at the path. */
   | 'no_file'
   /**
-   * The receiver-writes path was asked for and this bridge has not been wired to one.
+   * The receiver-writes path was asked for and this bridge has no way to run it for this pair.
    *
-   * `captureFromReceiver` exists (HND-012), but the dispatcher still passes `switch.ts`'s
-   * `receiverNotAvailable` stub — see HND-012a. It stays in the union after that wiring for the
-   * honest case: an adapter with no `runOnce` (spec §3 needs one to spawn the receiving agent
-   * headless) genuinely cannot reconstruct a handoff.
+   * The dispatcher wires `captureFromReceiver` in (HND-012a), so this is no longer "not built
+   * yet". It is now the two honest gaps that are properties of the MAC rather than of the
+   * session: no adapter registered for the receiving agent, and no way to read the sending
+   * agent's transcript here at all (a Codex sender on a bridge whose Codex adapter cannot reach
+   * the app-server). A caller that supplies no receiver path — a one-shot CLI dispatcher, a test
+   * — gets it too, from `switch.ts`'s `receiverNotAvailable` default.
+   *
+   * What it is NOT: a receiving adapter that has no `runOnce` is `no_runner`, and a session that
+   * left nothing readable is `no_transcript`. Both are about this session, and both are refused
+   * by `receiver.ts` where the fact is actually known.
    */
   | 'receiver_not_available';
 /**
