@@ -21,10 +21,11 @@ import { handoffWritePrompt } from './prompt.js';
  *
  *   - **sender writes** — `controlLevel: 'full'`. The session that has the context is still
  *     alive and Pagr can talk to it, so it is steered into writing its own handoff. That is
- *     {@link captureFromSender}, and it is all this file holds today.
+ *     {@link captureFromSender}, and it is what this file holds.
  *   - **receiver writes** — everything else (`approvals_only`, `mirror_only`, `none`, or the
  *     session has ended), and the fall-through when the sender path times out. The receiving
- *     agent is spawned headless over the sender's transcript. That lands next to this one.
+ *     agent is spawned headless over the sender's transcript. That is `captureFromReceiver`,
+ *     in `receiver.ts`; the types both paths answer with live here.
  *
  * Both paths answer with the same {@link CaptureOutcome}, and neither decides which of them
  * runs — that dispatch belongs to `session.handoff.capture` in the dispatcher, which is also
@@ -58,7 +59,23 @@ export type CaptureRefusal =
   /** The directory is not inside a git work tree, so there is no `<repo>/.pagr` to write to. */
   | 'not_a_repo'
   /** The adapter refused the instruction: the session is gone, finished, or not ours. */
-  | 'send_failed';
+  | 'send_failed'
+  /**
+   * Receiver path: the sending session left no transcript this Mac can read, so there is
+   * nothing for the receiving agent to reconstruct the handoff from (spec §9, row 2).
+   */
+  | 'no_transcript'
+  /**
+   * Receiver path: the receiving adapter has no `runOnce`, so it cannot be spawned headless.
+   * An adapter without one is still a good adapter — it just cannot be the writer.
+   */
+  | 'no_runner'
+  /** Receiver path: the headless agent could not be started, or reported a failure of its own. */
+  | 'run_failed'
+  /** Receiver path: the caller's `AbortSignal` fired and the run was killed. */
+  | 'run_canceled'
+  /** Receiver path: the run finished, said it was done, and left no file at the path. */
+  | 'no_file';
 
 /**
  * The end of a capture, whichever path ran it.
@@ -97,7 +114,10 @@ export type CaptureOutcome =
       reAsked: boolean;
       delivery?: InstructionDelivery;
     }
-  /** This path never started. Nothing was written and no instruction reached the session. */
+  /**
+   * No handoff file, and no point retrying this path. `reason` names which of the ways it
+   * could not happen — the sender was never asked, or the receiver never produced anything.
+   */
   | {
       outcome: 'refused';
       writer: HandoffWriter;
@@ -114,8 +134,17 @@ export type CaptureOutcome =
  * is also what keeps this module from importing the transport to emit an event itself.
  */
 export type CaptureProgress =
-  /** The instruction is with the agent; the file is being waited for. */
-  | { phase: 'capturing'; writer: HandoffWriter; path: string; delivery: InstructionDelivery }
+  /**
+   * The writing agent has the prompt and the file is being waited for. `delivery` says how the
+   * instruction reached a live session, and is absent on the receiver path, where a headless
+   * run was started rather than a conversation interrupted.
+   */
+  | {
+      phase: 'capturing';
+      writer: HandoffWriter;
+      path: string;
+      delivery?: InstructionDelivery | undefined;
+    }
   /** A file arrived and was not a handoff. The agent has been given the format once more. */
   | { phase: 'reasked'; writer: HandoffWriter; path: string; problem: HandoffProblem }
   /** The file is on disk and parses. `summary` is the line the phone receives. */
