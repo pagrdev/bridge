@@ -29,6 +29,12 @@ export interface CliContext {
   home: string;
   paths: PagrPaths;
   env: NodeJS.ProcessEnv;
+  /**
+   * The directory the person ran `pagr` in. A seam, not a convenience: commands that resolve a
+   * project from where you are standing (`pagr handoff`) are otherwise untestable without
+   * chdir-ing the whole test process.
+   */
+  cwd(): string;
   json: boolean;
   isTTY: boolean;
   /** Terminal width, for output that cannot wrap and stay useful (the pairing QR). */
@@ -158,6 +164,7 @@ export function createContext(overrides: ContextOverrides = {}): CliContext {
     home,
     paths: getPaths(home),
     env,
+    cwd: () => process.cwd(),
     json: false,
     isTTY: Boolean(process.stderr.isTTY),
     columns: process.stdout.columns ?? 80,

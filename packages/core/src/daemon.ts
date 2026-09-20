@@ -1,10 +1,14 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { basename } from 'node:path';
 import {
   type AgentConnectionStatus,
+  type CommandBody,
+  type CommandPayload,
+  type CommandType,
   canonicalize,
   type DeviceEvent,
   type EventPayload,
+  type HandoffCaptureResult,
   type Provider,
   type SessionStatus,
   type SessionSummary,
@@ -36,6 +40,10 @@ import {
   type RemoteProjectPickStatus,
 } from './dispatcher.js';
 import { makeEvent } from './events.js';
+import { repoRoot } from './git.js';
+import { handoffFilePath } from './handoff/capture.js';
+import { HANDOFF_DIR, HANDOFF_ID_RE } from './handoff/format.js';
+import { handoffStartInstruction } from './handoff/prompt.js';
 import { type DeviceIdentity, InvalidDeviceKeyError, loadOrCreateIdentity } from './identity.js';
 import {
   CHANNEL_POLL_TIMEOUT_MS,
@@ -429,7 +437,26 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
   /** Last status the Claude transcript mirror published; null until one runs in this process. */
   let mirror: MirrorStatus | null = null;
   const mirrorStatus = (): MirrorStatus | null => mirror ?? getMirrorBridge().status();
+  /**
+   * Commands this Mac issued to itself — `pagr handoff` running the switch through the daemon —
+   * whose acks belong to the CLI that is waiting on the socket and to nobody else.
+   *
+   * `command.ack` is documented as "exactly once per RECEIVED command", and the gateway keys it
+   * by a `cmd_…` it signed and remembers. An ack for an id the cloud never issued would be an
+   * answer to a question it did not ask, so the id goes in here before the dispatcher runs and
+   * the one ack it produces is dropped on the way out. Every other event the switch emits —
+   * `handoff.updated`, `session.updated`, the sealed `handoff` frame — is about something that
+   * really happened on this Mac and goes to the phone as usual.
+   */
+  const localCommandIds = new Set<string>();
   const emit = (event: DeviceEvent) => {
+    if (event.type === 'command.ack') {
+      const { commandId } = event.payload as EventPayload<'command.ack'>;
+      if (localCommandIds.delete(commandId)) {
+        logger.debug('ack withheld: local command', { commandId });
+        return;
+      }
+    }
     if (transport) transport.sendEvent(event);
     else logger.debug('event (unpaired, dropped)', { type: event.type });
   };
@@ -852,6 +879,144 @@ export async function createDaemon(o: CreateDaemonOptions): Promise<Daemon> {
       ...(p.limit !== undefined ? { limit: p.limit } : {}),
     });
   });
+  // ---------- handoff, from this Mac (`pagr handoff`) ----------
+
+  /**
+   * Run one command against the dispatcher as if the cloud had signed it.
+   *
+   * The whole of `pagr handoff` is this: the CLI is a second front door onto the SAME switch a
+   * phone drives (spec §7), so it must not be a second implementation of it. Everything that
+   * makes a command a command still happens — the dispatcher picks the adapter, resolves the
+   * work tree, emits `handoff.updated` at every state and seals the file as a frame — and the
+   * only thing missing is the signature, because there is no cloud in this path and the socket
+   * is already `0700` to this user.
+   *
+   * It does NOT go through `commandGuard`. That gauntlet exists to decide whether to trust bytes
+   * that arrived from the network; these bytes were built one function call ago by a daemon
+   * answering its own owner over a Unix socket, and re-checking a signature we would have to
+   * mint ourselves would prove nothing. What it does share is the ack: `handle` answers every
+   * command, and this reads that answer rather than a second return path.
+   */
+  async function localCommand<T extends CommandType>(
+    type: T,
+    payload: CommandPayload<T>,
+  ): Promise<EventPayload<'command.ack'>> {
+    const at = now();
+    const commandId = `cmd_${randomBytes(16).toString('hex')}`;
+    localCommandIds.add(commandId);
+    const body = {
+      version: 2,
+      commandId,
+      userId: config.userId ?? `usr_${'0'.repeat(32)}`,
+      deviceId: dispatcherDeviceId(),
+      issuedAt: at.toISOString(),
+      // Never re-sent and never queued: it is executed on the next line or not at all. The
+      // window is here only because the shape requires one.
+      expiresAt: new Date(at.getTime() + 60_000).toISOString(),
+      nonce: randomBytes(16).toString('hex'),
+      idempotencyKey: commandId,
+      type,
+      payload,
+    } as CommandBody;
+    try {
+      const ack = await dispatcher.handle(body);
+      return ack.payload as EventPayload<'command.ack'>;
+    } finally {
+      // `handle` answers every command, so the id is normally consumed by `emit` above. Clearing
+      // it here too means a dispatcher that somehow threw cannot leak an entry that would later
+      // swallow a real ack whose id happened to collide.
+      localCommandIds.delete(commandId);
+    }
+  }
+
+  /** An ack the CLI cannot use, turned into the IPC error it will map to an exit code. */
+  const ackFailed = (ack: EventPayload<'command.ack'>, fallback: string): IpcMethodError =>
+    new IpcMethodError(ack.errorCode ?? 'provider_error', ack.message ?? fallback);
+
+  /**
+   * `pagr handoff`, step one: write the handoff, commit the work, stop the sender.
+   *
+   * The session is the CLI's choice, not this method's — picking it needs the person's current
+   * directory, which the daemon does not have and should not guess at. What this owns is the
+   * part the CLI cannot do for itself: minting the handoff id, running the switch, and answering
+   * with the absolute path, which is the entire point of `--no-start`.
+   */
+  ipc.registerMethod('handoff.capture', async (params) => {
+    const p = z
+      .object({
+        sessionId: z.string().min(1),
+        to: z.enum(['claude', 'codex']),
+        note: z.string().min(1).max(2000).optional(),
+      })
+      .parse(params);
+    const rec = sessions.get(p.sessionId);
+    if (!rec)
+      throw new IpcMethodError(
+        'unknown_session',
+        `${p.sessionId} is not a session this Mac knows about`,
+      );
+    const handoffId = `hnd_${randomBytes(16).toString('hex')}`;
+    const ack = await localCommand('session.handoff.capture', {
+      handoffId,
+      sessionId: p.sessionId,
+      to: p.to,
+      ...(p.note !== undefined ? { note: p.note } : {}),
+    });
+    if (ack.status !== 'completed') throw ackFailed(ack, 'the handoff could not be captured');
+    const result = ack.result as HandoffCaptureResult;
+    // Resolved only now, and only for the answer: the capture already proved the directory is a
+    // work tree, so this cannot be the thing that fails and it cannot report `not_a_repo` twice.
+    const dir = rec.cwd ?? rec.projectPath ?? registry.resolve(rec.projectId).path;
+    const repo = await repoRoot(dir);
+    return {
+      handoffId,
+      from: rec.provider,
+      to: p.to,
+      sessionId: p.sessionId,
+      projectId: rec.projectId,
+      repo,
+      path: handoffFilePath(repo, handoffId),
+      relativePath: `${HANDOFF_DIR}/${handoffId}.md`,
+      instruction: handoffStartInstruction(handoffId),
+      ...result,
+    };
+  });
+
+  /**
+   * `pagr handoff`, step two: start the receiving agent on the handoff that was just written.
+   *
+   * Its own call, not a tail of the capture, for the same reason the cloud sends two signed
+   * commands (ADR 0019 decision 5): the capture is what produced the file, and it stays done
+   * whether or not anything is started afterwards. `--no-start` is simply this call not being
+   * made, which is what makes the flag honest for an agent Pagr has no adapter for.
+   */
+  ipc.registerMethod('handoff.start', async (params) => {
+    const p = z
+      .object({
+        handoffId: z.string().regex(HANDOFF_ID_RE),
+        provider: z.enum(['claude', 'codex']),
+        projectId: z.string().min(1),
+      })
+      .parse(params);
+    if (p.projectId === UNREGISTERED_PROJECT || !registry.has(p.projectId))
+      throw new IpcMethodError(
+        'unknown_project',
+        'that handoff is in no registered project, so there is nothing to start an agent in',
+      );
+    const sessionId = `ses_${randomBytes(16).toString('hex')}`;
+    const ack = await localCommand('agent.start_session', {
+      provider: p.provider,
+      projectId: p.projectId,
+      sessionId,
+      instruction: handoffStartInstruction(p.handoffId),
+      attachments: [],
+      readOnly: false,
+      context: { handoffId: p.handoffId },
+    });
+    if (ack.status !== 'completed') throw ackFailed(ack, `${p.provider} could not be started`);
+    return ack.result as SessionSummary;
+  });
+
   ipc.registerMethod('approvals.list', () => dispatcher.approvals.list());
   /**
    * Record a provider session the bridge did not start, so that it exists as far as this Mac is

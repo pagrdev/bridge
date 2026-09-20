@@ -18,6 +18,7 @@ export * from './frames.js';
 export * from './git.js';
 export * from './handoff/capture.js';
 export * from './handoff/format.js';
+export * from './handoff/list.js';
 export * from './handoff/prompt.js';
 export * from './handoff/receiver.js';
 export * from './handoff/switch.js';

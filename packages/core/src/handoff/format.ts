@@ -24,6 +24,16 @@ import { z } from 'zod';
 /** `hnd_` + 32 lowercase hex — the handoff id, and the file's basename. */
 export const HANDOFF_ID_RE = /^hnd_[0-9a-f]{32}$/;
 
+/**
+ * Where handoff files live, relative to the work tree root. `REVIEW_DIR` is its twin.
+ *
+ * Exported as the repo-relative string because three things need exactly it and must not spell
+ * it themselves: the absolute path a writing agent is given ({@link handoffFilePath}), the
+ * instruction a receiving agent is started with — whose cwd is the repository — and the
+ * directory `pagr handoffs ls` walks.
+ */
+export const HANDOFF_DIR = '.pagr/handoff';
+
 /** Body size cap, in UTF-8 bytes. `truncate` drops sections from the bottom until it fits. */
 export const HANDOFF_BODY_MAX_BYTES = 64 * 1024;
 

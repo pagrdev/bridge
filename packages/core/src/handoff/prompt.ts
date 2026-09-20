@@ -1,4 +1,4 @@
-import { HANDOFF_SECTIONS, type HandoffProvider } from './format.js';
+import { HANDOFF_DIR, HANDOFF_SECTIONS, type HandoffProvider } from './format.js';
 
 /**
  * The one instruction that asks an agent to write a handoff file.
@@ -104,3 +104,17 @@ export function handoffWritePrompt(input: HandoffWritePromptInput): string {
   lines.push('', 'Write the file, then stop. Say nothing else.');
   return `${lines.join('\n')}\n`;
 }
+
+/**
+ * The one instruction a receiving agent is started with, on every front door.
+ *
+ * Repo-relative on purpose, exactly like `reviewApplyInstruction`: the agent's cwd is the
+ * repository, and a path is the whole of what Pagr passes along. Nothing of the handoff is
+ * summarised, quoted or re-explained here — the file says it all, and an instruction that
+ * paraphrased it would be a second, worse copy that drifts from the one on disk.
+ *
+ * It is also the line `pagr handoff --no-start` prints for a person to paste into an agent Pagr
+ * has no adapter for, which is why it reads as something a human can hand over verbatim.
+ */
+export const handoffStartInstruction = (handoffId: string): string =>
+  `Read ${HANDOFF_DIR}/${handoffId}.md and continue the task it describes.`;

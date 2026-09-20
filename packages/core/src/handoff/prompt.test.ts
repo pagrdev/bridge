@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { HANDOFF_SECTIONS } from './format.js';
-import { HANDOFF_RULES, handoffWritePrompt } from './prompt.js';
+import { HANDOFF_DIR, HANDOFF_SECTIONS } from './format.js';
+import { HANDOFF_RULES, handoffStartInstruction, handoffWritePrompt } from './prompt.js';
 
 const PATH = '/Users/x/code/checkout-api/.pagr/handoff/hnd_0123456789abcdef0123456789abcdef.md';
 
@@ -166,5 +166,25 @@ describe('handoffWritePrompt', () => {
       Write the file, then stop. Say nothing else.
       "
     `);
+  });
+});
+
+describe('handoffStartInstruction', () => {
+  const ID = 'hnd_0123456789abcdef0123456789abcdef';
+
+  it('names the file, repo-relative, and asks for nothing else', () => {
+    expect(handoffStartInstruction(ID)).toBe(
+      `Read .pagr/handoff/${ID}.md and continue the task it describes.`,
+    );
+  });
+
+  it('is one line, so a person can paste it into an agent Pagr cannot start', () => {
+    expect(handoffStartInstruction(ID).split('\n')).toHaveLength(1);
+  });
+
+  it('carries no part of the handoff itself — the file is the only copy', () => {
+    const text = handoffStartInstruction(ID);
+    expect(text).not.toMatch(/goal|done|decision/i);
+    expect(text).toContain(HANDOFF_DIR);
   });
 });
