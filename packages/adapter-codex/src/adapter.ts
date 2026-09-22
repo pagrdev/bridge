@@ -471,6 +471,10 @@ export class CodexAdapter implements CodingAgentAdapter {
     return this.runSessions.list();
   }
 
+  providerSessionId(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.threadId ?? this.map.get(sessionId)?.threadId;
+  }
+
   async getStatus(sessionId: string): Promise<SessionSummaryV2 | null> {
     const run = this.runSessions.get(sessionId);
     if (run) return oneShotSummary(run);

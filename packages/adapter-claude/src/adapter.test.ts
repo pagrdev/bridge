@@ -138,6 +138,9 @@ describe('ClaudeAdapter against fake claude', () => {
       readOnly: true,
     });
     await c.waitFor(sessionEvent('completed'));
+    const nativeId = adapter.providerSessionId(SES);
+    expect(nativeId).toBeTruthy();
+    expect(nativeId).not.toBe(SES);
     await adapter.shutdown();
 
     // Same PAGR_HOME, new process: `listSessions` used to hard-code `idle` for everything it
@@ -147,6 +150,7 @@ describe('ClaudeAdapter against fake claude', () => {
       expect(await restarted.listSessions()).toEqual([
         expect.objectContaining({ sessionId: SES, status: 'completed', activeTurn: false }),
       ]);
+      expect(restarted.providerSessionId(SES)).toBe(nativeId);
       expect(await restarted.getStatus(SES)).toMatchObject({ status: 'completed' });
     } finally {
       await restarted.shutdown();

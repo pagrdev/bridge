@@ -445,6 +445,12 @@ export class ClaudeAdapter implements CodingAgentAdapter {
     return [...out.values()];
   }
 
+  providerSessionId(sessionId: string): string | undefined {
+    return (
+      this.sessions.get(sessionId)?.claudeSessionId ?? this.map.get(sessionId)?.claudeSessionId
+    );
+  }
+
   async getStatus(sessionId: string): Promise<SessionSummary | null> {
     const run = this.runs.get(sessionId);
     if (run) return oneShotSummary(run);

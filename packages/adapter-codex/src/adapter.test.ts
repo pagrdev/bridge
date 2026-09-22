@@ -269,6 +269,10 @@ describe('CodexAdapter against fake app-server', () => {
       projectId: PROJ,
       threadId: expect.stringMatching(/^thr_/),
     });
+    expect(adapter.providerSessionId(SES)).toBe(persisted[SES].threadId);
+    const restored = new CodexAdapter({ home, codexCommand: ['node', FIXTURE], log: false });
+    expect(restored.providerSessionId(SES)).toBe(persisted[SES].threadId);
+    await restored.shutdown();
     expect(fs.existsSync(path.join(home, 'logs', 'codex.log'))).toBe(true);
     const log = fs.readFileSync(path.join(home, 'logs', 'codex.log'), 'utf8');
     expect(log).not.toContain('requiresOpenaiAuth');
