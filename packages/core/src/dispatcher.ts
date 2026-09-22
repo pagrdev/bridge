@@ -1474,7 +1474,7 @@ export class Dispatcher {
           sessionId: summary.sessionId,
           provider: p.provider,
           projectId: p.projectId,
-          providerSessionId: summary.sessionId,
+          providerSessionId: adapter.providerSessionId?.(summary.sessionId) ?? summary.sessionId,
           status: summary.status,
           readOnly: p.readOnly,
           projectPath: project.path,
@@ -1880,7 +1880,12 @@ export class Dispatcher {
           'receiver_not_available',
           `this bridge cannot read a ${input.from} transcript on this Mac`,
         );
-      const providerSessionId = providerSessionIdOf(rec);
+      const providerSessionId =
+        this.o.adapters.get(input.from)?.providerSessionId?.(rec.sessionId) ??
+        providerSessionIdOf(rec);
+      if (providerSessionId && providerSessionId !== rec.providerSessionId) {
+        this.o.sessions.upsert({ ...rec, providerSessionId });
+      }
       if (!providerSessionId)
         return refuse(
           'no_transcript',
@@ -2777,7 +2782,11 @@ export class Dispatcher {
           sessionId: s.sessionId,
           provider,
           projectId: s.projectId,
-          providerSessionId: rec?.providerSessionId ?? s.sessionId,
+          providerSessionId:
+            this.o.adapters.get(provider)?.providerSessionId?.(s.sessionId) ??
+            rec?.providerSessionId ??
+            s.sessionId,
+          ...(rec?.providerThreadId ? { providerThreadId: rec.providerThreadId } : {}),
           status: s.status,
           // Never widen a read-only session, or forget which tree it holds, on a status update.
           ...(rec?.readOnly !== undefined ? { readOnly: rec.readOnly } : {}),

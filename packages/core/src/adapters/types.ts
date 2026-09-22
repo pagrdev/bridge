@@ -199,6 +199,8 @@ export type AdapterEvent =
 
 export interface CodingAgentAdapter {
   readonly provider: Provider;
+  /** Native transcript id, kept on this Mac and recoverable from the adapter session map. */
+  providerSessionId?(sessionId: string): string | undefined;
   probe(): Promise<AgentConnectionStatus>;
   listSessions(): Promise<SessionSummaryV2[]>;
   startSession(input: StartSessionInput): Promise<SessionSummaryV2>;

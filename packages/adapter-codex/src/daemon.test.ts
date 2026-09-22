@@ -238,7 +238,8 @@ describe('CodexAdapter attach vs embedded fallback', () => {
         localImagePaths: [],
         readOnly: false,
       });
-      expect(s.status).toBe('working');
+      // The daemon may deliver turn/completed before the start response resolves.
+      expect(['working', 'completed']).toContain(s.status);
       expect((await a.probe()).mode).toBe('app-server-daemon');
       // The trace file records every fake `codex` invocation. Attaching means the only one was
       // the `--version` probe: no app-server child of our own, and above all no `daemon start`.

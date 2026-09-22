@@ -426,13 +426,15 @@ describe('session.handoff.capture — the receiver writes', () => {
   it('falls through to the receiver when the sender was steered and never answered', async () => {
     writeClaudeTranscript();
     // A session the bridge started: `full` control, so the sender is asked first.
-    sending({ adopted: false, providerSessionId: CLAUDE_UUID });
+    sending({ adopted: false, providerSessionId: sessionId });
+    Object.assign(claude, { providerSessionId: () => CLAUDE_UUID });
     Object.assign(codex, { runOnce: writingRun() });
 
     const ack = (await capture()).payload as Ack;
 
     expect(ack.status).toBe('completed');
     expect((ack.result as HandoffCaptureAck).writer).toBe('receiver');
+    expect(sessions.get(sessionId)?.providerSessionId).toBe(CLAUDE_UUID);
     // Asked first, and only then handed over.
     expect(claude.calls.filter((c) => c.method === 'sendInstruction')).toHaveLength(1);
     expect(runs).toHaveLength(1);
