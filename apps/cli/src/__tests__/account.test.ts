@@ -81,11 +81,12 @@ describe('pagr doctor · the account', () => {
     expect(list.filter((c) => c.status === 'fail').map((c) => c.name)).not.toContain('trial');
   });
 
-  it('points at the dashboard when the deployment publishes no number', async () => {
+  it('says texting is not set up when the deployment publishes no number', async () => {
     await paired({ status: withOnboarding({}, null) });
-    expect(named(await checks(), 'phone')?.fix).toContain(
-      'link your phone at http://localhost:3000',
-    );
+    const fix = named(await checks(), 'phone')?.fix;
+    expect(fix).toContain("texting isn't set up on this Pagr deployment yet");
+    // Inbound-first: no detour to a page that would have Pagr text the phone first.
+    expect(fix).not.toContain('http://localhost:3000');
   });
 
   it('skips, with the command that enables it, on a Mac paired before the id was recorded', async () => {

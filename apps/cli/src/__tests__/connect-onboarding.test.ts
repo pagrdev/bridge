@@ -110,8 +110,12 @@ describe('connect · step 7, link your phone', () => {
       }),
     ).toBe(EXIT.ok);
     const text = all();
-    expect(text).toContain('no number to text yet');
-    expect(text).toContain('http://localhost:3000/welcome');
+    // Inbound-first: with no number there is no way to link a phone, and nothing may suggest Pagr
+    // will text first — no dashboard detour, no "waiting for your text".
+    expect(text).toContain("texting isn't set up on this Pagr deployment yet");
+    expect(text).not.toContain('Link your phone here');
+    expect(text).not.toContain('waiting for your text');
+    expect(text).not.toMatch(/Pagr will text|we.ll text you/i);
     expect(text).not.toContain('sms:');
   });
 
