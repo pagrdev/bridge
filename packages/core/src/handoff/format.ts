@@ -1,3 +1,4 @@
+import { HandoffWriter, Provider, SessionOrigin } from '@pagr/protocol';
 import { z } from 'zod';
 
 /**
@@ -7,8 +8,10 @@ import { z } from 'zod';
  * without ever reading the body, then nine fixed sections of prose the receiving agent reads
  * instead of the sender's transcript. Spec: `docs/superpowers/specs/2026-09-20-handoff-v1-design.md` §2.
  *
- * This module owns parse / validate / serialize and nothing else — no fs, no git, no adapters —
- * because the platform gets a byte-synced copy of it and must not inherit the bridge's world.
+ * This module owns parse / validate / serialize and nothing else — no fs, no git, no adapters.
+ * Its only dependency is `@pagr/protocol`, for the provider / origin / writer vocabularies the
+ * frontmatter shares with the wire. (The platform does not copy this file: the web app has its
+ * own lenient reader, `apps/web/lib/handoff-doc.ts`, which keeps any frontmatter key it meets.)
  *
  * Two invariants the rest of the system leans on:
  *
@@ -41,19 +44,33 @@ export const HANDOFF_BODY_MAX_BYTES = 64 * 1024;
 export const HANDOFF_SUMMARY_MAX_CHARS = 500;
 
 /**
- * Local copy of the protocol's `Provider`. HND-001 owns `@pagr/protocol`'s schemas on another
- * branch; this is re-pointed at `Provider` once both land, and the values are identical.
+ * The agents a handoff can move between: the protocol's `Provider`, the same schema the
+ * `session.handoff.capture` command's `to` is validated with, so the file and the command can
+ * never disagree about who is a valid receiver. `Provider` is the real agents only — there is no
+ * `unknown` member to narrow away — and a test pins that, so widening it is a decision made here
+ * rather than a file that silently starts accepting a handoff to nobody.
  */
-export const HandoffProvider = z.enum(['claude', 'codex']);
-export type HandoffProvider = z.infer<typeof HandoffProvider>;
+export const HandoffProvider = Provider;
+export type HandoffProvider = Provider;
 
-/** Where the sending session came from. `unknown` is for sessions Pagr only ever mirrored. */
-export const HandoffOrigin = z.enum(['pagr', 'terminal', 'ide', 'unknown']);
-export type HandoffOrigin = z.infer<typeof HandoffOrigin>;
+/**
+ * Where the sending session came from: the protocol's `SessionOrigin`. `unknown` is legitimate
+ * here — it is a session Pagr only ever mirrored — so this one is the whole enum, not a subset.
+ */
+export const HandoffOrigin = SessionOrigin;
+export type HandoffOrigin = SessionOrigin;
 
-/** Who actually wrote the body: the sending agent, or the receiver from the transcript (§3). */
-export const HandoffWriter = z.enum(['sender', 'receiver']);
-export type HandoffWriter = z.infer<typeof HandoffWriter>;
+/** Who actually wrote the body — the sending agent, or the receiver from the transcript (§3). */
+export { HandoffWriter };
+
+/** Sections `truncate` is allowed to drop, in the order it drops them. */
+export const HANDOFF_TRUNCATION_ORDER = [
+  'openQuestions',
+  'knownFailures',
+  'decisionDetail',
+  'filesTouched',
+] as const;
+export type HandoffTruncationStep = (typeof HANDOFF_TRUNCATION_ORDER)[number];
 
 export const HandoffFrontmatter = z.object({
   pagr: z.literal('handoff/1'),
@@ -79,6 +96,13 @@ export const HandoffFrontmatter = z.object({
   created: z.string().datetime({ offset: true }),
   /** Set by `truncate` when the body did not fit under the cap. */
   truncated: z.boolean().optional(),
+  /**
+   * What `truncate` dropped, in the order it dropped it. Written alongside `truncated: true` so
+   * the receiving agent can tell an empty "Known failures" that was cut from one that had nothing
+   * in it. Absent on files written before it existed — `truncated: true` without it means "cut,
+   * but which is not recorded", never "nothing".
+   */
+  truncatedSections: z.array(z.enum(HANDOFF_TRUNCATION_ORDER)).optional(),
 });
 export type HandoffFrontmatter = z.infer<typeof HandoffFrontmatter>;
 
@@ -115,15 +139,6 @@ export interface HandoffDoc {
   openQuestions: string[];
   extra: HandoffExtraSection[];
 }
-
-/** Sections `truncate` is allowed to drop, in the order it drops them. */
-export const HANDOFF_TRUNCATION_ORDER = [
-  'openQuestions',
-  'knownFailures',
-  'decisionDetail',
-  'filesTouched',
-] as const;
-export type HandoffTruncationStep = (typeof HANDOFF_TRUNCATION_ORDER)[number];
 
 export type HandoffProblemCode =
   /** No `---` fenced block at the top of the file at all. */
@@ -194,6 +209,10 @@ function emitFlowMap(entries: Array<[string, Scalar]>): string {
   return `{ ${entries.map(([k, v]) => `${k}: ${emitScalar(v, true)}`).join(', ')} }`;
 }
 
+function emitFlowSeq(items: string[]): string {
+  return `[${items.map((v) => emitScalar(v, true)).join(', ')}]`;
+}
+
 function parseScalar(raw: string): Scalar {
   const text = raw.trim();
   if (text === '' || text === 'null' || text === '~') return null;
@@ -247,8 +266,18 @@ function parseFlowMap(text: string): Record<string, Scalar> | null {
   return map;
 }
 
+/** `[a, b]` → its scalars. Nested collections are not part of handoff/1. */
+function parseFlowSeq(text: string): Scalar[] | null {
+  const out: Scalar[] = [];
+  for (const entry of splitFlowEntries(text.slice(1, -1))) {
+    if (entry.startsWith('{') || entry.startsWith('[')) return null;
+    out.push(parseScalar(entry));
+  }
+  return out;
+}
+
 /**
- * The `key: value` / `key: { k: v }` subset we write. Deliberately not a YAML parser: the file is
+ * The `key: value` / `key: { k: v }` / `key: [a, b]` subset we write. Deliberately not a YAML parser: the file is
  * machine-written, and a real YAML dependency in a module the platform byte-syncs is a cost with
  * no buyer.
  */
@@ -266,6 +295,11 @@ function parseFrontmatterBlock(block: string): Record<string, unknown> | null {
       const map = parseFlowMap(rest);
       if (!map) return null;
       out[key] = map;
+    } else if (rest.startsWith('[')) {
+      if (!rest.endsWith(']')) return null;
+      const seq = parseFlowSeq(rest);
+      if (!seq) return null;
+      out[key] = seq;
     } else {
       out[key] = parseScalar(rest);
     }
@@ -300,6 +334,8 @@ function serializeFrontmatter(fm: HandoffFrontmatter): string {
   ];
   // Only ever written when true: absent means "nothing was dropped", which is the common case.
   if (fm.truncated === true) lines.push('truncated: true');
+  if (fm.truncatedSections !== undefined)
+    lines.push(`truncatedSections: ${emitFlowSeq(fm.truncatedSections)}`);
   lines.push('---');
   return `${lines.join('\n')}\n`;
 }
@@ -482,7 +518,7 @@ export function parse(text: string): HandoffParseResult {
       ok: false,
       problem: problem(
         'bad_frontmatter',
-        'the frontmatter is not the `key: value` / `key: { k: v }` shape handoff/1 uses',
+        'the frontmatter is not the `key: value` / `key: { k: v }` / `key: [a, b]` shape handoff/1 uses',
         'rewrite the block, or delete the file and run the handoff again',
       ),
     };
@@ -588,8 +624,10 @@ export function summaryLine(doc: HandoffDoc): string {
  * Open questions, then Known failures, then the "why" on each decision, then Files touched.
  * Goal, Done and Not done are never touched — they are the handoff.
  *
- * Returns a new document; the input is not mutated. `dropped` names the steps that were applied,
- * because the file itself can only say *that* it was truncated, not what went.
+ * Returns a new document; the input is not mutated. `dropped` names the steps this call applied,
+ * and the file records them as `truncatedSections` next to `truncated: true`, so a receiver can
+ * say which sections were cut instead of reading an empty heading as "none". A document that was
+ * already truncated keeps its earlier steps: the recorded list is the union, in drop order.
  */
 export function truncate(doc: HandoffDoc): { doc: HandoffDoc; dropped: HandoffTruncationStep[] } {
   if (bodyBytes(doc) <= HANDOFF_BODY_MAX_BYTES) return { doc, dropped: [] };
@@ -604,8 +642,15 @@ export function truncate(doc: HandoffDoc): { doc: HandoffDoc; dropped: HandoffTr
     dropped.push(step);
     if (bodyBytes(current) <= HANDOFF_BODY_MAX_BYTES) break;
   }
+  const already = current.frontmatter.truncatedSections ?? [];
+  const truncatedSections = HANDOFF_TRUNCATION_ORDER.filter(
+    (step) => already.includes(step) || dropped.includes(step),
+  );
   return {
-    doc: { ...current, frontmatter: { ...current.frontmatter, truncated: true } },
+    doc: {
+      ...current,
+      frontmatter: { ...current.frontmatter, truncated: true, truncatedSections },
+    },
     dropped,
   };
 }

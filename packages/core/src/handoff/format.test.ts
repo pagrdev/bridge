@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { HandoffWriter as ProtocolHandoffWriter, Provider, SessionOrigin } from '@pagr/protocol';
 import { describe, expect, it } from 'vitest';
 import { useTempHome } from '../testUtil.js';
 import {
@@ -8,6 +9,9 @@ import {
   HANDOFF_SECTIONS,
   HANDOFF_SUMMARY_MAX_CHARS,
   type HandoffDoc,
+  HandoffOrigin,
+  HandoffProvider,
+  HandoffWriter,
   nextItem,
   parse,
   serialize,
@@ -81,6 +85,16 @@ describe('handoff format — serialize', () => {
     const t = doc();
     t.frontmatter.truncated = true;
     expect(serialize(t)).toContain('\ntruncated: true\n');
+  });
+
+  it('writes `truncatedSections` as a flow list right after `truncated`', () => {
+    expect(serialize(doc())).not.toContain('truncatedSections');
+    const t = doc();
+    t.frontmatter.truncated = true;
+    t.frontmatter.truncatedSections = ['openQuestions', 'knownFailures'];
+    expect(serialize(t)).toContain(
+      '\ntruncated: true\ntruncatedSections: [openQuestions, knownFailures]\n---\n',
+    );
   });
 
   it('quotes values that would break the flow mapping', () => {
@@ -221,8 +235,40 @@ describe('handoff format — bad frontmatter', () => {
     expect(r.problem.message).toContain('id');
   });
 
+  it('rejects a `truncatedSections` entry that is not a truncation step', () => {
+    const text = serialize(doc()).replace(
+      '\n---\n\n# Goal',
+      '\ntruncated: true\ntruncatedSections: [openQuestions, goal]\n---\n\n# Goal',
+    );
+    const r = parse(text);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.problem.code).toBe('wrong_shape');
+    expect(r.problem.message).toContain('truncatedSections');
+  });
+
+  it('reports an unclosed or nested flow list as bad frontmatter', () => {
+    for (const bad of ['[openQuestions, knownFailures', '[[openQuestions]]']) {
+      const text = serialize(doc()).replace(
+        '\n---\n\n# Goal',
+        `\ntruncatedSections: ${bad}\n---\n\n# Goal`,
+      );
+      const r = parse(text);
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.problem.code).toBe('bad_frontmatter');
+    }
+  });
+
   it('never throws on arbitrary input', () => {
-    for (const junk of ['', '---', '---\n---', '---\n{\n---\n', 'not a file at all']) {
+    for (const junk of [
+      '',
+      '---',
+      '---\n---',
+      '---\n{\n---\n',
+      '---\n[\n---\n',
+      'not a file at all',
+    ]) {
       expect(() => parse(junk)).not.toThrow();
       expect(parse(junk).ok).toBe(false);
     }
@@ -308,6 +354,7 @@ describe('handoff format — truncation', () => {
     const r = truncate(doc());
     expect(r.dropped).toEqual([]);
     expect(r.doc.frontmatter.truncated).toBeUndefined();
+    expect(r.doc.frontmatter.truncatedSections).toBeUndefined();
   });
 
   it('drops Open questions first and stops as soon as it fits', () => {
@@ -316,12 +363,14 @@ describe('handoff format — truncation', () => {
     expect(r.doc.openQuestions).toEqual([]);
     expect(r.doc.knownFailures).toHaveLength(1);
     expect(r.doc.frontmatter.truncated).toBe(true);
+    expect(r.doc.frontmatter.truncatedSections).toEqual(['openQuestions']);
     expect(bodyBytes(r.doc)).toBeLessThanOrEqual(HANDOFF_BODY_MAX_BYTES);
   });
 
   it('drops Known failures second', () => {
     const r = truncate(doc({ openQuestions: bullets(400, 'q'), knownFailures: bullets(400, 'f') }));
     expect(r.dropped).toEqual(['openQuestions', 'knownFailures']);
+    expect(r.doc.frontmatter.truncatedSections).toEqual(['openQuestions', 'knownFailures']);
     expect(r.doc.knownFailures).toEqual([]);
     expect(r.doc.decisions[0]?.why).not.toBeNull();
   });
@@ -359,6 +408,17 @@ describe('handoff format — truncation', () => {
     expect(r.doc.notDone).toEqual(big.notDone);
     expect(r.doc.goal).toBe(big.goal);
     expect(r.doc.frontmatter.truncated).toBe(true);
+    expect(r.doc.frontmatter.truncatedSections).toEqual(r.dropped);
+  });
+
+  it('keeps what an earlier pass dropped when a truncated document is cut again', () => {
+    const once = doc({ knownFailures: bullets(400, 'f') });
+    once.frontmatter.truncated = true;
+    once.frontmatter.truncatedSections = ['openQuestions'];
+    once.openQuestions = [];
+    const r = truncate(once);
+    expect(r.dropped).toEqual(['openQuestions', 'knownFailures']);
+    expect(r.doc.frontmatter.truncatedSections).toEqual(['openQuestions', 'knownFailures']);
   });
 
   it('does not mutate the input document', () => {
@@ -375,6 +435,37 @@ describe('handoff format — truncation', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.doc.frontmatter.truncated).toBe(true);
+    expect(r.doc.frontmatter.truncatedSections).toEqual(['openQuestions']);
+    expect(first).toContain('\ntruncatedSections: [openQuestions]\n');
     expect(serialize(r.doc)).toBe(first);
+  });
+
+  it('a file written before `truncatedSections` existed still parses and round-trips', () => {
+    const old = doc();
+    old.frontmatter.truncated = true;
+    const first = serialize(old);
+    expect(first).not.toContain('truncatedSections');
+    const r = parse(first);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.doc.frontmatter.truncated).toBe(true);
+    expect(r.doc.frontmatter.truncatedSections).toBeUndefined();
+    expect(serialize(r.doc)).toBe(first);
+  });
+});
+
+describe('handoff format — shared vocabularies', () => {
+  it('uses the protocol’s schemas for provider, origin and writer', () => {
+    expect(HandoffProvider).toBe(Provider);
+    expect(HandoffOrigin).toBe(SessionOrigin);
+    expect(HandoffWriter).toBe(ProtocolHandoffWriter);
+  });
+
+  it('only accepts a real agent as a provider, while origin keeps `unknown`', () => {
+    // A handoff to or from "unknown" is meaningless. If `Provider` ever grows a placeholder
+    // member, this fails and the handoff schema has to narrow it explicitly.
+    expect(HandoffProvider.options).toEqual(['claude', 'codex']);
+    expect(HandoffProvider.safeParse('unknown').success).toBe(false);
+    expect(HandoffOrigin.safeParse('unknown').success).toBe(true);
   });
 });
