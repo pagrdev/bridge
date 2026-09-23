@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { describeKeepAwake, inspectConfig, ProjectRegistry } from '@pagr/bridge-core';
 import type { Command } from 'commander';
-import { readAccount } from '../account.js';
+import { readAccount, TEXTING_NOT_SET_UP } from '../account.js';
 import type { CliContext } from '../context.js';
 import { daemonStatus } from '../ipc.js';
 import { bad, bold, dim, kv, ok, printJson, shortId, warn } from '../output.js';
@@ -150,7 +150,7 @@ export async function runStatus(ctx: CliContext): Promise<void> {
             : warn(
                 account.productNumber
                   ? `not linked — text Hi Pagr to ${account.productNumber}`
-                  : 'not linked',
+                  : `not linked — ${TEXTING_NOT_SET_UP}`,
               ),
         ],
         ['trial', account.onboarding.entitled ? ok('active') : warn('not started')],

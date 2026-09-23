@@ -271,7 +271,7 @@ export async function runChecks(ctx: CliContext, opts: DoctorOptions = {}): Prom
         : 'not linked yet — agents cannot text you'
       : (account.unavailable ?? 'unknown'),
     ...(account.onboarding && !account.onboarding.messagingLinked
-      ? { fix: linkPhoneFix(account.productNumber, welcome) }
+      ? { fix: linkPhoneFix(account.productNumber) }
       : accountFix
         ? { fix: accountFix }
         : {}),

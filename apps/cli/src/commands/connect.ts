@@ -26,6 +26,7 @@ import {
   startPairing,
 } from '@pagr/bridge-core';
 import type { Command } from 'commander';
+import { TEXTING_NOT_SET_UP } from '../account.js';
 import { installHookForUser } from '../claudeHook.js';
 import type { CliContext } from '../context.js';
 import { isRemoteSession } from '../context.js';
@@ -498,18 +499,23 @@ async function accountSteps(
           say(ctx, dim('  could not open Messages here — scan the code above instead'));
       }
     } else {
-      // No published line: there is nothing to text or encode, and the conversation has to be
-      // started by Pagr instead. The dashboard does that.
-      say(ctx, '  This Pagr deployment has no number to text yet.');
-      if (welcome) say(ctx, `  Link your phone here instead: ${bold(welcome)}`);
+      // No published line: there is nothing to text or encode. Pagr never starts the conversation
+      // itself (iMessage providers forbid business-initiated first contact), so there is no other
+      // way to link a phone here, and nothing to wait for.
+      say(ctx, `  ${warn(`${TEXTING_NOT_SET_UP} — there is no number to text.`)}`);
+      say(
+        ctx,
+        dim('  this Mac works either way; link your phone once the deployment has a number'),
+      );
     }
-    say(
-      ctx,
-      dim(
-        '  any text from the number on your account links it — Ctrl-C to skip, this Mac works either way',
-      ),
-    );
-    if (interactive) {
+    if (productNumber)
+      say(
+        ctx,
+        dim(
+          '  any text from the number on your account links it — Ctrl-C to skip, this Mac works either way',
+        ),
+      );
+    if (interactive && productNumber) {
       const got = await waitFor(
         ctx,
         o,
@@ -658,7 +664,7 @@ function printSummary(ctx: CliContext, r: ConnectResult): void {
           : warn(
               r.productNumber
                 ? `not linked — text ${LINK_PHONE_BODY} to ${r.productNumber}`
-                : 'not linked',
+                : `not linked — ${TEXTING_NOT_SET_UP}`,
             )
       }`,
     );
@@ -689,7 +695,7 @@ function printSummary(ctx: CliContext, r: ConnectResult): void {
       next.push(
         r.productNumber
           ? `${cyan(`text ${LINK_PHONE_BODY} to ${r.productNumber}`)}   ${dim('links your phone')}`
-          : dim('link your phone from the dashboard'),
+          : dim(TEXTING_NOT_SET_UP),
       );
     if (!r.onboarding.entitled && r.welcomeUrl)
       next.push(`${cyan(r.welcomeUrl)}   ${dim('start your trial')}`);

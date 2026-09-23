@@ -56,9 +56,13 @@ Run `pagr status --json` and read `phoneLinked`.
   > Text **Hi Pagr** to `<productNumber>` from the phone number on your Pagr account. Any text
   > from that number links it — you will get a welcome message back.
 
-  If `productNumber` is `null`, send them to the dashboard instead; this deployment has no
-  published number to text. `pagr connect` also prints a QR code of that text on its last step,
-  which is the easier path if they are about to run it anyway.
+  `pagr connect` also prints a QR code of that text on its last step, which is the easier path
+  if they are about to run it anyway.
+
+  If `productNumber` is `null`, tell them texting isn't set up on this Pagr deployment yet: there
+  is no number to text, so there is no way to link a phone. Do not send them to the dashboard or
+  suggest Pagr will text them — Pagr never sends the first message (iMessage providers forbid it);
+  the person always texts Pagr first.
 - `null` — the state could not be read (`accountUnknown` says why). Report the reason; do not
   guess that it is unlinked.
 

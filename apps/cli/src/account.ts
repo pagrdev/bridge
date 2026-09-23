@@ -55,8 +55,17 @@ export async function readAccount(
   }
 }
 
+/**
+ * What a deployment with no published number is, in the words every command uses.
+ *
+ * Pagr is inbound-first: iMessage providers forbid a business texting someone first, so a phone
+ * is only ever linked by the person sending Pagr the first text. With no number there is nothing
+ * to send it to, and no dashboard button or other route that would "text you" instead.
+ */
+export const TEXTING_NOT_SET_UP = "texting isn't set up on this Pagr deployment yet";
+
 /** The one thing that finishes the phone link, given what we know about the deployment. */
-export const linkPhoneFix = (productNumber: string | null, welcomeUrl: string | null): string =>
+export const linkPhoneFix = (productNumber: string | null): string =>
   productNumber
     ? `text Hi Pagr to ${productNumber} from the phone on your account`
-    : `link your phone at ${welcomeUrl ?? 'your Pagr dashboard'}`;
+    : `${TEXTING_NOT_SET_UP} — there is no number to text`;
